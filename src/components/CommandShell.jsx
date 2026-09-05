@@ -1,10 +1,35 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { systemOverview } from '../data/systemOverview';
 import { scenarioPresets } from '../scenarios/scenarioPresets';
+import { describeDelta } from '../utils/describeKeyframeDelta';
+import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
 import { getRiskClasses } from '../utils/riskStyles';
 import { getScenarioById, matchScenario, scenarios } from '../utils/scenarioMatcher';
 import { MapView } from './MapView';
+import { TimelineScrubber } from './TimelineScrubber';
 import { TopNav } from './TopNav';
+
+/**
+ * Computes the full merged map state for a given timeline position.
+ * Index 0 (T+0) renders the plain scenario baseline; any later index
+ * folds `scenario.timeline[0..index]` cumulatively onto that baseline via
+ * mergeKeyframesUpTo. Wrapped defensively: if a scenario's timeline is
+ * malformed (missing, wrong shape, or a keyframe that fails to merge),
+ * this logs a warning and falls back to the baseline rather than crashing
+ * the UI, per Task 5's data-requirements spec.
+ */
+function getMergedStateForIndex(scenario, index) {
+  if (index <= 0 || !Array.isArray(scenario.timeline) || scenario.timeline.length === 0) {
+    return scenario.baseline;
+  }
+  try {
+    return mergeKeyframesUpTo(scenario.baseline, scenario.timeline, index);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn(`CommandShell: failed to merge timeline keyframes for "${scenario.id}" at index ${index}.`, error);
+    return scenario.baseline;
+  }
+}
 
 // Fake "AI thinking" delay range (ms) for free-text scenario input, so
 // the keyword match feels like real processing rather than an instant
@@ -27,6 +52,45 @@ export function CommandShell() {
   const [activeScenario, setActiveScenario] = useState(scenarios[0]);
   const [inputValue, setInputValue] = useState('');
   const [isThinking, setIsThinking] = useState(false);
+
+  // Timeline scrubber state. Lives here (not inside TimelineScrubber)
+  // because MapView is a sibling that also needs the derived merged
+  // state — same reasoning as why activeScenario lives here (Task 4).
+  const [currentKeyframeIndex, setCurrentKeyframeIndex] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  // Switching scenarios (free-text match or preset chip) must never carry
+  // a mid-timeline position into the newly-selected scenario. Reset it
+  // during render (React's documented "adjust state when a prop changes"
+  // pattern) rather than in a useEffect, so the reset lands in the same
+  // commit as the scenario change instead of flashing the old timeline
+  // position for one extra frame.
+  const [resetForScenarioId, setResetForScenarioId] = useState(activeScenario.id);
+  if (resetForScenarioId !== activeScenario.id) {
+    setResetForScenarioId(activeScenario.id);
+    setCurrentKeyframeIndex(0);
+    setIsPlaying(false);
+  }
+
+  const mergedMapState = useMemo(
+    () => getMergedStateForIndex(activeScenario, currentKeyframeIndex),
+    [activeScenario, currentKeyframeIndex],
+  );
+
+  // MapView already renders `scenario.baseline` as its data source (Task
+  // 3/4), so the simplest way to feed it the time-merged state is to pass
+  // a shallow-cloned scenario with `baseline` swapped for the merged
+  // state — no MapView changes needed for *which* state it renders.
+  const mapViewScenario = useMemo(
+    () => ({ ...activeScenario, baseline: mergedMapState }),
+    [activeScenario, mergedMapState],
+  );
+
+  const timelineStatusText = useMemo(() => {
+    if (currentKeyframeIndex <= 0) return 'Scenario baseline established.';
+    const prevState = getMergedStateForIndex(activeScenario, currentKeyframeIndex - 1);
+    return describeDelta(prevState, mergedMapState);
+  }, [activeScenario, currentKeyframeIndex, mergedMapState]);
 
   function handleScenarioSubmit(event) {
     event.preventDefault();
@@ -75,7 +139,7 @@ export function CommandShell() {
               </div>
 
               <div className="relative mt-4 min-h-[420px] flex-1 overflow-hidden">
-                <MapView scenario={activeScenario} />
+                <MapView scenario={mapViewScenario} />
 
                 {isThinking && (
                   <div className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl bg-slate-950/70 backdrop-blur-sm">
@@ -138,16 +202,14 @@ export function CommandShell() {
 
         <footer className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 shadow-[0_0_0_1px_rgba(15,23,42,0.8)]">
           <div className="flex flex-col gap-4 xl:flex-row xl:items-center">
-            <div className="flex min-w-[200px] flex-1 flex-col gap-3">
-              <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.3em] text-slate-400">
-                <span>Timeline scrubber</span>
-                <span>06:40 UTC</span>
-              </div>
-              <div className="relative h-3 rounded-full border border-slate-700 bg-slate-900">
-                <div className="absolute inset-y-1 left-2 right-2 rounded-full bg-gradient-to-r from-accent/60 via-risks-yellow/60 to-risks-red/80" />
-                <div className="absolute left-[62%] top-1/2 h-5 w-5 -translate-y-1/2 rounded-full border-2 border-slate-900 bg-accent shadow-[0_0_16px_rgba(94,234,212,0.7)]" />
-              </div>
-            </div>
+            <TimelineScrubber
+              keyframes={activeScenario.timeline}
+              currentIndex={currentKeyframeIndex}
+              onIndexChange={setCurrentKeyframeIndex}
+              isPlaying={isPlaying}
+              onPlayToggle={setIsPlaying}
+              statusText={timelineStatusText}
+            />
 
             <div className="flex flex-1 flex-col gap-2 xl:max-w-[420px]">
               <label htmlFor="scenario" className="text-[10px] uppercase tracking-[0.3em] text-slate-400">

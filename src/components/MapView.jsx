@@ -1,7 +1,52 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import defaultScenario from '../scenarios/security-attack.json';
 import { getRiskClasses } from '../utils/riskStyles';
 import { computeBounds, createProjector } from '../utils/geoProjection';
+
+// Duration for state-to-state visual transitions (building height/color,
+// road status, shelter strain) as the timeline scrubber moves between
+// keyframes. Matches the 300-500ms range from Task 5's spec.
+const TRANSITION_MS = 400;
+
+/**
+ * Tracks the previous value of `value` and reports it as a fading
+ * "ghost" for one transition cycle whenever it changes. Used for SVG
+ * properties that can't be smoothly CSS-transitioned directly (e.g. a
+ * discrete strokeDasharray swap on road status change) — the ghost
+ * renders the OLD look on top of the new one and fades out, producing a
+ * quick crossfade instead of an instant pop.
+ */
+function useGhostOnChange(value, duration = TRANSITION_MS) {
+  const [ghost, setGhost] = useState(null);
+  const [fading, setFading] = useState(false);
+  const lastRef = useRef(value);
+
+  useEffect(() => {
+    if (lastRef.current === value) return undefined;
+
+    const previous = lastRef.current;
+    lastRef.current = value;
+    setGhost(previous);
+    setFading(false);
+
+    let secondFrame;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => setFading(true));
+    });
+    const timeoutId = window.setTimeout(() => {
+      setGhost(null);
+      setFading(false);
+    }, duration + 80);
+
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+      window.clearTimeout(timeoutId);
+    };
+  }, [value, duration]);
+
+  return { ghost, fading };
+}
 
 // Hex values mirror tailwind.config.js `risks` palette. Kept as plain hex
 // here (rather than Tailwind classes) because SVG fill/stroke attributes
@@ -21,6 +66,13 @@ const RISK_HEIGHT = {
   orange: 19,
   red: 25,
 };
+
+// Buildings are drawn once at this reference height (matches the tallest
+// risk level, 'red') so a height change can be animated with a CSS
+// `transform: scaleY()` on a wrapper group instead of recomputing SVG
+// polygon points every frame — `points` isn't CSS-transitionable, but
+// `transform` is.
+const UNIT_HEIGHT = 25;
 
 const ROAD_STATUS_HEX = {
   clear: '#22c55e',
@@ -62,30 +114,41 @@ function tint(hex, fraction) {
  */
 function IsoBuilding({ x, y, riskLevel, id, onHover, onLeave }) {
   const baseColor = RISK_HEX[riskLevel] || RISK_HEX.green;
-  const h = RISK_HEIGHT[riskLevel] || RISK_HEIGHT.green;
+  const targetHeight = RISK_HEIGHT[riskLevel] || RISK_HEIGHT.green;
+  const heightRatio = targetHeight / UNIT_HEIGHT;
   const s = 9; // half-width of the block footprint
 
-  const top = [x, y - h - s];
-  const right = [x + s, y - h];
-  const bottom = [x, y - h + s];
-  const left = [x - s, y - h];
-  const groundLeft = [x - s, y];
-  const groundRight = [x + s, y];
-  const groundBottom = [x, y + s];
+  // Shape is drawn once at the fixed UNIT_HEIGHT, in local coordinates
+  // with the ground point at (0, 0) and the block extending upward
+  // (negative y). The outer <g> below positions it at (x, y) and the
+  // inner <g> scales it vertically to the actual risk-level height —
+  // that scale is what animates on riskLevel change.
+  const top = [0, -UNIT_HEIGHT - s];
+  const right = [s, -UNIT_HEIGHT];
+  const bottom = [0, -UNIT_HEIGHT + s];
+  const left = [-s, -UNIT_HEIGHT];
+  const groundLeft = [-s, 0];
+  const groundRight = [s, 0];
+  const groundBottom = [0, s];
 
   const topFace = [top, right, bottom, left].map((p) => p.join(',')).join(' ');
   const leftFace = [left, bottom, groundBottom, groundLeft].map((p) => p.join(',')).join(' ');
   const rightFace = [bottom, right, groundRight, groundBottom].map((p) => p.join(',')).join(' ');
 
+  const faceTransition = { transition: `fill ${TRANSITION_MS}ms ease, stroke ${TRANSITION_MS}ms ease` };
+
   return (
     <g
-      onMouseEnter={() => onHover({ type: 'building', id, riskLevel, x, y: y - h - s })}
+      onMouseEnter={() => onHover({ type: 'building', id, riskLevel, x, y: y - targetHeight - s })}
       onMouseLeave={onLeave}
       className="cursor-pointer"
+      style={{ transform: `translate(${x}px, ${y}px)`, transition: `transform ${TRANSITION_MS}ms ease` }}
     >
-      <polygon points={leftFace} fill={shade(baseColor, 0.35)} stroke="rgba(2,6,23,0.6)" strokeWidth="0.5" />
-      <polygon points={rightFace} fill={shade(baseColor, 0.15)} stroke="rgba(2,6,23,0.6)" strokeWidth="0.5" />
-      <polygon points={topFace} fill={tint(baseColor, 0.15)} stroke="rgba(2,6,23,0.6)" strokeWidth="0.5" />
+      <g style={{ transform: `scaleY(${heightRatio})`, transformOrigin: '0px 0px', transition: `transform ${TRANSITION_MS}ms ease` }}>
+        <polygon points={leftFace} fill={shade(baseColor, 0.35)} stroke="rgba(2,6,23,0.6)" strokeWidth="0.5" style={faceTransition} />
+        <polygon points={rightFace} fill={shade(baseColor, 0.15)} stroke="rgba(2,6,23,0.6)" strokeWidth="0.5" style={faceTransition} />
+        <polygon points={topFace} fill={tint(baseColor, 0.15)} stroke="rgba(2,6,23,0.6)" strokeWidth="0.5" style={faceTransition} />
+      </g>
     </g>
   );
 }
@@ -109,10 +172,56 @@ function ShelterMarker({ x, y, shelter, onHover, onLeave }) {
         fill="rgba(15,23,42,0.9)"
         stroke={strain}
         strokeWidth="2"
+        style={{ transition: `stroke ${TRANSITION_MS}ms ease` }}
       />
-      <path d={`M ${x - 6} ${y - 2} L ${x} ${y - 8} L ${x + 6} ${y - 2}`} fill="none" stroke={strain} strokeWidth="1.5" />
-      <rect x={x - 3} y={y + 1} width="6" height="7" fill={strain} opacity="0.85" />
+      <path
+        d={`M ${x - 6} ${y - 2} L ${x} ${y - 8} L ${x + 6} ${y - 2}`}
+        fill="none"
+        stroke={strain}
+        strokeWidth="1.5"
+        style={{ transition: `stroke ${TRANSITION_MS}ms ease` }}
+      />
+      <rect x={x - 3} y={y + 1} width="6" height="7" fill={strain} opacity="0.85" style={{ transition: `fill ${TRANSITION_MS}ms ease` }} />
     </g>
+  );
+}
+
+/**
+ * Renders a road as a status-colored/dashed polyline. Road coordinates
+ * never change between keyframes, only `status` — so color transitions
+ * smoothly via plain CSS, but the dash pattern is a discrete swap that
+ * CSS can't interpolate. A short-lived "ghost" of the previous status,
+ * rendered on top and faded to opacity 0, papers over that pop with a
+ * quick crossfade instead.
+ */
+function RoadLine({ road, points }) {
+  const pointsAttr = points.map((p) => p.join(',')).join(' ');
+  const { ghost, fading } = useGhostOnChange(road.status);
+
+  return (
+    <>
+      <polyline
+        points={pointsAttr}
+        fill="none"
+        stroke={ROAD_STATUS_HEX[road.status] || ROAD_STATUS_HEX.clear}
+        strokeWidth="3"
+        strokeDasharray={ROAD_STATUS_DASH[road.status] || 'none'}
+        strokeLinecap="round"
+        opacity="0.85"
+        style={{ transition: `stroke ${TRANSITION_MS}ms ease` }}
+      />
+      {ghost && (
+        <polyline
+          points={pointsAttr}
+          fill="none"
+          stroke={ROAD_STATUS_HEX[ghost] || ROAD_STATUS_HEX.clear}
+          strokeWidth="3"
+          strokeDasharray={ROAD_STATUS_DASH[ghost] || 'none'}
+          strokeLinecap="round"
+          style={{ opacity: fading ? 0 : 0.85, transition: `opacity ${TRANSITION_MS}ms ease` }}
+        />
+      )}
+    </>
   );
 }
 
@@ -178,16 +287,7 @@ export function MapView({ scenario = defaultScenario }) {
       <svg viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`} className="relative h-full w-full">
         {/* Roads, drawn first so buildings/shelters render on top */}
         {projectedRoads.map((road) => (
-          <polyline
-            key={road.id}
-            points={road.points.map((p) => p.join(',')).join(' ')}
-            fill="none"
-            stroke={ROAD_STATUS_HEX[road.status] || ROAD_STATUS_HEX.clear}
-            strokeWidth="3"
-            strokeDasharray={ROAD_STATUS_DASH[road.status] || 'none'}
-            strokeLinecap="round"
-            opacity="0.85"
-          />
+          <RoadLine key={road.id} road={road} points={road.points} />
         ))}
 
         {/* Buildings */}
