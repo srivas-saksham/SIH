@@ -1,7 +1,20 @@
+import { useState } from 'react';
 import { systemOverview } from '../data/systemOverview';
 import { scenarioPresets } from '../scenarios/scenarioPresets';
 import { getRiskClasses } from '../utils/riskStyles';
+import { getScenarioById, matchScenario, scenarios } from '../utils/scenarioMatcher';
+import { MapView } from './MapView';
 import { TopNav } from './TopNav';
+
+// Fake "AI thinking" delay range (ms) for free-text scenario input, so
+// the keyword match feels like real processing rather than an instant
+// lookup. Preset chips skip this entirely (see handlePresetClick).
+const THINKING_DELAY_MIN = 1100;
+const THINKING_DELAY_MAX = 1900;
+
+function randomThinkingDelay() {
+  return THINKING_DELAY_MIN + Math.random() * (THINKING_DELAY_MAX - THINKING_DELAY_MIN);
+}
 
 function Dot({ level }) {
   const { dot } = getRiskClasses(level);
@@ -9,6 +22,37 @@ function Dot({ level }) {
 }
 
 export function CommandShell() {
+  // Security scenarios are the primary demo use case, so that's the
+  // default active scenario (matches Task 3's hardcoded starting point).
+  const [activeScenario, setActiveScenario] = useState(scenarios[0]);
+  const [inputValue, setInputValue] = useState('');
+  const [isThinking, setIsThinking] = useState(false);
+
+  function handleScenarioSubmit(event) {
+    event.preventDefault();
+    if (isThinking) return; // ignore double-submits mid "thinking"
+
+    const query = inputValue;
+    setIsThinking(true);
+
+    // Fake AI processing delay — the actual match is instant, but a
+    // real lookup happening in 0ms wouldn't sell the "AI interpreting
+    // your scenario" moment the demo is going for.
+    window.setTimeout(() => {
+      const matched = matchScenario(query);
+      setActiveScenario(matched);
+      setIsThinking(false);
+    }, randomThinkingDelay());
+  }
+
+  function handlePresetClick(scenarioId) {
+    // Preset chips are a known, direct scenario reference — no need to
+    // run them through the matcher or fake a thinking delay.
+    const matched = getScenarioById(scenarioId);
+    setActiveScenario(matched);
+    setInputValue('');
+  }
+
   return (
     <div className="min-h-screen bg-background text-slate-100">
       <div className="mx-auto flex min-h-screen max-w-[1600px] flex-col px-4 py-4 sm:px-5 lg:px-8">
@@ -26,40 +70,23 @@ export function CommandShell() {
                   <h2 className="mt-1 text-xl font-semibold text-slate-50">{systemOverview.incident}</h2>
                 </div>
                 <div className="rounded-full border border-risks-red/40 bg-risks-red/10 px-3 py-1 text-[10px] uppercase tracking-[0.22em] text-risks-red">
-                  High risk signal
+                  {isThinking ? 'Interpreting scenario…' : activeScenario.name}
                 </div>
               </div>
 
-              <div className="relative mt-4 flex-1 overflow-hidden rounded-2xl border border-slate-800 bg-[#08111d]">
-                <div className="absolute inset-0 opacity-25 [background-image:linear-gradient(rgba(148,163,184,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.12)_1px,transparent_1px)] [background-size:36px_36px]" />
-                <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(94,234,212,0.08),transparent_35%)]" />
+              <div className="relative mt-4 min-h-[420px] flex-1 overflow-hidden">
+                <MapView scenario={activeScenario} />
 
-                <div className="absolute left-7 top-10 h-20 w-20 rounded-full border border-accent/40 bg-accent/10 blur-xl" />
-                <div className="absolute right-16 top-20 h-24 w-24 rounded-full border border-risks-red/30 bg-risks-red/10 blur-xl" />
-                <div className="absolute bottom-14 left-1/3 h-20 w-20 rounded-full border border-risks-yellow/30 bg-risks-yellow/10 blur-xl" />
-
-                <svg viewBox="0 0 900 540" className="relative h-full w-full">
-                  <path d="M70 320 C210 250, 250 210, 340 240 S520 320, 650 270 S770 180, 830 210" fill="none" stroke="rgba(94,234,212,0.75)" strokeWidth="2.5" strokeDasharray="12 12" />
-                  <path d="M120 145 C260 120, 300 160, 360 190 S500 260, 590 250 S720 120, 830 150" fill="none" stroke="rgba(248,113,113,0.65)" strokeWidth="2.5" strokeDasharray="10 10" />
-                  <path d="M180 420 C270 390, 320 330, 400 350 S560 480, 660 415 S770 310, 870 330" fill="none" stroke="rgba(250,204,21,0.6)" strokeWidth="2.5" strokeDasharray="8 10" />
-                  <circle cx="323" cy="238" r="12" fill="rgba(14,165,233,0.2)" stroke="rgba(94,234,212,0.9)" strokeWidth="2" />
-                  <circle cx="590" cy="248" r="14" fill="rgba(239,68,68,0.2)" stroke="rgba(248,113,113,0.9)" strokeWidth="2" />
-                  <circle cx="752" cy="298" r="11" fill="rgba(251,146,60,0.2)" stroke="rgba(251,146,60,0.9)" strokeWidth="2" />
-                  <circle cx="835" cy="210" r="9" fill="rgba(34,197,94,0.2)" stroke="rgba(34,197,94,0.9)" strokeWidth="2" />
-                </svg>
-
-                <div className="absolute left-6 top-6 flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/75 px-3 py-2 text-[10px] uppercase tracking-[0.26em] text-slate-300">
-                  <span className="inline-block h-2 w-2 rounded-full bg-risks-red" />
-                  Northern corridor
-                </div>
-
-                <div className="absolute bottom-6 left-6 rounded-2xl border border-slate-700 bg-slate-950/80 p-3 backdrop-blur-sm">
-                  <p className="text-[10px] uppercase tracking-[0.26em] text-slate-400">Live status</p>
-                  <div className="mt-2 flex items-center gap-3">
-                    <span className="text-3xl font-semibold text-slate-50">82</span>
-                    <span className="text-sm text-slate-300">pressure index</span>
+                {isThinking && (
+                  <div className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl bg-slate-950/70 backdrop-blur-sm">
+                    <div className="flex flex-col items-center gap-3">
+                      <div className="h-10 w-10 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+                      <p className="animate-pulse text-[11px] uppercase tracking-[0.32em] text-accent">
+                        AI interpreting scenario…
+                      </p>
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
             </div>
           </section>
@@ -126,26 +153,36 @@ export function CommandShell() {
               <label htmlFor="scenario" className="text-[10px] uppercase tracking-[0.3em] text-slate-400">
                 Scenario input
               </label>
-              <div className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900/80 px-3 py-3">
-                <span className="text-accent">›</span>
+              <form
+                onSubmit={handleScenarioSubmit}
+                className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900/80 px-3 py-3"
+              >
+                {isThinking ? (
+                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+                ) : (
+                  <span className="text-accent">›</span>
+                )}
                 <input
                   id="scenario"
                   type="text"
-                  value="Cross-border clearance delay on western dock"
-                  readOnly
-                  className="w-full border-0 bg-transparent font-mono text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                  value={inputValue}
+                  onChange={(event) => setInputValue(event.target.value)}
+                  disabled={isThinking}
+                  placeholder="e.g. high-severity hostile attack in Central Delhi"
+                  className="w-full border-0 bg-transparent font-mono text-sm text-slate-100 outline-none placeholder:text-slate-500 disabled:opacity-60"
                 />
-              </div>
+              </form>
             </div>
 
             <div className="flex flex-wrap gap-2 xl:justify-end">
-              {scenarioPresets.map((scenario) => (
+              {scenarioPresets.map((preset) => (
                 <button
-                  key={scenario.name}
+                  key={preset.name}
                   type="button"
-                  className={`rounded-full border px-3 py-2 text-[10px] uppercase tracking-[0.24em] ${getRiskClasses(scenario.severity).pill}`}
+                  onClick={() => handlePresetClick(preset.scenarioId)}
+                  className={`rounded-full border px-3 py-2 text-[10px] uppercase tracking-[0.24em] transition hover:brightness-125 ${getRiskClasses(preset.severity).pill}`}
                 >
-                  {scenario.name}
+                  {preset.name}
                 </button>
               ))}
             </div>

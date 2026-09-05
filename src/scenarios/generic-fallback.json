@@ -1,0 +1,123 @@
+{
+  "id": "generic-fallback",
+  "name": "Generic Resilience Scenario",
+  "keywords": [],
+  "baseline": {
+    "buildings": [
+      { "id": "b1", "riskLevel": "orange", "lat": 28.6200, "lng": 77.2100 },
+      { "id": "b2", "riskLevel": "yellow", "lat": 28.6215, "lng": 77.2120 },
+      { "id": "b3", "riskLevel": "yellow", "lat": 28.6185, "lng": 77.2085 },
+      { "id": "b4", "riskLevel": "green", "lat": 28.6230, "lng": 77.2070 },
+      { "id": "b5", "riskLevel": "green", "lat": 28.6170, "lng": 77.2140 },
+      { "id": "b6", "riskLevel": "yellow", "lat": 28.6245, "lng": 77.2110 },
+      { "id": "b7", "riskLevel": "green", "lat": 28.6160, "lng": 77.2160 },
+      { "id": "b8", "riskLevel": "green", "lat": 28.6255, "lng": 77.2150 }
+    ],
+    "roads": [
+      { "id": "r1", "status": "congested", "coords": [[28.6200, 77.2100], [28.6215, 77.2120]] },
+      { "id": "r2", "status": "clear", "coords": [[28.6185, 77.2085], [28.6170, 77.2140]] },
+      { "id": "r3", "status": "clear", "coords": [[28.6230, 77.2070], [28.6245, 77.2110]] },
+      { "id": "r4", "status": "clear", "coords": [[28.6160, 77.2160], [28.6255, 77.2150]] }
+    ],
+    "shelters": [
+      { "id": "s1", "capacity": 400, "occupancy": 240, "lat": 28.6270, "lng": 77.2050 },
+      { "id": "s2", "capacity": 300, "occupancy": 150, "lat": 28.6145, "lng": 77.2175 },
+      { "id": "s3", "capacity": 350, "occupancy": 180, "lat": 28.6210, "lng": 77.2180 }
+    ]
+  },
+  "intervention": {
+    "buildings": [
+      { "id": "b1", "riskLevel": "yellow", "lat": 28.6200, "lng": 77.2100 },
+      { "id": "b2", "riskLevel": "green", "lat": 28.6215, "lng": 77.2120 },
+      { "id": "b3", "riskLevel": "green", "lat": 28.6185, "lng": 77.2085 },
+      { "id": "b4", "riskLevel": "green", "lat": 28.6230, "lng": 77.2070 },
+      { "id": "b5", "riskLevel": "green", "lat": 28.6170, "lng": 77.2140 },
+      { "id": "b6", "riskLevel": "green", "lat": 28.6245, "lng": 77.2110 },
+      { "id": "b7", "riskLevel": "green", "lat": 28.6160, "lng": 77.2160 },
+      { "id": "b8", "riskLevel": "green", "lat": 28.6255, "lng": 77.2150 }
+    ],
+    "roads": [
+      { "id": "r1", "status": "clear", "coords": [[28.6200, 77.2100], [28.6215, 77.2120]] },
+      { "id": "r2", "status": "clear", "coords": [[28.6185, 77.2085], [28.6170, 77.2140]] },
+      { "id": "r3", "status": "clear", "coords": [[28.6230, 77.2070], [28.6245, 77.2110]] },
+      { "id": "r4", "status": "clear", "coords": [[28.6160, 77.2160], [28.6255, 77.2150]] }
+    ],
+    "shelters": [
+      { "id": "s1", "capacity": 400, "occupancy": 150, "lat": 28.6270, "lng": 77.2050 },
+      { "id": "s2", "capacity": 300, "occupancy": 90, "lat": 28.6145, "lng": 77.2175 },
+      { "id": "s3", "capacity": 350, "occupancy": 110, "lat": 28.6210, "lng": 77.2180 }
+    ]
+  },
+  "timeline": [
+    {
+      "label": "T+0",
+      "buildings": [
+        { "id": "b1", "riskLevel": "orange" }
+      ],
+      "roads": [
+        { "id": "r1", "status": "congested" }
+      ],
+      "shelters": []
+    },
+    {
+      "label": "T+5",
+      "buildings": [
+        { "id": "b2", "riskLevel": "yellow" }
+      ],
+      "roads": [],
+      "shelters": [
+        { "id": "s1", "occupancy": 200 }
+      ]
+    },
+    {
+      "label": "T+10",
+      "buildings": [
+        { "id": "b3", "riskLevel": "yellow" }
+      ],
+      "roads": [],
+      "shelters": [
+        { "id": "s1", "occupancy": 220 },
+        { "id": "s2", "occupancy": 130 }
+      ]
+    },
+    {
+      "label": "T+15",
+      "buildings": [
+        { "id": "b6", "riskLevel": "yellow" }
+      ],
+      "roads": [],
+      "shelters": [
+        { "id": "s2", "occupancy": 150 },
+        { "id": "s3", "occupancy": 170 }
+      ]
+    },
+    {
+      "label": "T+30",
+      "buildings": [
+        { "id": "b1", "riskLevel": "orange" }
+      ],
+      "roads": [
+        { "id": "r1", "status": "congested" }
+      ],
+      "shelters": [
+        { "id": "s1", "occupancy": 240 },
+        { "id": "s2", "occupancy": 150 },
+        { "id": "s3", "occupancy": 180 }
+      ]
+    }
+  ],
+  "causalFactors": {
+    "shelterDeficit": 30,
+    "populationDensity": 42,
+    "roadAccessibility": 65,
+    "infrastructure": 58
+  },
+  "comparisonStats": {
+    "evacTimeBefore": 28,
+    "evacTimeAfter": 18,
+    "overloadBefore": 60,
+    "overloadAfter": 38,
+    "riskZonesBefore": 2,
+    "riskZonesAfter": 1
+  }
+}

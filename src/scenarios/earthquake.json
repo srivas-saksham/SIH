@@ -1,0 +1,154 @@
+{
+  "id": "earthquake",
+  "name": "Earthquake — Central Delhi Zone",
+  "keywords": [
+    "earthquake", "quake", "tremor", "seismic", "aftershock",
+    "magnitude", "richter", "shaking", "building collapse"
+  ],
+  "baseline": {
+    "buildings": [
+      { "id": "b1", "riskLevel": "red", "lat": 28.6304, "lng": 77.2177 },
+      { "id": "b2", "riskLevel": "red", "lat": 28.6289, "lng": 77.2195 },
+      { "id": "b3", "riskLevel": "red", "lat": 28.6318, "lng": 77.2160 },
+      { "id": "b4", "riskLevel": "orange", "lat": 28.6275, "lng": 77.2210 },
+      { "id": "b5", "riskLevel": "orange", "lat": 28.6330, "lng": 77.2145 },
+      { "id": "b6", "riskLevel": "orange", "lat": 28.6260, "lng": 77.2180 },
+      { "id": "b7", "riskLevel": "yellow", "lat": 28.6345, "lng": 77.2200 },
+      { "id": "b8", "riskLevel": "yellow", "lat": 28.6250, "lng": 77.2225 },
+      { "id": "b9", "riskLevel": "yellow", "lat": 28.6300, "lng": 77.2240 },
+      { "id": "b10", "riskLevel": "green", "lat": 28.6360, "lng": 77.2160 },
+      { "id": "b11", "riskLevel": "green", "lat": 28.6235, "lng": 77.2190 }
+    ],
+    "roads": [
+      { "id": "r1", "status": "blocked", "coords": [[28.6304, 77.2177], [28.6289, 77.2195]] },
+      { "id": "r2", "status": "blocked", "coords": [[28.6318, 77.2160], [28.6330, 77.2145]] },
+      { "id": "r3", "status": "congested", "coords": [[28.6275, 77.2210], [28.6260, 77.2180]] },
+      { "id": "r4", "status": "congested", "coords": [[28.6345, 77.2200], [28.6300, 77.2240]] },
+      { "id": "r5", "status": "clear", "coords": [[28.6360, 77.2160], [28.6235, 77.2190]] }
+    ],
+    "shelters": [
+      { "id": "s1", "capacity": 600, "occupancy": 590, "lat": 28.6370, "lng": 77.2130 },
+      { "id": "s2", "capacity": 450, "occupancy": 430, "lat": 28.6220, "lng": 77.2230 },
+      { "id": "s3", "capacity": 400, "occupancy": 250, "lat": 28.6320, "lng": 77.2260 },
+      { "id": "s4", "capacity": 300, "occupancy": 290, "lat": 28.6255, "lng": 77.2150 }
+    ]
+  },
+  "intervention": {
+    "buildings": [
+      { "id": "b1", "riskLevel": "orange", "lat": 28.6304, "lng": 77.2177 },
+      { "id": "b2", "riskLevel": "orange", "lat": 28.6289, "lng": 77.2195 },
+      { "id": "b3", "riskLevel": "orange", "lat": 28.6318, "lng": 77.2160 },
+      { "id": "b4", "riskLevel": "yellow", "lat": 28.6275, "lng": 77.2210 },
+      { "id": "b5", "riskLevel": "yellow", "lat": 28.6330, "lng": 77.2145 },
+      { "id": "b6", "riskLevel": "yellow", "lat": 28.6260, "lng": 77.2180 },
+      { "id": "b7", "riskLevel": "green", "lat": 28.6345, "lng": 77.2200 },
+      { "id": "b8", "riskLevel": "green", "lat": 28.6250, "lng": 77.2225 },
+      { "id": "b9", "riskLevel": "green", "lat": 28.6300, "lng": 77.2240 },
+      { "id": "b10", "riskLevel": "green", "lat": 28.6360, "lng": 77.2160 },
+      { "id": "b11", "riskLevel": "green", "lat": 28.6235, "lng": 77.2190 }
+    ],
+    "roads": [
+      { "id": "r1", "status": "congested", "coords": [[28.6304, 77.2177], [28.6289, 77.2195]] },
+      { "id": "r2", "status": "clear", "coords": [[28.6318, 77.2160], [28.6330, 77.2145]] },
+      { "id": "r3", "status": "clear", "coords": [[28.6275, 77.2210], [28.6260, 77.2180]] },
+      { "id": "r4", "status": "clear", "coords": [[28.6345, 77.2200], [28.6300, 77.2240]] },
+      { "id": "r5", "status": "clear", "coords": [[28.6360, 77.2160], [28.6235, 77.2190]] }
+    ],
+    "shelters": [
+      { "id": "s1", "capacity": 600, "occupancy": 400, "lat": 28.6370, "lng": 77.2130 },
+      { "id": "s2", "capacity": 450, "occupancy": 300, "lat": 28.6220, "lng": 77.2230 },
+      { "id": "s3", "capacity": 400, "occupancy": 220, "lat": 28.6320, "lng": 77.2260 },
+      { "id": "s4", "capacity": 300, "occupancy": 180, "lat": 28.6255, "lng": 77.2150 },
+      { "id": "s5", "capacity": 350, "occupancy": 140, "lat": 28.6390, "lng": 77.2200 }
+    ]
+  },
+  "timeline": [
+    {
+      "label": "T+0",
+      "buildings": [
+        { "id": "b1", "riskLevel": "orange" },
+        { "id": "b3", "riskLevel": "orange" }
+      ],
+      "roads": [
+        { "id": "r1", "status": "congested" }
+      ],
+      "shelters": []
+    },
+    {
+      "label": "T+5",
+      "buildings": [
+        { "id": "b1", "riskLevel": "red" },
+        { "id": "b2", "riskLevel": "red" }
+      ],
+      "roads": [
+        { "id": "r1", "status": "blocked" },
+        { "id": "r2", "status": "congested" }
+      ],
+      "shelters": [
+        { "id": "s1", "occupancy": 320 }
+      ]
+    },
+    {
+      "label": "T+10",
+      "buildings": [
+        { "id": "b3", "riskLevel": "red" },
+        { "id": "b4", "riskLevel": "orange" },
+        { "id": "b5", "riskLevel": "orange" }
+      ],
+      "roads": [
+        { "id": "r2", "status": "blocked" },
+        { "id": "r3", "status": "congested" }
+      ],
+      "shelters": [
+        { "id": "s1", "occupancy": 500 },
+        { "id": "s2", "occupancy": 350 }
+      ]
+    },
+    {
+      "label": "T+15",
+      "buildings": [
+        { "id": "b6", "riskLevel": "orange" },
+        { "id": "b7", "riskLevel": "yellow" }
+      ],
+      "roads": [
+        { "id": "r4", "status": "congested" }
+      ],
+      "shelters": [
+        { "id": "s1", "occupancy": 580 },
+        { "id": "s2", "occupancy": 420 },
+        { "id": "s4", "occupancy": 260 }
+      ]
+    },
+    {
+      "label": "T+30",
+      "buildings": [
+        { "id": "b8", "riskLevel": "yellow" },
+        { "id": "b9", "riskLevel": "yellow" },
+        { "id": "b10", "riskLevel": "green" }
+      ],
+      "roads": [
+        { "id": "r5", "status": "clear" }
+      ],
+      "shelters": [
+        { "id": "s1", "occupancy": 590 },
+        { "id": "s2", "occupancy": 430 },
+        { "id": "s3", "occupancy": 250 },
+        { "id": "s4", "occupancy": 290 }
+      ]
+    }
+  ],
+  "causalFactors": {
+    "shelterDeficit": 71,
+    "populationDensity": 66,
+    "roadAccessibility": 40,
+    "infrastructure": 82
+  },
+  "comparisonStats": {
+    "evacTimeBefore": 52,
+    "evacTimeAfter": 30,
+    "overloadBefore": 96,
+    "overloadAfter": 61,
+    "riskZonesBefore": 6,
+    "riskZonesAfter": 3
+  }
+}
