@@ -5,6 +5,8 @@ import { describeDelta } from '../utils/describeKeyframeDelta';
 import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
 import { getRiskClasses } from '../utils/riskStyles';
 import { getScenarioById, matchScenario, scenarios } from '../utils/scenarioMatcher';
+import { CausalBreakdown } from './CausalBreakdown';
+import { ComparisonPanel } from './ComparisonPanel';
 import { MapView } from './MapView';
 import { TimelineScrubber } from './TimelineScrubber';
 import { TopNav } from './TopNav';
@@ -31,6 +33,27 @@ function getMergedStateForIndex(scenario, index) {
   }
 }
 
+/**
+ * Causal factors are a static per-scenario snapshot by default (Task 2's
+ * data model — one `causalFactors` object per scenario, not per
+ * keyframe). This adds a lightweight, backward-compatible per-keyframe
+ * override on top of that: if the keyframe object at `scenario.timeline`
+ * index `index` optionally carries its own `causalFactors`, that's used
+ * instead; otherwise this falls back to the scenario-level static value.
+ * No existing scenario JSON needs to change for this — none of the four
+ * current datasets define per-keyframe factors yet, so today's behavior
+ * is identical to the plain static approach, but a future task/dataset
+ * can add per-keyframe factors without touching this code again.
+ */
+function getCausalFactorsForIndex(scenario, index) {
+  const timeline = scenario.timeline;
+  if (!Array.isArray(timeline) || timeline.length === 0 || index <= 0) {
+    return scenario.causalFactors;
+  }
+  const clampedIndex = Math.min(index, timeline.length - 1);
+  return timeline[clampedIndex]?.causalFactors ?? scenario.causalFactors;
+}
+
 // Fake "AI thinking" delay range (ms) for free-text scenario input, so
 // the keyword match feels like real processing rather than an instant
 // lookup. Preset chips skip this entirely (see handlePresetClick).
@@ -39,11 +62,6 @@ const THINKING_DELAY_MAX = 1900;
 
 function randomThinkingDelay() {
   return THINKING_DELAY_MIN + Math.random() * (THINKING_DELAY_MAX - THINKING_DELAY_MIN);
-}
-
-function Dot({ level }) {
-  const { dot } = getRiskClasses(level);
-  return <span className={`h-2.5 w-2.5 rounded-full ${dot}`} />;
 }
 
 export function CommandShell() {
@@ -59,17 +77,23 @@ export function CommandShell() {
   const [currentKeyframeIndex, setCurrentKeyframeIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
 
+  // Task 7: whether the user has clicked "Apply intervention" for the
+  // current scenario. Owned here, same pattern as the timeline state
+  // above, since both ComparisonPanel and MapView need to react to it.
+  const [interventionApplied, setInterventionApplied] = useState(false);
+
   // Switching scenarios (free-text match or preset chip) must never carry
-  // a mid-timeline position into the newly-selected scenario. Reset it
-  // during render (React's documented "adjust state when a prop changes"
-  // pattern) rather than in a useEffect, so the reset lands in the same
-  // commit as the scenario change instead of flashing the old timeline
-  // position for one extra frame.
+  // a mid-timeline position — or an applied intervention — into the
+  // newly-selected scenario. Reset it during render (React's documented
+  // "adjust state when a prop changes" pattern) rather than in a
+  // useEffect, so the reset lands in the same commit as the scenario
+  // change instead of flashing the old state for one extra frame.
   const [resetForScenarioId, setResetForScenarioId] = useState(activeScenario.id);
   if (resetForScenarioId !== activeScenario.id) {
     setResetForScenarioId(activeScenario.id);
     setCurrentKeyframeIndex(0);
     setIsPlaying(false);
+    setInterventionApplied(false);
   }
 
   const mergedMapState = useMemo(
@@ -77,13 +101,27 @@ export function CommandShell() {
     [activeScenario, currentKeyframeIndex],
   );
 
+  // Task 7: when an intervention has been applied, MapView shows the
+  // scenario's `intervention` state instead of the timeline-merged one —
+  // chosen over trying to also fold the current `currentKeyframeIndex` on
+  // top of it, since `intervention` already represents a full alternate
+  // baseline-shaped end-state ("what we did about it"), not another point
+  // on the same unmitigated timeline. Combining both cleanly would need a
+  // second merge axis for comparatively little demo value. Scrubbing the
+  // timeline while an intervention is active resets `interventionApplied`
+  // instead (see handleTimelineIndexChange) specifically so this override
+  // can stay this simple without the two ever needing to coexist.
+  const activeMapState = interventionApplied ? activeScenario.intervention : mergedMapState;
+
   // MapView already renders `scenario.baseline` as its data source (Task
-  // 3/4), so the simplest way to feed it the time-merged state is to pass
-  // a shallow-cloned scenario with `baseline` swapped for the merged
-  // state — no MapView changes needed for *which* state it renders.
+  // 3/4), so the simplest way to feed it either the time-merged state or
+  // the intervention state is to pass a shallow-cloned scenario with
+  // `baseline` swapped for whichever applies — no MapView changes needed
+  // for *which* state it renders, and it animates into the new state via
+  // the same CSS-transition/ghost-crossfade machinery from Task 5.
   const mapViewScenario = useMemo(
-    () => ({ ...activeScenario, baseline: mergedMapState }),
-    [activeScenario, mergedMapState],
+    () => ({ ...activeScenario, baseline: activeMapState }),
+    [activeScenario, activeMapState],
   );
 
   const timelineStatusText = useMemo(() => {
@@ -91,6 +129,11 @@ export function CommandShell() {
     const prevState = getMergedStateForIndex(activeScenario, currentKeyframeIndex - 1);
     return describeDelta(prevState, mergedMapState);
   }, [activeScenario, currentKeyframeIndex, mergedMapState]);
+
+  const activeCausalFactors = useMemo(
+    () => getCausalFactorsForIndex(activeScenario, currentKeyframeIndex),
+    [activeScenario, currentKeyframeIndex],
+  );
 
   function handleScenarioSubmit(event) {
     event.preventDefault();
@@ -115,6 +158,28 @@ export function CommandShell() {
     const matched = getScenarioById(scenarioId);
     setActiveScenario(matched);
     setInputValue('');
+  }
+
+  // Task 7, point 4: scrubbing the timeline while an intervention is
+  // applied automatically clears `interventionApplied` — treated as
+  // "stepping back into the unmitigated timeline." Chosen over dimming
+  // the scrubber and ignoring input, since a single choke point here
+  // (every drag/click/keyboard/autoplay path in TimelineScrubber routes
+  // through onIndexChange) is simpler to get right than disabling an
+  // interactive control mid-gesture.
+  function handleTimelineIndexChange(nextIndex) {
+    if (interventionApplied) setInterventionApplied(false);
+    setCurrentKeyframeIndex(nextIndex);
+  }
+
+  // Task 7, point 5: no revert affordance — once applied, the button is
+  // simply disabled (see ComparisonPanel) until a scenario switch or
+  // timeline scrub resets it. Simpler than adding a secondary "Reset"
+  // link, and those two existing reset paths already cover "I want to see
+  // the baseline again" without a redundant third control.
+  function handleApplyIntervention() {
+    if (interventionApplied) return;
+    setInterventionApplied(true);
   }
 
   return (
@@ -156,47 +221,13 @@ export function CommandShell() {
           </section>
 
           <aside className="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 shadow-[0_0_0_1px_rgba(15,23,42,0.8)]">
-            <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-              <div className="flex items-center justify-between">
-                <p className="text-[10px] uppercase tracking-[0.28em] text-slate-400">Causal breakdown</p>
-                <span className="text-xs text-slate-300">4 nodes</span>
-              </div>
+            <CausalBreakdown factors={activeCausalFactors} />
 
-              <div className="mt-4 space-y-3">
-                {systemOverview.causalBreakdown.map((item) => {
-                  const { pill } = getRiskClasses(item.risk);
-                  return (
-                    <div key={item.title} className="rounded-xl border border-slate-800 bg-slate-950/80 p-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2 text-sm font-medium text-slate-100">
-                          <Dot level={item.risk} />
-                          {item.title}
-                        </div>
-                        <span className={`rounded-full border px-2 py-1 text-[9px] uppercase tracking-[0.2em] ${pill}`}>
-                          {item.risk}
-                        </span>
-                      </div>
-                      <p className="mt-2 text-sm leading-6 text-slate-400">{item.detail}</p>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-              <p className="text-[10px] uppercase tracking-[0.28em] text-slate-400">Comparison</p>
-              <div className="mt-4 space-y-3">
-                {systemOverview.comparison.map((item, index) => (
-                  <div key={item.label} className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <div className={`h-2.5 w-2.5 rounded-full ${index === 0 ? 'bg-risks-green' : index === 1 ? 'bg-risks-red' : 'bg-risks-yellow'}`} />
-                      <span className="text-sm text-slate-300">{item.label}</span>
-                    </div>
-                    <span className="font-mono text-sm text-slate-50">{item.value}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <ComparisonPanel
+              comparisonStats={activeScenario.comparisonStats}
+              interventionApplied={interventionApplied}
+              onApply={handleApplyIntervention}
+            />
           </aside>
         </main>
 
@@ -205,7 +236,7 @@ export function CommandShell() {
             <TimelineScrubber
               keyframes={activeScenario.timeline}
               currentIndex={currentKeyframeIndex}
-              onIndexChange={setCurrentKeyframeIndex}
+              onIndexChange={handleTimelineIndexChange}
               isPlaying={isPlaying}
               onPlayToggle={setIsPlaying}
               statusText={timelineStatusText}

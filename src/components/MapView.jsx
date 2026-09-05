@@ -244,11 +244,23 @@ export function MapView({ scenario = defaultScenario }) {
     setHovered(null);
   }, [scenario.id]);
 
+  // Task 7 fix: the projector was previously memoized on `scenario.id`
+  // alone, on the assumption that a scenario's building/road/shelter
+  // *positions* never change across keyframes (Task 3/5 — only color,
+  // status, and occupancy vary over the timeline, so that held). The
+  // Task 7 intervention states break that assumption: several scenarios'
+  // `intervention.shelters` add a genuinely new shelter at coordinates
+  // outside the baseline bounding box (representing "we placed a new
+  // resource"). Recomputing bounds only when the point *count* changes
+  // (rather than on every render) keeps the timeline-scrub case cheap and
+  // stable while still re-fitting the view when intervention introduces a
+  // new marker outside the original footprint.
+  const boundsSignature = `${scenario.id}:${state.buildings.length}:${state.shelters.length}:${state.roads.length}`;
   const project = useMemo(() => {
     const bounds = computeBounds(state);
     return createProjector(bounds, { width: VIEW_WIDTH, height: VIEW_HEIGHT, padding: 60 });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenario.id]);
+  }, [boundsSignature]);
 
   const projectedBuildings = state.buildings.map((b) => {
     const [x, y] = project(b.lat, b.lng);
