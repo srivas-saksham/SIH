@@ -4,9 +4,20 @@ import { useEffect, useRef } from 'react';
 // maplibregl.NavigationControl below.
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
+// maplibre-gl v6 needs its Web Worker location told to it explicitly
+// under bundlers: `import.meta.url` (which the library normally uses to
+// auto-locate the worker) doesn't reliably resolve inside Vite's module
+// graph. `?worker&url` routes the worker file through Vite's own worker
+// pipeline so it — and the maplibre-gl-shared.mjs sibling chunk it
+// imports — actually get emitted, instead of `?url` alone which drops
+// that sibling and leaves the worker unable to load. This one-time call
+// (see below, right after the imports) is what makes tile parsing work
+// in dev; without it the map silently never leaves an unloaded state
+// (root cause of the Task 8b blank-map bug — see PROJECT_CONTEXT.md).
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 import * as turf from '@turf/turf';
 import { RISK_HEX } from './MapView';
-import { LANDMARK_IDS, createLandmarksGeoJSON, withRiskLevels } from '../data/delhiLandmarks';
+import { LANDMARK_IDS, LANDMARKS } from '../data/delhiLandmarks';
 
 /**
  * MapLibreView — Task 8b proof-of-concept 3D map, wired up for the
@@ -23,6 +34,11 @@ import { LANDMARK_IDS, createLandmarksGeoJSON, withRiskLevels } from '../data/de
  * needs to know about timeline indices, intervention flags, etc. — it
  * just renders whatever `scenario.baseline` currently says.
  */
+
+// Must run before the first `new maplibregl.Map(...)` anywhere in the
+// app. Module-level (not inside the component/effect) so it only ever
+// runs once, regardless of how many times MapLibreView mounts.
+maplibregl.setWorkerUrl(maplibreWorkerUrl);
 
 const STYLE_URL = 'https://tiles.openfreemap.org/styles/bright';
 
@@ -83,6 +99,22 @@ function findLabelLayerId(map) {
   return symbolLayer?.id;
 }
 
+// A single projected pixel rarely lands exactly on a real building
+// polygon — delhiLandmarks.js's coordinates are approximate lookups, not
+// survey-accurate, and a landmark's true footprint centroid can be a few
+// meters off from where its label/POI sits. Querying a small box around
+// the projected point (instead of the bare point) tolerates that slop
+// without risking false matches — 24px is roughly one building's width
+// at the zoom levels this scene actually uses (15–16.5).
+const FEATURE_QUERY_RADIUS_PX = 12;
+
+function queryBoxAround(point) {
+  return [
+    [point.x - FEATURE_QUERY_RADIUS_PX, point.y - FEATURE_QUERY_RADIUS_PX],
+    [point.x + FEATURE_QUERY_RADIUS_PX, point.y + FEATURE_QUERY_RADIUS_PX],
+  ];
+}
+
 export function MapLibreView({ scenario }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -96,8 +128,37 @@ export function MapLibreView({ scenario }) {
   const idleRotatePausedRef = useRef(false);
   const routeLineRef = useRef(null); // current evac route GeoJSON LineString
 
+  // Task 8c: landmark highlighting via setFeatureState instead of a
+  // drawn overlay. landmarkFeatureRef maps each landmark id to the real
+  // 3d-buildings feature MapLibre found for it ({ id, source,
+  // sourceLayer }, MapLibre's own setFeatureState target shape) once
+  // queryRenderedFeatures has successfully located it — see
+  // tryResolveLandmarkFeatures. currentRiskByIdRef holds the latest
+  // desired riskLevel per landmark id (from applyLandmarkRisk) so that a
+  // landmark resolved LATE (found on some subsequent 'idle' after
+  // already being assigned a risk level) still gets that risk level
+  // applied retroactively instead of silently staying unhighlighted.
+  const landmarkFeatureRef = useRef({});
+  const currentRiskByIdRef = useRef({});
+
   // -------------------------------------------------------------------
   // Map init — runs once on mount.
+  //
+  // Root cause of the Task 8b blank-map bug (see PROJECT_CONTEXT.md /
+  // MAPLIBRE_DEBUG_PROMPT.md for the full investigation trail): under
+  // Vite, maplibre-gl v6's Web Worker (which does all vector-tile
+  // parsing) never resolved, because `import.meta.url` — which the
+  // library normally uses to auto-locate its worker script — doesn't
+  // reliably resolve inside Vite's dev module graph. That's a
+  // bundler-level resolution failure, not a MapLibre runtime error, so
+  // it never surfaced as an `error` event on the map: tiles fetched
+  // fine, the style loaded fine, but nothing was ever decoded, so
+  // `load`/`idle` never fired. Fixed via the explicit setWorkerUrl()
+  // call at module scope above, paired with excluding maplibre-gl from
+  // Vite's dependency pre-bundling in vite.config.js (pre-bundling was
+  // the specific thing breaking the worker chunk's emission). The
+  // StrictMode double-invoke theory from the earlier debugging session
+  // was investigated and ruled out — it was never the actual cause.
   // -------------------------------------------------------------------
   useEffect(() => {
     const container = containerRef.current;
@@ -114,23 +175,15 @@ export function MapLibreView({ scenario }) {
       attributionControl: true,
     });
     mapRef.current = map;
-    // TEMPORARY debug hook — remove once the blank-map issue is
-    // resolved. Lets us inspect live map/container/canvas state from
-    // the browser console instead of guessing blind.
+    // Debug hook — harmless to keep, but safe to delete once you've
+    // confirmed the fix live (window.__debugMap.loaded() should read
+    // `true` once idle).
     window.__debugMap = map;
 
-    // TEMPORARY diagnostic logging — MapLibre's `loaded()` is stuck
-    // `false` with no visible console error, so we're logging its
-    // internal lifecycle events directly to find where it's actually
-    // stalling. Remove once resolved.
     map.on('error', (e) => {
       // eslint-disable-next-line no-console
       console.error('[MapLibre error event]', e.error || e);
     });
-    map.on('styledata', () => console.log('[MapLibre] styledata', map.isStyleLoaded()));
-    map.on('sourcedata', (e) => console.log('[MapLibre] sourcedata', e.sourceId, e.isSourceLoaded, e.dataType));
-    map.on('data', (e) => console.log('[MapLibre] data', e.dataType));
-    map.on('idle', () => console.log('[MapLibre] idle (loaded():', map.loaded(), ')'));
 
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
 
@@ -153,6 +206,16 @@ export function MapLibreView({ scenario }) {
       const labelLayerId = findLabelLayerId(map);
 
       // --- 1. 3D buildings from OpenFreeMap's own OSM building layer ---
+      // Task 8c: landmark highlighting used to be a separate overlay
+      // layer (a drawn shape sitting on top of the real building,
+      // hiding its actual geometry). It's now driven by feature-state
+      // directly on THIS layer instead — the 'case' below checks for a
+      // 'riskLevel' feature-state key (set via setFeatureState once a
+      // landmark's real building feature is found, see
+      // tryResolveLandmarkFeatures) and falls through to the original
+      // unchanged grayscale height interpolation for every building
+      // that isn't a matched landmark. No separate 'landmarks' source/
+      // layer exists anymore.
       map.addLayer(
         {
           id: '3d-buildings',
@@ -162,14 +225,28 @@ export function MapLibreView({ scenario }) {
           minzoom: 14,
           paint: {
             'fill-extrusion-color': [
-              'interpolate',
-              ['linear'],
-              ['coalesce', ['get', 'render_height'], 8],
-              0,
-              '#3a3a3f',
-              100,
-              '#5a5a60',
+              'case',
+              ['==', ['feature-state', 'riskLevel'], 'red'],
+              RISK_HEX.red,
+              ['==', ['feature-state', 'riskLevel'], 'orange'],
+              RISK_HEX.orange,
+              ['==', ['feature-state', 'riskLevel'], 'yellow'],
+              RISK_HEX.yellow,
+              ['==', ['feature-state', 'riskLevel'], 'green'],
+              RISK_HEX.green,
+              // Fallback for every non-landmark building — unchanged
+              // from the original grayscale height interpolation.
+              [
+                'interpolate',
+                ['linear'],
+                ['coalesce', ['get', 'render_height'], 8],
+                0,
+                '#3a3a3f',
+                100,
+                '#5a5a60',
+              ],
             ],
+            'fill-extrusion-color-transition': { duration: TRANSITION_MS },
             'fill-extrusion-height': [
               'interpolate',
               ['linear'],
@@ -186,34 +263,7 @@ export function MapLibreView({ scenario }) {
         labelLayerId,
       );
 
-      // --- 2. Our own controlled landmark footprints, on top ---
-      map.addSource('landmarks', { type: 'geojson', data: createLandmarksGeoJSON() });
-      map.addLayer({
-        id: 'landmarks-extrusion',
-        source: 'landmarks',
-        type: 'fill-extrusion',
-        paint: {
-          'fill-extrusion-color': [
-            'match',
-            ['get', 'riskLevel'],
-            'green',
-            RISK_HEX.green,
-            'yellow',
-            RISK_HEX.yellow,
-            'orange',
-            RISK_HEX.orange,
-            'red',
-            RISK_HEX.red,
-            RISK_HEX.green,
-          ],
-          'fill-extrusion-color-transition': { duration: TRANSITION_MS },
-          'fill-extrusion-height': ['get', 'baseHeight'],
-          'fill-extrusion-base': 0,
-          'fill-extrusion-opacity': 0.95,
-        },
-      });
-
-      // --- 3. Impact / blast-radius zone (grown in on activation) ---
+      // --- 2. Impact / blast-radius zone (grown in on activation) ---
       map.addSource('impact-zone', {
         type: 'geojson',
         data: turf.circle([FALLBACK_CENTER.lng, FALLBACK_CENTER.lat], 0.001, { steps: 64, units: 'kilometers' }),
@@ -236,7 +286,7 @@ export function MapLibreView({ scenario }) {
         paint: { 'line-color': RISK_HEX.red, 'line-width': 2, 'line-opacity': 0.6 },
       });
 
-      // --- 4. Evacuation route: static dashed line + animated point ---
+      // --- 3. Evacuation route: static dashed line + animated point ---
       map.addSource('evac-route', {
         type: 'geojson',
         data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } },
@@ -283,6 +333,32 @@ export function MapLibreView({ scenario }) {
     });
     map.on('dragend', () => {
       idleRotatePausedRef.current = false;
+    });
+
+    // Task 8c: resolve each landmark's real 3d-buildings feature ID on
+    // every 'idle' event, not just once after 'load'. 'idle' (not
+    // 'load' or flyTo's 'moveend') is the right signal specifically
+    // because it's the only one of the three that guarantees the
+    // current viewport's tiles have actually finished rendering and are
+    // queryable — 'load' can fire before that, and 'moveend' only means
+    // the camera stopped, not that tiles arrived.
+    //
+    // Retrying on every idle (rather than a single attempt tied to one
+    // moment in the flyTo choreography) is deliberate: this scene's
+    // camera starts at a wide establishing view (FALLBACK_CENTER, zoom
+    // 15) and then flies to whichever building the active scenario
+    // flags as the primary impact site — a location that can be over a
+    // kilometer from some of the 5 real landmarks (e.g. India Gate vs.
+    // Rashtrapati Bhavan). No single fixed moment reliably has all 5 in
+    // view. Checking on every idle means each landmark resolves
+    // whenever it actually becomes visible — at the initial wide view,
+    // after the flyTo, or after a later manual pan/zoom — instead of
+    // depending on exactly when in the choreography we happened to
+    // look. tryResolveLandmarkFeatures itself is a no-op past the point
+    // where all 5 are already resolved, so this costs nothing once
+    // settled.
+    map.on('idle', () => {
+      tryResolveLandmarkFeatures();
     });
 
     return () => {
@@ -347,12 +423,66 @@ export function MapLibreView({ scenario }) {
   // don't need to be referentially stable for any dependency array.
   // -------------------------------------------------------------------
 
+  /**
+   * Attempts to find each not-yet-resolved landmark's real building
+   * feature in the 3d-buildings layer via queryRenderedFeatures, and
+   * records the match in landmarkFeatureRef. Safe to call repeatedly —
+   * already-resolved landmarks are skipped, so calling this on every
+   * 'idle' event (see the map.on('idle', ...) listener above) is cheap
+   * once all 5 are found. A landmark whose query point never lands on a
+   * building in ANY viewport the camera visits during a session (most
+   * likely 'kartavya-path', a boulevard, not a building — see
+   * delhiLandmarks.js) simply never resolves and never gets highlighted;
+   * that's an accepted, documented limitation, not a crash.
+   */
+  function tryResolveLandmarkFeatures() {
+    const map = mapRef.current;
+    if (!map) return;
+    LANDMARKS.forEach(({ id, lat, lng }) => {
+      if (landmarkFeatureRef.current[id]) return; // already resolved
+      const point = map.project([lng, lat]);
+      const matches = map.queryRenderedFeatures(queryBoxAround(point), { layers: ['3d-buildings'] });
+      if (matches.length === 0) return;
+      const feature = matches[0];
+      const featureTarget = { source: feature.source, sourceLayer: feature.sourceLayer, id: feature.id };
+      landmarkFeatureRef.current[id] = featureTarget;
+      // If a risk level was already assigned before this landmark
+      // resolved (e.g. applyLandmarkRisk ran while the camera hadn't
+      // reached it yet), apply it now instead of waiting for the next
+      // scenario/timeline change to push it again.
+      const pendingRisk = currentRiskByIdRef.current[id];
+      if (pendingRisk) {
+        map.setFeatureState(featureTarget, { riskLevel: pendingRisk });
+      }
+    });
+  }
+
+  /**
+   * Pushes each landmark's current riskLevel onto its real building
+   * feature via setFeatureState (Task 8c — see the 3d-buildings paint
+   * expression above for how 'riskLevel' feature-state gets rendered).
+   * Landmarks not yet resolved (see tryResolveLandmarkFeatures) simply
+   * have their desired level cached in currentRiskByIdRef and get it
+   * applied retroactively the moment they do resolve — nothing here
+   * needs to wait for that to happen. No explicit removeFeatureState
+   * step is needed on scenario switch: MapLibreView only ever mounts
+   * for the security-attack scenario (see CommandShell's conditional
+   * bridge), so switching to any other scenario unmounts this whole
+   * component and tears the map down via the init effect's cleanup
+   * (map.remove()) — there's no "stay mounted, reset state" case here
+   * the way MapView's own scenario-switch reset (Task 4/8) has to
+   * handle for its sibling scenarios.
+   */
   function applyLandmarkRisk(currentScenario) {
     const map = mapRef.current;
-    const source = map?.getSource('landmarks');
-    if (!source) return;
+    if (!map) return;
     const riskById = deriveLandmarkRisk(currentScenario.baseline);
-    source.setData(withRiskLevels(riskById));
+    currentRiskByIdRef.current = riskById;
+    LANDMARK_IDS.forEach((id) => {
+      const featureTarget = landmarkFeatureRef.current[id];
+      if (!featureTarget) return; // will be applied once resolved, see above
+      map.setFeatureState(featureTarget, { riskLevel: riskById[id] || 'green' });
+    });
   }
 
   function applyScenarioActivation(currentScenario) {
