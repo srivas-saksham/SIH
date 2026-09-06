@@ -3,7 +3,6 @@ import { systemOverview } from '../data/systemOverview';
 import { scenarioPresets } from '../scenarios/scenarioPresets';
 import { describeDelta } from '../utils/describeKeyframeDelta';
 import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
-import { getRiskClasses } from '../utils/riskStyles';
 import { getScenarioById, matchScenario, scenarios } from '../utils/scenarioMatcher';
 import { CausalBreakdown } from './CausalBreakdown';
 import { ComparisonPanel } from './ComparisonPanel';
@@ -63,6 +62,18 @@ const THINKING_DELAY_MAX = 1900;
 function randomThinkingDelay() {
   return THINKING_DELAY_MIN + Math.random() * (THINKING_DELAY_MAX - THINKING_DELAY_MIN);
 }
+
+// Task 8: preset chips lost their bordered/pill treatment in the flat
+// layout, but still need to read as a severity signal at a glance — so
+// each chip's label color (not a border/background) maps to its
+// existing `severity` field via the same risks-* tokens riskStyles.js
+// already uses elsewhere.
+const PRESET_TEXT_CLASS = {
+  green: 'text-risks-green',
+  yellow: 'text-risks-yellow',
+  orange: 'text-risks-orange',
+  red: 'text-risks-red',
+};
 
 export function CommandShell() {
   // Security scenarios are the primary demo use case, so that's the
@@ -135,6 +146,38 @@ export function CommandShell() {
     [activeScenario, currentKeyframeIndex],
   );
 
+  // Task 8: "Quick Analytics" glanceable stat tiles. Derived entirely from
+  // data already flowing into CausalBreakdown/ComparisonPanel — the three
+  // comparisonStats figures (flipping to the "after" value once an
+  // intervention is applied, same convention ComparisonPanel itself uses)
+  // plus a shelter count read off the same activeMapState already passed
+  // to MapView. No new data source is introduced for this panel.
+  const quickStats = useMemo(() => {
+    const stats = activeScenario.comparisonStats;
+    return [
+      {
+        key: 'evacTime',
+        label: 'Evac time',
+        value: `${interventionApplied ? stats.evacTimeAfter : stats.evacTimeBefore} min`,
+      },
+      {
+        key: 'overload',
+        label: 'Overload',
+        value: `${interventionApplied ? stats.overloadAfter : stats.overloadBefore}%`,
+      },
+      {
+        key: 'riskZones',
+        label: 'Risk zones',
+        value: `${interventionApplied ? stats.riskZonesAfter : stats.riskZonesBefore}`,
+      },
+      {
+        key: 'shelters',
+        label: 'Shelters',
+        value: `${activeMapState.shelters.length}`,
+      },
+    ];
+  }, [activeScenario, interventionApplied, activeMapState]);
+
   function handleScenarioSubmit(event) {
     event.preventDefault();
     if (isThinking) return; // ignore double-submits mid "thinking"
@@ -183,56 +226,40 @@ export function CommandShell() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-slate-100">
-      <div className="mx-auto flex min-h-screen max-w-[1600px] flex-col px-4 py-4 sm:px-5 lg:px-8">
-        <header className="rounded-2xl border border-slate-800 bg-slate-950/70 shadow-[0_0_0_1px_rgba(15,23,42,0.8)] backdrop-blur">
-          <TopNav />
-        </header>
+    <div className="flex h-screen flex-col overflow-hidden bg-canvas text-ink">
+      <header className="shrink-0 border-b border-hairline bg-canvas">
+        <TopNav />
+      </header>
 
-        <main className="mt-4 grid flex-1 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.6fr)_360px]">
-          <section className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/70 p-4 shadow-[0_0_0_1px_rgba(15,23,42,0.8)]">
-            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(94,234,212,0.12),transparent_35%),linear-gradient(180deg,rgba(15,23,42,0.4),rgba(2,6,23,0.8))]" />
-            <div className="relative flex h-full min-h-[540px] flex-col">
-              <div className="flex items-center justify-between gap-4 border-b border-slate-800 pb-4">
-                <div>
-                  <p className="text-[10px] uppercase tracking-[0.28em] text-slate-400">Network overview</p>
-                  <h2 className="mt-1 text-xl font-semibold text-slate-50">{systemOverview.incident}</h2>
-                </div>
-                <div className="rounded-full border border-risks-red/40 bg-risks-red/10 px-3 py-1 text-[10px] uppercase tracking-[0.22em] text-risks-red">
-                  {isThinking ? 'Interpreting scenario…' : activeScenario.name}
-                </div>
-              </div>
-
-              <div className="relative mt-4 min-h-[420px] flex-1 overflow-hidden">
-                <MapView scenario={mapViewScenario} />
-
-                {isThinking && (
-                  <div className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl bg-slate-950/70 backdrop-blur-sm">
-                    <div className="flex flex-col items-center gap-3">
-                      <div className="h-10 w-10 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
-                      <p className="animate-pulse text-[11px] uppercase tracking-[0.32em] text-accent">
-                        AI interpreting scenario…
-                      </p>
-                    </div>
-                  </div>
-                )}
-              </div>
+      <main className="flex min-h-0 flex-1 flex-col xl:flex-row">
+        {/* LEFT: map (hero element) + timeline scrubber pinned beneath it */}
+        <section className="flex min-h-0 flex-1 flex-col border-hairline xl:w-[65%] xl:flex-none xl:border-r">
+          <div className="flex items-center justify-between gap-4 border-b border-hairline px-4 py-3">
+            <div>
+              <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Network overview</p>
+              <h2 className="mt-1 text-lg font-semibold text-ink">{systemOverview.incident}</h2>
             </div>
-          </section>
+            <div className="rounded-full border border-risks-red/40 bg-risks-red/10 px-3 py-1 text-[10px] uppercase tracking-[0.22em] text-risks-red">
+              {isThinking ? 'Interpreting scenario…' : activeScenario.name}
+            </div>
+          </div>
 
-          <aside className="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 shadow-[0_0_0_1px_rgba(15,23,42,0.8)]">
-            <CausalBreakdown factors={activeCausalFactors} />
+          <div className="relative min-h-[320px] flex-1">
+            <MapView scenario={mapViewScenario} />
 
-            <ComparisonPanel
-              comparisonStats={activeScenario.comparisonStats}
-              interventionApplied={interventionApplied}
-              onApply={handleApplyIntervention}
-            />
-          </aside>
-        </main>
+            {isThinking && (
+              <div className="absolute inset-0 z-20 flex items-center justify-center bg-canvas/70 backdrop-blur-sm">
+                <div className="flex flex-col items-center gap-3">
+                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+                  <p className="animate-pulse text-[11px] uppercase tracking-[0.32em] text-accent">
+                    AI interpreting scenario…
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
 
-        <footer className="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 shadow-[0_0_0_1px_rgba(15,23,42,0.8)]">
-          <div className="flex flex-col gap-4 xl:flex-row xl:items-center">
+          <div className="shrink-0 px-4 py-3">
             <TimelineScrubber
               keyframes={activeScenario.timeline}
               currentIndex={currentKeyframeIndex}
@@ -241,47 +268,80 @@ export function CommandShell() {
               onPlayToggle={setIsPlaying}
               statusText={timelineStatusText}
             />
+          </div>
+        </section>
 
-            <div className="flex flex-1 flex-col gap-2 xl:max-w-[420px]">
-              <label htmlFor="scenario" className="text-[10px] uppercase tracking-[0.3em] text-slate-400">
-                Scenario input
-              </label>
-              <form
-                onSubmit={handleScenarioSubmit}
-                className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900/80 px-3 py-3"
-              >
-                {isThinking ? (
-                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
-                ) : (
-                  <span className="text-accent">›</span>
-                )}
-                <input
-                  id="scenario"
-                  type="text"
-                  value={inputValue}
-                  onChange={(event) => setInputValue(event.target.value)}
-                  disabled={isThinking}
-                  placeholder="e.g. high-severity hostile attack in Central Delhi"
-                  className="w-full border-0 bg-transparent font-mono text-sm text-slate-100 outline-none placeholder:text-slate-500 disabled:opacity-60"
-                />
-              </form>
+        {/* RIGHT: quick analytics / detailed analytics / scenario chat, each
+            separated by a single hairline divider — no nested card boxes */}
+        <aside className="flex min-h-0 flex-1 flex-col overflow-y-auto xl:w-[35%] xl:flex-none">
+          <div className="shrink-0 border-b border-hairline px-4 py-4">
+            <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Quick analytics</p>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              {quickStats.map((stat) => (
+                <div key={stat.key} className="rounded-lg bg-surface px-3 py-2.5">
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-ink-dim">{stat.label}</p>
+                  <p className="mt-1 text-xl font-semibold text-ink">{stat.value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="min-h-0 flex-1 space-y-6 overflow-y-auto border-b border-hairline px-4 py-4">
+            <div>
+              <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Detailed analytics</p>
+              <div className="mt-3">
+                <CausalBreakdown factors={activeCausalFactors} />
+              </div>
             </div>
 
-            <div className="flex flex-wrap gap-2 xl:justify-end">
+            <ComparisonPanel
+              comparisonStats={activeScenario.comparisonStats}
+              interventionApplied={interventionApplied}
+              onApply={handleApplyIntervention}
+            />
+          </div>
+
+          <div className="shrink-0 border-t border-hairline px-4 py-4">
+            <div className="flex flex-wrap gap-1">
               {scenarioPresets.map((preset) => (
                 <button
                   key={preset.name}
                   type="button"
                   onClick={() => handlePresetClick(preset.scenarioId)}
-                  className={`rounded-full border px-3 py-2 text-[10px] uppercase tracking-[0.24em] transition hover:brightness-125 ${getRiskClasses(preset.severity).pill}`}
+                  className={`rounded-md px-2 py-1 text-[10px] uppercase tracking-[0.24em] transition hover:bg-surface ${
+                    PRESET_TEXT_CLASS[preset.severity] || 'text-ink-dim'
+                  }`}
                 >
                   {preset.name}
                 </button>
               ))}
             </div>
+
+            <label htmlFor="scenario" className="mt-3 block text-[10px] uppercase tracking-[0.3em] text-ink-dim">
+              Scenario input
+            </label>
+            <form
+              onSubmit={handleScenarioSubmit}
+              className="mt-2 flex items-center gap-2 border-b border-hairline pb-2"
+            >
+              {isThinking ? (
+                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+              ) : (
+                <span className="text-accent">›</span>
+              )}
+              <input
+                id="scenario"
+                type="text"
+                value={inputValue}
+                onChange={(event) => setInputValue(event.target.value)}
+                disabled={isThinking}
+                placeholder="e.g. high-severity hostile attack in Central Delhi"
+                className="w-full border-0 bg-transparent font-mono text-sm text-ink outline-none placeholder:text-ink-faint disabled:opacity-60"
+              />
+            </form>
           </div>
-        </footer>
-      </div>
+        </aside>
+      </main>
     </div>
   );
 }

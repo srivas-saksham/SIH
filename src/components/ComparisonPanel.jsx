@@ -127,11 +127,11 @@ function ComparisonRow({ label, before, after, unit, rowDelay, interventionAppli
 
   return (
     <div
-      className="rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-2.5"
+      className="py-1"
       aria-label={ariaLabel}
     >
       <div className="flex items-center justify-between gap-3">
-        <span className="text-sm text-slate-300">{label}</span>
+        <span className="text-sm text-ink-dim">{label}</span>
         <div className="flex items-center gap-2 font-mono text-sm">
           {interventionApplied ? (
             <>
@@ -202,10 +202,10 @@ export function ComparisonPanel({ comparisonStats, interventionApplied, onApply 
   ];
 
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-      <p className="text-[10px] uppercase tracking-[0.28em] text-slate-400">Baseline vs Intervention</p>
+    <div>
+      <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Baseline vs Intervention</p>
 
-      <div className="mt-4 space-y-3">
+      <div className="mt-4 space-y-1">
         {rows.map((row, index) => (
           <ComparisonRow
             key={row.key}
@@ -225,7 +225,7 @@ export function ComparisonPanel({ comparisonStats, interventionApplied, onApply 
         disabled={interventionApplied}
         aria-disabled={interventionApplied}
         aria-label={interventionApplied ? 'Intervention applied' : 'Apply intervention and see improved outcomes'}
-        className={`mt-4 w-full rounded-xl border px-4 py-2.5 text-[11px] uppercase tracking-[0.22em] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 ${
+        className={`mt-4 w-full rounded-xl border px-4 py-2.5 text-[11px] uppercase tracking-[0.22em] transition focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-canvas ${
           interventionApplied
             ? 'cursor-not-allowed border-risks-green/40 bg-risks-green/10 text-risks-green'
             : 'border-accent/40 bg-accent/10 text-accent hover:bg-accent/20'

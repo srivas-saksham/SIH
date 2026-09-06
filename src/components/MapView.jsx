@@ -278,7 +278,7 @@ export function MapView({ scenario = defaultScenario }) {
   }));
 
   return (
-    <div className="relative h-full min-h-[540px] w-full overflow-hidden rounded-2xl border border-slate-800 bg-[#08111d]">
+    <div className="relative h-full w-full overflow-hidden bg-canvas">
       <div className="absolute inset-0 opacity-25 [background-image:linear-gradient(rgba(148,163,184,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.12)_1px,transparent_1px)] [background-size:36px_36px]" />
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(94,234,212,0.08),transparent_35%)]" />
 

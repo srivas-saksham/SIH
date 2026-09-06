@@ -47,8 +47,8 @@ export function CausalBreakdown({ factors }) {
   const primaryText = describePrimaryDrivers(factors);
 
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-      <p className="text-[10px] uppercase tracking-[0.28em] text-slate-400">Why this area is at risk</p>
+    <div>
+      <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Why this area is at risk</p>
 
       <div className="mt-4 space-y-3">
         {FACTORS.map(({ key, label }) => {
@@ -86,7 +86,7 @@ export function CausalBreakdown({ factors }) {
         })}
       </div>
 
-      <div className="mt-4 rounded-xl border border-accent/30 bg-accent/10 px-3 py-2 text-xs font-medium text-accent">
+      <div className="mt-4 border-t border-hairline pt-3 text-xs font-medium text-accent">
         {primaryText}
       </div>
     </div>
