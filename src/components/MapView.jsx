@@ -51,7 +51,10 @@ function useGhostOnChange(value, duration = TRANSITION_MS) {
 // Hex values mirror tailwind.config.js `risks` palette. Kept as plain hex
 // here (rather than Tailwind classes) because SVG fill/stroke attributes
 // need literal color values, not utility classes.
-const RISK_HEX = {
+// Exported (Task 8b) so MapLibreView can reuse this exact palette for its
+// landmark fill-extrusion-color match expression instead of redefining
+// the same hex values a second time.
+export const RISK_HEX = {
   green: '#22c55e',
   yellow: '#facc15',
   orange: '#f97316',

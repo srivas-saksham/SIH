@@ -6,6 +6,7 @@ import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
 import { getScenarioById, matchScenario, scenarios } from '../utils/scenarioMatcher';
 import { CausalBreakdown } from './CausalBreakdown';
 import { ComparisonPanel } from './ComparisonPanel';
+import { MapLibreView } from './MapLibreView';
 import { MapView } from './MapView';
 import { TimelineScrubber } from './TimelineScrubber';
 import { TopNav } from './TopNav';
@@ -245,7 +246,24 @@ export function CommandShell() {
           </div>
 
           <div className="relative min-h-[320px] flex-1">
-            <MapView scenario={mapViewScenario} />
+            {/*
+              TEMPORARY BRIDGE (Task 8b): MapLibreView (real 3D MapLibre
+              GL JS map) is wired up for the security-attack scenario
+              ONLY, as a proof of concept. Every other scenario
+              (earthquake/flood/generic-fallback) still renders through
+              the original SVG MapView, untouched. Both components share
+              the exact same `scenario` prop shape (mapViewScenario, with
+              baseline already swapped for the active timeline/
+              intervention state), so this condition is the only thing
+              that needs to change once MapLibreView is proven out for
+              the remaining scenarios — see PROJECT_CONTEXT.md Section 8
+              for the full migration plan.
+            */}
+            {activeScenario.id === 'security-attack' ? (
+              <MapLibreView scenario={mapViewScenario} />
+            ) : (
+              <MapView scenario={mapViewScenario} />
+            )}
 
             {isThinking && (
               <div className="absolute inset-0 z-20 flex items-center justify-center bg-canvas/70 backdrop-blur-sm">
