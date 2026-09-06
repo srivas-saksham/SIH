@@ -260,7 +260,7 @@ export function CommandShell() {
               for the full migration plan.
             */}
             {activeScenario.id === 'security-attack' ? (
-              <MapLibreView scenario={mapViewScenario} />
+              <MapLibreView scenario={mapViewScenario} timelineIndex={currentKeyframeIndex} />
             ) : (
               <MapView scenario={mapViewScenario} />
             )}

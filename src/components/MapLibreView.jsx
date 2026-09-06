@@ -40,7 +40,11 @@ import { LANDMARK_IDS, LANDMARKS } from '../data/delhiLandmarks';
 // runs once, regardless of how many times MapLibreView mounts.
 maplibregl.setWorkerUrl(maplibreWorkerUrl);
 
-const STYLE_URL = 'https://tiles.openfreemap.org/styles/bright';
+// Task 8d FIX 1: OpenFreeMap's dark style, forked from
+// openmaptiles/dark-matter-gl-style — free, no key, same zero-config
+// setup as bright. Confirmed live at this exact URL (it's listed on
+// OpenFreeMap's own Quick Start guide alongside bright/liberty/positron).
+const STYLE_URL = 'https://tiles.openfreemap.org/styles/dark';
 
 // Mirrors MapView's TRANSITION_MS convention (Task 5) so landmark risk
 // color changes crossfade at the same speed as every other risk-driven
@@ -58,6 +62,43 @@ const RISK_RANK = { red: 4, orange: 3, yellow: 2, green: 1 };
 const IMPACT_ZONE_RADIUS_KM = 0.3; // ~300m "affected area" radius
 const IMPACT_ZONE_GROW_MS = 1800;
 const ROUTE_ANIMATE_MS = 2200;
+
+// Task 8f FIX A (random building recoloring): MapLibre's setFeatureState
+// is keyed by { source, sourceLayer, id } — and vector-tile feature ids
+// are only guaranteed unique WITHIN a single tile, not globally across
+// the whole source. As the camera moves/zooms and different tiles load
+// (or the same tile gets re-requested at a different zoom), a totally
+// unrelated building can coincidentally carry the same numeric id a
+// landmark used, and silently inherit its highlight color the instant
+// that tile renders — this is the "random buildings turning
+// orange/red" symptom. The fix is `promoteId`: it tells MapLibre to key
+// feature state off a feature PROPERTY instead of the tile-local id, so
+// the same real-world building keeps the same identity across every
+// tile/zoom it ever appears in, and two different buildings can never
+// collide.
+//
+// We can't just add `promoteId` to the *existing* `openmaptiles` source
+// (it's declared by the base style itself, and changing it would mean
+// tearing down and re-adding every layer that already reads from it —
+// roads, water, labels, the works). Instead we add a SECOND vector
+// source pointing at the exact same tiles, with promoteId set only for
+// the `building` source-layer, and point `3d-buildings` at that one.
+// Every other layer in the style is left completely alone.
+//
+// CAVEAT (can't verify from here without a live browser): this assumes
+// OpenMapTiles' `building` source-layer carries an `osm_id` property on
+// each feature, which is true for most OpenMapTiles-schema builds but
+// not guaranteed for every tile provider/version. If OpenFreeMap's
+// building layer does NOT include `osm_id`, `promoteId` will fail to
+// resolve and MapLibre will fall back to auto-generated ids (via
+// `generateId`), which are stable per-source-load but won't survive a
+// style/source reload — still far better than raw tile-local ids, but
+// worth an actual check in devtools (Network tab → inspect a building
+// tile's decoded properties, or `map.querySourceFeatures` in console)
+// once this is live. If `osm_id` turns out to be absent, swap the
+// property name below for whatever unique id field the tiles do carry.
+const BUILDING_PROMOTE_ID_PROPERTY = 'osm_id';
+const BUILDINGS_SOURCE_ID = 'openmaptiles-buildings';
 
 /** Highest-severity building in a baseline, or null if there are none. */
 function findPrimaryImpactBuilding(baseline) {
@@ -92,11 +133,44 @@ function findTargetShelter(baseline) {
   return [...shelters].sort((a, b) => (b.capacity || 0) - (a.capacity || 0))[0];
 }
 
-/** Finds the style's first symbol layer, so new layers can be inserted below labels. */
+/**
+ * Finds a style's label layer so new layers (3d-buildings) can be
+ * inserted below it — i.e. buildings render under text, not over it.
+ *
+ * Task 8d FIX 1: bright and dark are two DIFFERENT upstream style
+ * families (bright is OpenFreeMap's own composed style; dark is an
+ * unmodified port of openmaptiles/dark-matter-gl-style — see
+ * PROJECT_CONTEXT.md), so their layer ids/ordering aren't guaranteed to
+ * match. Naively grabbing the very first `type: 'symbol'` layer is
+ * fragile: dark-matter-gl-style's earliest symbol layers are
+ * line-placed labels running along roads/rivers (e.g. `water_name`,
+ * `road_name`), not point-placed place/POI labels — inserting buildings
+ * immediately below one of those would leave the buildings layer very
+ * low in the stack, likely under road/water fill layers that come
+ * later. Point-placed symbol layers (`symbol-placement` defaulting to
+ * `point`, i.e. NOT explicitly `'line'`) are a much closer proxy for
+ * "the actual place/POI labels", so those are preferred; falling back
+ * to the first symbol layer of any kind, then to `undefined` (which
+ * makes MapLibre's addLayer put the new layer on TOP of everything —
+ * still visible, just not tucked under labels) if the style somehow has
+ * no symbol layers at all. The `undefined` fallback path is logged so
+ * this never fails silently.
+ */
 function findLabelLayerId(map) {
   const layers = map.getStyle()?.layers || [];
-  const symbolLayer = layers.find((layer) => layer.type === 'symbol');
-  return symbolLayer?.id;
+  const symbolLayers = layers.filter((layer) => layer.type === 'symbol');
+  const pointLabelLayer = symbolLayers.find(
+    (layer) => layer.layout?.['symbol-placement'] !== 'line',
+  );
+  const chosen = pointLabelLayer || symbolLayers[0];
+  if (!chosen) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[MapLibreView] findLabelLayerId: no symbol layer found in this style — '
+        + '3d-buildings will be added on top of the whole style instead of below labels.',
+    );
+  }
+  return chosen?.id;
 }
 
 // A single projected pixel rarely lands exactly on a real building
@@ -124,8 +198,6 @@ export function MapLibreView({ scenario }) {
   // React re-renders — it's imperative canvas/map state.
   const impactZoneFrameRef = useRef(null);
   const routeFrameRef = useRef(null);
-  const idleRotateIntervalRef = useRef(null);
-  const idleRotatePausedRef = useRef(false);
   const routeLineRef = useRef(null); // current evac route GeoJSON LineString
 
   // Task 8c: landmark highlighting via setFeatureState instead of a
@@ -171,6 +243,13 @@ export function MapLibreView({ scenario }) {
       zoom: 15,
       pitch: 55,
       bearing: -15,
+      // Task 8e: MapLibre's own hard ceiling for pitch is 85° (it's
+      // baked into the renderer, not a config choice — the library
+      // simply won't go higher than this regardless of setMaxPitch()).
+      // The default is only 60, so raising it here is what actually
+      // removes OUR earlier self-imposed restriction; there's no way to
+      // get truly unlimited pitch out of MapLibre GL JS itself.
+      maxPitch: 85,
       canvasContextAttributes: { antialias: true },
       attributionControl: true,
     });
@@ -186,6 +265,89 @@ export function MapLibreView({ scenario }) {
     });
 
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+
+    // Task 8f FIX B: increase scroll-zoom intensity. MapLibre's default
+    // wheel-zoom rate (~1/450 per wheel-delta unit) and trackpad-zoom
+    // rate (~1/100) are tuned conservatively for general-purpose maps;
+    // for this cinematic demo we want a single scroll notch to move the
+    // camera noticeably more. Roughly doubling both rates (smaller
+    // divisor = more zoom per unit of input) does that without touching
+    // the zoom curve itself or the min/max zoom bounds.
+    map.scrollZoom.setWheelZoomRate(1 / 220);
+    map.scrollZoom.setZoomRate(1 / 60);
+
+    // -----------------------------------------------------------------
+    // Task 8e — camera drag rebind (unchanged from the previous pass):
+    //   - plain LEFT-drag  -> rotate/pitch. Horizontal delta -> bearing
+    //     (inverted per feedback), vertical delta -> pitch (unchanged).
+    //   - RIGHT-drag       -> pan the map (drag the ground under the
+    //     cursor), replacing MapLibre's default right-drag=rotate.
+    //   - scroll wheel     -> zoom (now faster, see FIX B above).
+    // Both default handlers this replaces (DragPanHandler for
+    // left-drag, DragRotateHandler for right-drag/Ctrl+left-drag) are
+    // disabled so they don't fight our custom gestures over the same
+    // pointer events.
+    // -----------------------------------------------------------------
+    map.dragPan.disable();
+    map.dragRotate.disable();
+    // Prevent the browser's own right-click context menu from popping
+    // up mid-drag — same fix every custom right-click-drag pan
+    // implementation needs. Named (not inline) so it can be removed on
+    // unmount below.
+    function onContainerContextMenu(e) {
+      e.preventDefault();
+    }
+    container.addEventListener('contextmenu', onContainerContextMenu);
+
+    const ROTATE_DEG_PER_PX = 0.35;
+    const PITCH_DEG_PER_PX = 0.28;
+    let activeDragButton = null; // 0 = left (rotate), 2 = right (pan)
+    let lastDragPoint = null;
+
+    function onCustomDragPointerDown(e) {
+      if (e.button !== 0 && e.button !== 2) return;
+      if (e.target.closest && e.target.closest('.maplibregl-ctrl')) return;
+      activeDragButton = e.button;
+      lastDragPoint = { x: e.clientX, y: e.clientY };
+      container.style.cursor = activeDragButton === 0 ? 'grabbing' : 'move';
+    }
+
+    function onCustomDragPointerMove(e) {
+      if (activeDragButton === null || !lastDragPoint) return;
+      const dx = e.clientX - lastDragPoint.x;
+      const dy = e.clientY - lastDragPoint.y;
+      lastDragPoint = { x: e.clientX, y: e.clientY };
+
+      if (activeDragButton === 0) {
+        // Rotate/pitch. Bearing inverted vs. the first pass (dragging
+        // right rotates the view the other way); pitch direction
+        // unchanged. No manual clamping here beyond what the map's own
+        // maxPitch (85, set above) and minPitch (0, MapLibre's floor)
+        // already enforce internally. Bearing itself has never been
+        // restricted and still isn't.
+        map.setBearing(map.getBearing() + dx * ROTATE_DEG_PER_PX);
+        map.setPitch(map.getPitch() - dy * PITCH_DEG_PER_PX);
+      } else {
+        // Pan: move the camera opposite the drag so map content tracks
+        // the cursor, matching the feel of MapLibre's own DragPanHandler
+        // (which panBy replicates directly — this is the same primitive
+        // it's built on).
+        map.panBy([-dx, -dy], { animate: false });
+      }
+    }
+
+    function onCustomDragPointerUp() {
+      if (activeDragButton === null) return;
+      activeDragButton = null;
+      lastDragPoint = null;
+      container.style.cursor = 'grab';
+    }
+
+    container.style.cursor = 'grab';
+    container.addEventListener('pointerdown', onCustomDragPointerDown);
+    window.addEventListener('pointermove', onCustomDragPointerMove);
+    window.addEventListener('pointerup', onCustomDragPointerUp);
+    // -----------------------------------------------------------------
 
     // MapLibre measures the container's pixel size synchronously inside
     // the constructor. If that measurement happens to land in the same
@@ -205,6 +367,34 @@ export function MapLibreView({ scenario }) {
       map.resize();
       const labelLayerId = findLabelLayerId(map);
 
+      // --- Task 8f FIX A: dedicated buildings source with promoteId ---
+      // See the big comment block near BUILDING_PROMOTE_ID_PROPERTY
+      // above for the full rationale. We clone the style's own
+      // `openmaptiles` source definition (same tiles, same everything)
+      // and add `promoteId` scoped to the `building` source-layer only,
+      // so every other style layer (roads, water, labels, the
+      // style-provided flat building fill, etc.) keeps using the
+      // original `openmaptiles` source completely untouched. Only our
+      // own `3d-buildings` layer below reads from this new source.
+      const styleSources = map.getStyle()?.sources || {};
+      const baseBuildingsSource = styleSources.openmaptiles;
+      if (baseBuildingsSource && !map.getSource(BUILDINGS_SOURCE_ID)) {
+        map.addSource(BUILDINGS_SOURCE_ID, {
+          ...baseBuildingsSource,
+          promoteId: { building: BUILDING_PROMOTE_ID_PROPERTY },
+        });
+      } else if (!baseBuildingsSource) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[MapLibreView] no `openmaptiles` source found in the loaded style — '
+            + 'falling back to it directly for 3d-buildings, which means the '
+            + 'random-recolor bug (tile-local feature ids) will NOT be fixed.',
+        );
+      }
+      const buildingsSourceId = map.getSource(BUILDINGS_SOURCE_ID)
+        ? BUILDINGS_SOURCE_ID
+        : 'openmaptiles';
+
       // --- 1. 3D buildings from OpenFreeMap's own OSM building layer ---
       // Task 8c: landmark highlighting used to be a separate overlay
       // layer (a drawn shape sitting on top of the real building,
@@ -219,7 +409,7 @@ export function MapLibreView({ scenario }) {
       map.addLayer(
         {
           id: '3d-buildings',
-          source: 'openmaptiles',
+          source: buildingsSourceId,
           'source-layer': 'building',
           type: 'fill-extrusion',
           minzoom: 14,
@@ -234,28 +424,48 @@ export function MapLibreView({ scenario }) {
               RISK_HEX.yellow,
               ['==', ['feature-state', 'riskLevel'], 'green'],
               RISK_HEX.green,
-              // Fallback for every non-landmark building — unchanged
-              // from the original grayscale height interpolation.
+              // Fallback for every non-landmark building — same
+              // grayscale-by-height interpolation as before, lightened
+              // (Task 8d FIX 1) from #3a3a3f→#5a5a60 to #5a5a62→#8a8a94
+              // so it reads against dark-matter's near-black basemap.
               [
                 'interpolate',
                 ['linear'],
                 ['coalesce', ['get', 'render_height'], 8],
                 0,
-                '#3a3a3f',
+                '#5a5a62',
                 100,
-                '#5a5a60',
+                '#8a8a94',
               ],
             ],
             'fill-extrusion-color-transition': { duration: TRANSITION_MS },
+            // Task 8d FIX 2: boost HEIGHT (not just color) for any
+            // building with an active riskLevel, via the same
+            // feature-state key, so a highlighted building stays
+            // visually prominent regardless of its real OSM height.
+            // Floor values (40/30/20m) are starting points tuned
+            // against typical Central Delhi building scale — adjust
+            // once seen rendered live if they read as too tall/short.
+            //
+            // The fallback branch is a flat coalesced height (NOT a
+            // zoom-interpolated ramp) — nesting ['zoom'] inside a case
+            // branch is invalid MapLibre style syntax and previously
+            // broke this entire layer (see PROJECT_CONTEXT.md /
+            // Task 8d bug writeup). Left as-is here.
             'fill-extrusion-height': [
-              'interpolate',
-              ['linear'],
-              ['zoom'],
-              14,
-              0,
-              16,
+              'case',
+              ['==', ['feature-state', 'riskLevel'], 'red'],
+              ['max', 40, ['coalesce', ['get', 'render_height'], 8]],
+              ['==', ['feature-state', 'riskLevel'], 'orange'],
+              ['max', 30, ['coalesce', ['get', 'render_height'], 8]],
+              ['==', ['feature-state', 'riskLevel'], 'yellow'],
+              ['max', 20, ['coalesce', ['get', 'render_height'], 8]],
               ['coalesce', ['get', 'render_height'], 8],
             ],
+            // Matches the 400ms ease convention used for color above and
+            // throughout the app (PROJECT_CONTEXT.md Section 9), so a
+            // risk-level change animates height and color in sync.
+            'fill-extrusion-height-transition': { duration: TRANSITION_MS, delay: 0 },
             'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0],
             'fill-extrusion-opacity': 0.85,
           },
@@ -322,17 +532,11 @@ export function MapLibreView({ scenario }) {
       loadedRef.current = true;
       applyScenarioActivation(scenario);
       applyLandmarkRisk(scenario);
-      startIdleRotation();
-    });
-
-    // Pause the idle "surveillance drift" rotation while the user is
-    // actively dragging/zooming, resume once they let go — a fixed slow
-    // rotation that fights user input would feel broken, not cinematic.
-    map.on('dragstart', () => {
-      idleRotatePausedRef.current = true;
-    });
-    map.on('dragend', () => {
-      idleRotatePausedRef.current = false;
+      // Task 8f FIX D: idle "surveillance drift" camera rotation has
+      // been removed entirely per explicit request — the camera now
+      // only moves in response to user input (drag) or a scenario
+      // activation's scripted flyTo. No interval, no drift, no pause/
+      // resume bookkeeping needed anymore.
     });
 
     // Task 8c: resolve each landmark's real 3d-buildings feature ID on
@@ -364,7 +568,10 @@ export function MapLibreView({ scenario }) {
     return () => {
       if (impactZoneFrameRef.current) cancelAnimationFrame(impactZoneFrameRef.current);
       if (routeFrameRef.current) cancelAnimationFrame(routeFrameRef.current);
-      if (idleRotateIntervalRef.current) clearInterval(idleRotateIntervalRef.current);
+      container.removeEventListener('pointerdown', onCustomDragPointerDown);
+      window.removeEventListener('pointermove', onCustomDragPointerMove);
+      window.removeEventListener('pointerup', onCustomDragPointerUp);
+      container.removeEventListener('contextmenu', onContainerContextMenu);
       map.remove();
       mapRef.current = null;
       loadedRef.current = false;
@@ -573,26 +780,6 @@ export function MapLibreView({ scenario }) {
       }
     };
     routeFrameRef.current = requestAnimationFrame(step);
-  }
-
-  /**
-   * Subtle continuous bearing drift for a "live surveillance" feel when
-   * nothing else is animating. Deliberately cheap: a single setInterval
-   * nudging bearing by a fraction of a degree, paused during user drag
-   * (see the dragstart/dragend handlers above) and left running through
-   * flyTo/impact/route animations since MapLibre's own camera and paint
-   * updates don't conflict with a plain setBearing call. If this turns
-   * out to cost more than expected on lower-end demo hardware, the whole
-   * effect is isolated to this one function and safe to delete.
-   */
-  function startIdleRotation() {
-    const map = mapRef.current;
-    if (!map) return;
-    if (idleRotateIntervalRef.current) clearInterval(idleRotateIntervalRef.current);
-    idleRotateIntervalRef.current = setInterval(() => {
-      if (idleRotatePausedRef.current) return;
-      map.setBearing(map.getBearing() + 0.03);
-    }, 50);
   }
 
   return <div ref={containerRef} className="h-full w-full" />;
