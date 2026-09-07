@@ -62,6 +62,10 @@
   "timeline": [
     {
       "label": "T+0",
+      "impactPoint": { "lat": 28.6139, "lng": 77.2090 },
+      "redRadiusKm": 0.08,
+      "yellowRadiusKm": 0.16,
+      "greenRadiusKm": 0.24,
       "buildings": [
         { "id": "b1", "riskLevel": "orange" },
         { "id": "b2", "riskLevel": "yellow" }
@@ -73,6 +77,10 @@
     },
     {
       "label": "T+5",
+      "impactPoint": { "lat": 28.6139, "lng": 77.2090 },
+      "redRadiusKm": 0.15,
+      "yellowRadiusKm": 0.3,
+      "greenRadiusKm": 0.45,
       "buildings": [
         { "id": "b1", "riskLevel": "red" },
         { "id": "b3", "riskLevel": "orange" }
@@ -87,6 +95,10 @@
     },
     {
       "label": "T+10",
+      "impactPoint": { "lat": 28.6139, "lng": 77.2090 },
+      "redRadiusKm": 0.22,
+      "yellowRadiusKm": 0.42,
+      "greenRadiusKm": 0.65,
       "buildings": [
         { "id": "b2", "riskLevel": "red" },
         { "id": "b4", "riskLevel": "orange" },
@@ -102,6 +114,10 @@
     },
     {
       "label": "T+15",
+      "impactPoint": { "lat": 28.6139, "lng": 77.2090 },
+      "redRadiusKm": 0.28,
+      "yellowRadiusKm": 0.55,
+      "greenRadiusKm": 0.85,
       "buildings": [
         { "id": "b6", "riskLevel": "yellow" },
         { "id": "b7", "riskLevel": "yellow" }
@@ -117,6 +133,10 @@
     },
     {
       "label": "T+30",
+      "impactPoint": { "lat": 28.6139, "lng": 77.2090 },
+      "redRadiusKm": 0.2,
+      "yellowRadiusKm": 0.4,
+      "greenRadiusKm": 0.95,
       "buildings": [
         { "id": "b8", "riskLevel": "yellow" },
         { "id": "b9", "riskLevel": "green" },

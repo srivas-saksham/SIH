@@ -13,6 +13,17 @@
  * base list are appended as new entries (useful for interventions that
  * add a shelter, etc.).
  *
+ * Building-risk-engine fields (`impactPoint`, `redRadiusKm`,
+ * `yellowRadiusKm`, `greenRadiusKm`) are plain scalar/object fields on
+ * the keyframe itself (not id-matched lists), so they're passed through
+ * directly: whenever a keyframe defines them, they overwrite whatever
+ * the base state had; when a keyframe omits them (or `keyframe` itself
+ * is null, i.e. baseline/no-timeline case), the base state's own value
+ * is kept as-is. This lets MapLibreView simply read
+ * `mergedState.impactPoint` / `mergedState.redRadiusKm` etc. off
+ * whatever state CommandShell hands it, without caring whether that
+ * state came from a raw baseline or a merged keyframe.
+ *
  * This function does not mutate its inputs.
  *
  * @param {object} baseState - full state, e.g. scenario.baseline
@@ -29,6 +40,10 @@ export function mergeKeyframe(baseState, keyframe) {
     buildings: mergeById(baseState.buildings, keyframe.buildings),
     roads: mergeById(baseState.roads, keyframe.roads),
     shelters: mergeById(baseState.shelters, keyframe.shelters),
+    impactPoint: keyframe.impactPoint !== undefined ? keyframe.impactPoint : baseState.impactPoint,
+    redRadiusKm: keyframe.redRadiusKm !== undefined ? keyframe.redRadiusKm : baseState.redRadiusKm,
+    yellowRadiusKm: keyframe.yellowRadiusKm !== undefined ? keyframe.yellowRadiusKm : baseState.yellowRadiusKm,
+    greenRadiusKm: keyframe.greenRadiusKm !== undefined ? keyframe.greenRadiusKm : baseState.greenRadiusKm,
   };
 }
 
@@ -82,6 +97,11 @@ function cloneState(state) {
     buildings: (state.buildings || []).map((item) => ({ ...item })),
     roads: (state.roads || []).map((item) => ({ ...item })),
     shelters: (state.shelters || []).map((item) => ({ ...item })),
+    // impactPoint/redRadiusKm/yellowRadiusKm/greenRadiusKm already come
+    // through via the `...state` spread above (they're plain
+    // scalar/object fields, not id-matched lists) — no extra handling
+    // needed here, called out explicitly since mergeKeyframe (above)
+    // does need to handle them explicitly.
   };
 }
 

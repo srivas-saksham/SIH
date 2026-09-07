@@ -59,9 +59,111 @@ const FALLBACK_CENTER = { lat: 28.6134, lng: 77.2096 };
 
 const RISK_RANK = { red: 4, orange: 3, yellow: 2, green: 1 };
 
-const IMPACT_ZONE_RADIUS_KM = 0.3; // ~300m "affected area" radius
+const IMPACT_ZONE_RADIUS_KM = 0.3; // ~300m "affected area" radius, used only as a fallback when a scenario/keyframe has no explicit radii (see resolveActiveRadii)
 const IMPACT_ZONE_GROW_MS = 1800;
 const ROUTE_ANIMATE_MS = 2200;
+
+// ---------------------------------------------------------------------
+// Per-building spatial risk engine (new — see MAPLIBRE_RESEARCH_FINDINGS.md).
+//
+// This replaces the old "5 fixed landmarks only" model with a real
+// distance-based evaluation of every building near the impact point.
+// Three concentric bands (red/yellow/green — no orange in this path,
+// per the task's acceptance checklist) are evaluated by geographic
+// distance from the current impactPoint, using radii that grow/shrink
+// as the timeline advances. Buildings outside all three bands are left
+// at the style's default gray.
+// ---------------------------------------------------------------------
+
+// Only three colors exist in the building-risk path (research §3, §9):
+// a `match` expression on ['feature-state','riskLevel'] with an
+// explicit gray fallback branch for 'none' / null / never-set. We
+// explicitly set 'none' (rather than calling removeFeatureState) when a
+// building leaves every band, per research §2/§9 — this keeps the
+// animation hot path down to a single API (setFeatureState) and
+// sidesteps the unresolved question of whether a truly-never-set
+// feature-state value falls through `match` identically to an
+// explicitly-removed one.
+const BUILDING_RISK_HEX = {
+  red: RISK_HEX.red,
+  yellow: RISK_HEX.yellow,
+  green: RISK_HEX.green,
+};
+const BUILDING_DEFAULT_GRAY = '#5a5a62';
+
+// Fallback radii (km) used only if a scenario/keyframe defines no
+// explicit impactPoint/radii at all (research §9's approach assumes
+// these are always present; this is the "smallest reasonable
+// assumption" fallback called out in the task prompt for anything the
+// research artifact doesn't cover — flagged in the implementation
+// summary).
+const DEFAULT_RED_RADIUS_KM = IMPACT_ZONE_RADIUS_KM * 0.4;
+const DEFAULT_YELLOW_RADIUS_KM = IMPACT_ZONE_RADIUS_KM * 0.7;
+const DEFAULT_GREEN_RADIUS_KM = IMPACT_ZONE_RADIUS_KM;
+
+// Research §7/§9: only re-evaluate a building's band on ticks where the
+// growing/shrinking radius has actually crossed that building's
+// precomputed distance, rather than calling setFeatureState on every
+// candidate building every animation frame. RADIUS_EPSILON_KM guards
+// against float-jitter re-triggering a "band changed" recompute when
+// the radius is effectively unchanged between ticks.
+const RADIUS_EPSILON_KM = 0.0005; // 0.5m
+
+/**
+ * Per-building distance -> band classification. Pure function, no map
+ * access, so it's trivially testable and reusable from the animation
+ * loop without any MapLibre-specific state.
+ *
+ * Bands are innermost-wins: red first, then yellow, then green: a
+ * building inside the red radius is red even though it's technically
+ * also inside the (larger) yellow/green radii. Radii are treated as
+ * whatever order they come in — if a keyframe is authored with, say,
+ * yellowRadiusKm < redRadiusKm (a malformed keyframe), the innermost-
+ * wins check order still yields a sane (if visually odd) result rather
+ * than throwing, since we don't assume ordering, only compare each
+ * radius directly against distance.
+ *
+ * @returns {'red'|'yellow'|'green'|'none'}
+ */
+function classifyBuildingRisk(distanceKm, radii) {
+  if (distanceKm <= radii.red) return 'red';
+  if (distanceKm <= radii.yellow) return 'yellow';
+  if (distanceKm <= radii.green) return 'green';
+  return 'none';
+}
+
+/**
+ * Resolves the "current" impact point + three radii from whatever
+ * scenario/state object MapLibreView was handed (baseline, or a
+ * timeline-keyframe-merged state — both flow through mergeKeyframe.js,
+ * see that file's updated field-passthrough). Falls back to the
+ * primary-impact-building heuristic / fixed radii used by the old
+ * single-circle code if a state doesn't define these fields at all, so
+ * this never throws on an older/malformed scenario object.
+ */
+function resolveActiveRadii(state, impactCenter) {
+  const hasExplicitRadii = typeof state?.redRadiusKm === 'number'
+    || typeof state?.yellowRadiusKm === 'number'
+    || typeof state?.greenRadiusKm === 'number';
+
+  const point = state?.impactPoint || impactCenter;
+
+  if (!hasExplicitRadii) {
+    return {
+      point,
+      red: DEFAULT_RED_RADIUS_KM,
+      yellow: DEFAULT_YELLOW_RADIUS_KM,
+      green: DEFAULT_GREEN_RADIUS_KM,
+    };
+  }
+
+  return {
+    point,
+    red: state.redRadiusKm ?? DEFAULT_RED_RADIUS_KM,
+    yellow: state.yellowRadiusKm ?? DEFAULT_YELLOW_RADIUS_KM,
+    green: state.greenRadiusKm ?? DEFAULT_GREEN_RADIUS_KM,
+  };
+}
 
 // Task 8f FIX A (random building recoloring): MapLibre's setFeatureState
 // is keyed by { source, sourceLayer, id } — and vector-tile feature ids
@@ -85,19 +187,35 @@ const ROUTE_ANIMATE_MS = 2200;
 // the `building` source-layer, and point `3d-buildings` at that one.
 // Every other layer in the style is left completely alone.
 //
-// CAVEAT (can't verify from here without a live browser): this assumes
-// OpenMapTiles' `building` source-layer carries an `osm_id` property on
-// each feature, which is true for most OpenMapTiles-schema builds but
-// not guaranteed for every tile provider/version. If OpenFreeMap's
-// building layer does NOT include `osm_id`, `promoteId` will fail to
-// resolve and MapLibre will fall back to auto-generated ids (via
-// `generateId`), which are stable per-source-load but won't survive a
-// style/source reload — still far better than raw tile-local ids, but
-// worth an actual check in devtools (Network tab → inspect a building
-// tile's decoded properties, or `map.querySourceFeatures` in console)
-// once this is live. If `osm_id` turns out to be absent, swap the
-// property name below for whatever unique id field the tiles do carry.
-const BUILDING_PROMOTE_ID_PROPERTY = 'osm_id';
+// CORRECTION (researched against OpenMapTiles' own published building
+// layer schema + OpenFreeMap's tile generator): `osm_id` is NOT a
+// property/tag exposed on building features in these tiles. It only
+// ever appears as an internal SQL join key in the legacy Postgres/
+// ST_AsMVT pipeline's query (`SELECT osm_id, geometry, render_height,
+// render_min_height, colour, hide_3d FROM layer_building(...)`) — the
+// *emitted* tile fields for the `building` layer are render_height,
+// render_min_height, colour, and hide_3d only; osm_id is consumed by
+// the query, never written out as a feature property. OpenFreeMap
+// itself is generated by Planetiler (not that Postgres pipeline)
+// anyway. `promoteId: { building: 'osm_id' }` was therefore looking
+// for a property that never exists on any building feature — every
+// single feature silently resolved to `id === undefined`, which
+// resolveBuildingCandidates below correctly (and silently) drops. That
+// is the actual root cause of "no buildings ever get colored": the
+// candidate list was empty on every run, not a timing/query-order bug.
+//
+// The fix is to stop using promoteId at all and rely on the vector
+// tile's own native numeric `id` element instead. Planetiler (which
+// builds OpenFreeMap's tiles) documents writing that id as
+// `{OSM element id} * 10 + {1 node / 2 way / 3 relation / 0 other}`
+// for every feature by default — i.e. it's already derived from the
+// real-world OSM id, not a tile-local index, so it's already globally
+// stable across every tile/zoom a building appears in. That's exactly
+// the property `promoteId` exists to provide, except MapLibre gets it
+// for free from the tile's id slot here, no property lookup needed.
+// generateId (MapLibre's *other* id-assignment option) is documented
+// as GeoJSON-source-only and doesn't apply to vector sources at all,
+// so it was never a viable fallback here either.
 const BUILDINGS_SOURCE_ID = 'openmaptiles-buildings';
 
 /** Highest-severity building in a baseline, or null if there are none. */
@@ -212,6 +330,35 @@ export function MapLibreView({ scenario }) {
   // applied retroactively instead of silently staying unhighlighted.
   const landmarkFeatureRef = useRef({});
   const currentRiskByIdRef = useRef({});
+
+  // ---------------------------------------------------------------
+  // Per-building risk engine bookkeeping (new).
+  // buildingCandidatesRef: [{ featureTarget, distanceKm }, ...] for
+  //   every candidate building resolved near the current impact point.
+  //   Resolved ONCE per impact-point placement (research §9 — "do this
+  //   candidate enumeration once ... not every frame"), not per tick.
+  // buildingBandByKeyRef: last-applied band per building (keyed by a
+  //   stable string derived from the featureTarget id), so the
+  //   animation loop only calls setFeatureState when a building's band
+  //   actually changes on a given tick (research §7/§9 throttling).
+  // riskZoneFrameRef: the single rAF handle driving BOTH the concentric
+  //   circles and the building recolor loop (research §9 — "drive both
+  //   ... off one requestAnimationFrame loop").
+  // ---------------------------------------------------------------
+  const buildingCandidatesRef = useRef([]);
+  const buildingBandByKeyRef = useRef({});
+  const riskZoneFrameRef = useRef(null);
+  // lastRadiiRef: the most recently fully-settled { point, red, yellow,
+  // green } radii, used as the animation's start point so scrubbing the
+  // timeline forward/backward always animates a smooth grow/shrink from
+  // wherever the zones currently are, rather than restarting from ~0
+  // every time. null until the first activation completes.
+  const lastRadiiRef = useRef(null);
+  // currentRadiiRef: the radii actually rendered on the MOST RECENT
+  // animation tick, updated every frame (unlike lastRadiiRef, which
+  // only updates when an animation fully settles). See the BUGFIX
+  // comment in animateRiskZones for why this exists.
+  const currentRadiiRef = useRef(null);
 
   // -------------------------------------------------------------------
   // Map init — runs once on mount.
@@ -376,19 +523,22 @@ export function MapLibreView({ scenario }) {
       // style-provided flat building fill, etc.) keeps using the
       // original `openmaptiles` source completely untouched. Only our
       // own `3d-buildings` layer below reads from this new source.
+      // No `promoteId` here (see the big comment block above
+      // BUILDINGS_SOURCE_ID for why it was removed) — this second
+      // source now exists only so
+      // 3d-buildings can be added/removed independently of the style's
+      // own building layer, not for any id-remapping purpose. We still
+      // clone rather than reuse `openmaptiles` directly, purely to keep
+      // this layer's lifecycle isolated from the base style's.
       const styleSources = map.getStyle()?.sources || {};
       const baseBuildingsSource = styleSources.openmaptiles;
       if (baseBuildingsSource && !map.getSource(BUILDINGS_SOURCE_ID)) {
-        map.addSource(BUILDINGS_SOURCE_ID, {
-          ...baseBuildingsSource,
-          promoteId: { building: BUILDING_PROMOTE_ID_PROPERTY },
-        });
+        map.addSource(BUILDINGS_SOURCE_ID, { ...baseBuildingsSource });
       } else if (!baseBuildingsSource) {
         // eslint-disable-next-line no-console
         console.warn(
           '[MapLibreView] no `openmaptiles` source found in the loaded style — '
-            + 'falling back to it directly for 3d-buildings, which means the '
-            + 'random-recolor bug (tile-local feature ids) will NOT be fixed.',
+            + 'falling back to it directly for 3d-buildings.',
         );
       }
       const buildingsSourceId = map.getSource(BUILDINGS_SOURCE_ID)
@@ -414,17 +564,35 @@ export function MapLibreView({ scenario }) {
           type: 'fill-extrusion',
           minzoom: 14,
           paint: {
+            // Research §3/§9: `match` on the categorical 'riskLevel'
+            // feature-state, with an explicit gray fallback branch —
+            // this is what makes a building with NO feature-state set
+            // (never-touched) and a building explicitly set to 'none'
+            // (left every band, see evaluateAndApplyBuildingRisk)
+            // render identically: both resolve ['feature-state',
+            // 'riskLevel'] to something that isn't 'red'/'yellow'/
+            // 'green', which `match` falls through to the last
+            // (fallback) argument for. Only three risk colors exist in
+            // this path — no 'orange' branch — per the task's
+            // acceptance checklist; the 5-landmark code below still
+            // writes 'orange' as one of ITS possible values (unchanged
+            // legacy behavior, see applyLandmarkRisk), so 'orange'
+            // simply isn't given its own branch here and instead falls
+            // through to gray, exactly like 'none' does. (Landmarks are
+            // a separate, older highlighting path layered on the same
+            // feature-state key — see Section on landmark code below —
+            // and are out of scope for this task's re-work; flagged in
+            // the implementation summary.)
             'fill-extrusion-color': [
-              'case',
-              ['==', ['feature-state', 'riskLevel'], 'red'],
-              RISK_HEX.red,
-              ['==', ['feature-state', 'riskLevel'], 'orange'],
-              RISK_HEX.orange,
-              ['==', ['feature-state', 'riskLevel'], 'yellow'],
-              RISK_HEX.yellow,
-              ['==', ['feature-state', 'riskLevel'], 'green'],
-              RISK_HEX.green,
-              // Fallback for every non-landmark building — same
+              'match',
+              ['feature-state', 'riskLevel'],
+              'red',
+              BUILDING_RISK_HEX.red,
+              'yellow',
+              BUILDING_RISK_HEX.yellow,
+              'green',
+              BUILDING_RISK_HEX.green,
+              // Fallback for every unaffected building — same
               // grayscale-by-height interpolation as before, lightened
               // (Task 8d FIX 1) from #3a3a3f→#5a5a60 to #5a5a62→#8a8a94
               // so it reads against dark-matter's near-black basemap.
@@ -433,31 +601,34 @@ export function MapLibreView({ scenario }) {
                 ['linear'],
                 ['coalesce', ['get', 'render_height'], 8],
                 0,
-                '#5a5a62',
+                BUILDING_DEFAULT_GRAY,
                 100,
                 '#8a8a94',
               ],
             ],
+            // Research §3: fill-extrusion-color is Transitionable and
+            // documented as supporting feature-state expressions;
+            // whether the crossfade is actually smooth for a
+            // feature-state-driven change (vs. snapping instantly) is
+            // flagged unresolved/unverified in the research artifact —
+            // left enabled here since it's the documented-correct
+            // config either way, and a snap-instead-of-fade is an
+            // acceptable degraded case, not a bug in this config.
             'fill-extrusion-color-transition': { duration: TRANSITION_MS },
-            // Task 8d FIX 2: boost HEIGHT (not just color) for any
-            // building with an active riskLevel, via the same
-            // feature-state key, so a highlighted building stays
-            // visually prominent regardless of its real OSM height.
-            // Floor values (40/30/20m) are starting points tuned
-            // against typical Central Delhi building scale — adjust
-            // once seen rendered live if they read as too tall/short.
-            //
-            // The fallback branch is a flat coalesced height (NOT a
+            // Height boost only for red/yellow (green is "still
+            // affected, least severe" per the task brief, not
+            // "safe/normal" — but we intentionally do NOT boost green's
+            // height, to keep the innermost bands visually dominant on
+            // the skyline; green is communicated via color only). The
+            // fallback branch is a flat coalesced height (NOT a
             // zoom-interpolated ramp) — nesting ['zoom'] inside a case
             // branch is invalid MapLibre style syntax and previously
-            // broke this entire layer (see PROJECT_CONTEXT.md /
-            // Task 8d bug writeup). Left as-is here.
+            // broke this entire layer (see PROJECT_CONTEXT.md / Task 8d
+            // bug writeup). Left as-is here.
             'fill-extrusion-height': [
               'case',
               ['==', ['feature-state', 'riskLevel'], 'red'],
               ['max', 40, ['coalesce', ['get', 'render_height'], 8]],
-              ['==', ['feature-state', 'riskLevel'], 'orange'],
-              ['max', 30, ['coalesce', ['get', 'render_height'], 8]],
               ['==', ['feature-state', 'riskLevel'], 'yellow'],
               ['max', 20, ['coalesce', ['get', 'render_height'], 8]],
               ['coalesce', ['get', 'render_height'], 8],
@@ -473,27 +644,41 @@ export function MapLibreView({ scenario }) {
         labelLayerId,
       );
 
-      // --- 2. Impact / blast-radius zone (grown in on activation) ---
-      map.addSource('impact-zone', {
-        type: 'geojson',
-        data: turf.circle([FALLBACK_CENTER.lng, FALLBACK_CENTER.lat], 0.001, { steps: 64, units: 'kilometers' }),
-      });
-      map.addLayer({
-        id: 'impact-zone-fill',
-        source: 'impact-zone',
-        type: 'fill-extrusion',
-        paint: {
-          'fill-extrusion-color': RISK_HEX.red,
-          'fill-extrusion-height': 18,
-          'fill-extrusion-base': 0,
-          'fill-extrusion-opacity': 0.22,
-        },
-      });
-      map.addLayer({
-        id: 'impact-zone-outline',
-        source: 'impact-zone',
-        type: 'line',
-        paint: { 'line-color': RISK_HEX.red, 'line-width': 2, 'line-opacity': 0.6 },
+      // --- 2. Impact / blast-radius zones: three concentric rings ---
+      // Upgraded from a single fixed-radius circle to three concentric
+      // GeoJSON circles matching the new red/yellow/green building
+      // bands (research §9 flags this as an open design choice between
+      // "three concentric circles" vs. "stay a single outline" and
+      // recommends whichever is best-supported — three separate
+      // GeoJSON sources, each swapped via setData() exactly like the
+      // old single circle was, is directly supported with no new API,
+      // so that's what's implemented here). Green (outermost, largest
+      // radius) is added FIRST so red/yellow layer on top of it,
+      // matching the innermost-wins visual priority used for building
+      // classification.
+      ['green', 'yellow', 'red'].forEach((band) => {
+        const sourceId = `impact-zone-${band}`;
+        map.addSource(sourceId, {
+          type: 'geojson',
+          data: turf.circle([FALLBACK_CENTER.lng, FALLBACK_CENTER.lat], 0.001, { steps: 64, units: 'kilometers' }),
+        });
+        map.addLayer({
+          id: `${sourceId}-fill`,
+          source: sourceId,
+          type: 'fill-extrusion',
+          paint: {
+            'fill-extrusion-color': RISK_HEX[band],
+            'fill-extrusion-height': band === 'red' ? 18 : band === 'yellow' ? 12 : 6,
+            'fill-extrusion-base': 0,
+            'fill-extrusion-opacity': band === 'red' ? 0.22 : 0.14,
+          },
+        });
+        map.addLayer({
+          id: `${sourceId}-outline`,
+          source: sourceId,
+          type: 'line',
+          paint: { 'line-color': RISK_HEX[band], 'line-width': 2, 'line-opacity': 0.6 },
+        });
       });
 
       // --- 3. Evacuation route: static dashed line + animated point ---
@@ -599,27 +784,51 @@ export function MapLibreView({ scenario }) {
   }, []);
 
   // -------------------------------------------------------------------
-  // Landmark risk colors + evac route target — react to ANY change in
-  // `scenario` (timeline scrub, intervention toggle, or scenario switch
-  // itself), matching MapView's own "re-render on every merged state"
-  // behavior. This does NOT re-fly the camera or regrow the impact zone
-  // — see the effect below for that, which only fires on scenario.id.
+  // Landmark risk colors + per-building risk zones + evac route target
+  // — react to ANY change in `scenario` (timeline scrub, intervention
+  // toggle, or scenario switch itself), matching MapView's own
+  // "re-render on every merged state" behavior. This does NOT re-fly
+  // the camera or re-resolve the building candidate set — see the
+  // effect below for that, which only fires on scenario.id. Scrubbing
+  // the timeline re-animates the risk zones toward whatever radii the
+  // new keyframe/state specifies (growing OR shrinking, per
+  // animateRiskZones' lerp-from-lastRadiiRef behavior) without
+  // re-querying the building source or re-flying the camera.
   // -------------------------------------------------------------------
   useEffect(() => {
     if (!loadedRef.current) return;
     applyLandmarkRisk(scenario);
+    const primary = findPrimaryImpactBuilding(scenario.baseline);
+    const impactCenter = scenario.baseline?.impactPoint
+      || (primary ? { lat: primary.lat, lng: primary.lng } : FALLBACK_CENTER);
+    // BUGFIX: resolveActiveRadii reads redRadiusKm/yellowRadiusKm/
+    // greenRadiusKm/impactPoint directly off whatever object it's
+    // given. Those fields live on the MERGED keyframe state
+    // (scenario.baseline, per mergeKeyframe.js's field passthrough —
+    // CommandShell spreads the merged state into mapViewScenario.baseline),
+    // not on the outer scenario wrapper ({id, baseline, timeline, ...}).
+    // Passing `scenario` here meant hasExplicitRadii was always false,
+    // so every keyframe scrub silently fell back to the same fixed
+    // default radii/point instead of the keyframe's actual values —
+    // this is why scrubbing to T+5/T+10/etc. visibly did nothing.
+    animateRiskZones(scenario.baseline, impactCenter);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenario]);
 
   // -------------------------------------------------------------------
-  // Scenario ACTIVATION — camera fly-in + impact-zone growth + one-shot
-  // evac route animation. Keyed on scenario.id specifically (not the
-  // whole scenario object) so scrubbing the timeline or toggling an
-  // intervention never re-triggers the cinematic entrance, only an
-  // actual scenario switch does.
+  // Scenario ACTIVATION — camera fly-in + building-candidate
+  // resolution + impact-zone growth + one-shot evac route animation.
+  // Keyed on scenario.id specifically (not the whole scenario object)
+  // so scrubbing the timeline or toggling an intervention never
+  // re-triggers the cinematic entrance or re-queries the building
+  // source, only an actual scenario switch does. resetAllBuildingRisk
+  // runs first so a building colored by the PREVIOUS scenario doesn't
+  // stay stuck colored after switching (checklist item 6 — "scenario
+  // resets" reset trigger).
   // -------------------------------------------------------------------
   useEffect(() => {
     if (!loadedRef.current) return;
+    resetAllBuildingRisk();
     applyScenarioActivation(scenario);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenario.id]);
@@ -696,10 +905,16 @@ export function MapLibreView({ scenario }) {
     const map = mapRef.current;
     if (!map) return;
 
+    // Prefer the scenario/keyframe's own explicit impactPoint (the same
+    // field resolveActiveRadii reads for the circles — see that
+    // function's priority order) so the camera flies to, and building
+    // candidates are measured from, the exact same point the red/
+    // yellow/green zones are centered on. Only fall back to the
+    // highest-severity-building heuristic when a scenario doesn't
+    // define impactPoint at all (older/malformed scenario objects).
     const primary = findPrimaryImpactBuilding(currentScenario.baseline);
-    const impactCenter = primary
-      ? { lat: primary.lat, lng: primary.lng }
-      : FALLBACK_CENTER;
+    const impactCenter = currentScenario.baseline?.impactPoint
+      || (primary ? { lat: primary.lat, lng: primary.lng } : FALLBACK_CENTER);
 
     // Cinematic camera move into the impact zone.
     map.flyTo({
@@ -712,33 +927,304 @@ export function MapLibreView({ scenario }) {
       essential: true,
     });
 
-    growImpactZone(impactCenter);
+    // Research §1: don't start touching setFeatureState / querying
+    // buildings until the buildings source has actually finished
+    // loading — guards the documented "first setFeatureState call for a
+    // session throws" race condition. isSourceLoaded is checked
+    // immediately; if it's not ready yet, we retry on 'idle' (which
+    // this component already listens to for landmark resolution) via
+    // a one-shot flag rather than polling on a timer.
+    // Research §1/§5: don't query the buildings source for candidates
+    // until it has tiles loaded AROUND THE IMPACT POINT specifically —
+    // isSourceLoaded() can be true here yet still only reflect tiles
+    // near the wide establishing view (FALLBACK_CENTER), since the
+    // flyTo above hasn't landed yet. querySourceFeatures is scoped to
+    // whatever tiles happen to be in memory (research §5), so querying
+    // immediately after flyTo starts (rather than after it settles) was
+    // silently returning zero candidates near the impact point — no
+    // buildings ever got colored. Waiting for 'idle' AFTER flyTo (which
+    // only fires once camera movement AND tile loading for the new
+    // viewport have both settled) guarantees the impact-point tiles are
+    // actually resolvable. moveend fires on camera stop; idle fires
+    // strictly after that once tiles are in, so idle is the correct
+    // signal here, not moveend.
+    const beginBuildingRiskEngine = () => {
+      resolveBuildingCandidates(impactCenter);
+      animateRiskZones(currentScenario.baseline, impactCenter);
+    };
+    if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
+      beginBuildingRiskEngine();
+    } else {
+      const onIdleStart = () => {
+        if (!map.isSourceLoaded(BUILDINGS_SOURCE_ID)) return;
+        map.off('idle', onIdleStart);
+        beginBuildingRiskEngine();
+      };
+      map.on('idle', onIdleStart);
+    }
+    // Re-resolve candidates on every 'idle' for a short window after
+    // activation, not just once on moveend. 'idle' (not moveend) is the
+    // correct "tiles have actually settled" signal (research §1 — this
+    // matches the exact reasoning already used for tryResolveLandmarkFeatures
+    // above); moveend only means the camera stopped, tiles can still be
+    // in flight for several more idle cycles as the flyTo's intermediate
+    // zoom levels page in new tiles. Re-running resolveBuildingCandidates
+    // repeatedly is cheap (a single querySourceFeatures scan) and
+    // idempotent — each call fully replaces buildingCandidatesRef, so a
+    // later, more-complete idle simply supersedes an earlier, sparser
+    // one rather than accumulating duplicates.
+    let idleRetriesLeft = 6; // ~a few seconds of idle events after activation
+    const onIdleReresolve = () => {
+      resolveBuildingCandidates(impactCenter);
+      idleRetriesLeft -= 1;
+      if (idleRetriesLeft <= 0) map.off('idle', onIdleReresolve);
+    };
+    map.on('idle', onIdleReresolve);
     animateEvacRoute(currentScenario.baseline, impactCenter);
   }
 
-  function growImpactZone(center) {
+  /**
+   * Research §5/§9: enumerates every candidate building once (not per
+   * frame) via querySourceFeatures (NOT queryRenderedFeatures — the
+   * growing radius must be able to reach buildings currently outside
+   * the viewport, which queryRenderedFeatures structurally cannot see).
+   * Deduplicates by the promoted id (osm_id) since tile-boundary
+   * splitting can return the same building's geometry more than once
+   * (research §5). For each unique candidate, computes a representative
+   * point via turf.pointOnFeature (research §6 — safer than
+   * turf.centroid for non-convex/L-shaped real building footprints,
+   * since a centroid can land outside the polygon) and precomputes its
+   * distance from the impact point once, in kilometers (matching the
+   * km units the scenario's radii are authored in).
+   *
+   * Results are cached in buildingCandidatesRef and reused for every
+   * tick of the radius animation, per research §9's "do this once, not
+   * every frame" guidance — only each building's band relative to the
+   * CURRENT radius changes per tick, not the underlying candidate set
+   * or its distances.
+   */
+  function resolveBuildingCandidates(impactCenter) {
     const map = mapRef.current;
-    const source = map?.getSource('impact-zone');
-    if (!source) return;
+    if (!map) return;
 
-    if (impactZoneFrameRef.current) cancelAnimationFrame(impactZoneFrameRef.current);
+    const runQuery = () => {
+      let features;
+      try {
+        features = map.querySourceFeatures(BUILDINGS_SOURCE_ID, { sourceLayer: 'building' });
+      } catch (err) {
+        // Research §1: defense-in-depth try/catch around the first
+        // querySourceFeatures/setFeatureState calls for a session — a
+        // source that hasn't finished loading can throw here rather
+        // than returning an empty array, depending on version/timing.
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] querySourceFeatures failed (source likely still loading), will retry on idle', err);
+        buildingCandidatesRef.current = [];
+        return;
+      }
+
+      const seenIds = new Set();
+      const impactPointFeature = turf.point([impactCenter.lng, impactCenter.lat]);
+      const candidates = [];
+
+      features.forEach((feature) => {
+        // feature.id here is the vector tile's own native id (no
+        // promoteId involved anymore — see the comment block near
+        // BUILDINGS_SOURCE_ID above for why). Planetiler already
+        // derives that id from the real-world OSM element id, so it's
+        // stable across every tile/zoom the building appears in. Skip
+        // anything that didn't resolve to an id at all (research §1:
+        // setFeatureState requires feature.id to be present) — this
+        // should now be rare/never instead of "always every building".
+        if (feature.id === undefined || feature.id === null) return;
+        const dedupeKey = String(feature.id);
+        if (seenIds.has(dedupeKey)) return; // research §5: tile-boundary duplication
+        seenIds.add(dedupeKey);
+
+        let representativePoint;
+        try {
+          representativePoint = turf.pointOnFeature(feature);
+        } catch (err) {
+          return; // malformed geometry — skip rather than crash the whole batch
+        }
+
+        const distanceKm = turf.distance(impactPointFeature, representativePoint, { units: 'kilometers' });
+        candidates.push({
+          featureTarget: { source: feature.source, sourceLayer: feature.sourceLayer, id: feature.id },
+          dedupeKey,
+          distanceKm,
+        });
+      });
+
+      buildingCandidatesRef.current = candidates;
+    };
+
+    if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
+      runQuery();
+    } else {
+      // Research §1: `sourcedata` isn't reliably a single-fire signal —
+      // prefer polling isSourceLoaded via the map's own 'idle' event
+      // (which this component already subscribes to) as the fallback
+      // signal rather than trusting one sourcedata event.
+      const onIdleRetry = () => {
+        if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
+          map.off('idle', onIdleRetry);
+          runQuery();
+        }
+      };
+      map.on('idle', onIdleRetry);
+    }
+  }
+
+  /**
+   * Drives BOTH the three concentric impact-zone circles AND the
+   * per-building recoloring off a single requestAnimationFrame loop
+   * keyed to elapsed wall-clock time (research §9 — "keyed to elapsed
+   * time, not frame count, so behavior is consistent across displays
+   * with different refresh rates").
+   *
+   * Radii are interpolated from the scenario's current radii (whatever
+   * `resolveActiveRadii` resolves off the merged state CommandShell
+   * handed this component — baseline or a timeline keyframe) starting
+   * from whatever the PREVIOUS radii were, so scrubbing the timeline
+   * forward/backward animates a smooth grow/shrink rather than jumping.
+   * On first activation (no previous radii recorded), it eases up from
+   * ~0 exactly like the old single-circle animation did.
+   */
+  function animateRiskZones(currentState, impactCenter) {
+    const map = mapRef.current;
+    const greenSource = map?.getSource('impact-zone-green');
+    const yellowSource = map?.getSource('impact-zone-yellow');
+    const redSource = map?.getSource('impact-zone-red');
+    if (!greenSource || !yellowSource || !redSource) return;
+
+    const target = resolveActiveRadii(currentState, impactCenter);
+    // BUGFIX: lastRadiiRef was only ever WRITTEN when a grow animation
+    // fully settled (t>=1, ~IMPACT_ZONE_GROW_MS later — see the `else`
+    // branch of `step` below). Auto-play advances keyframes every
+    // PLAY_INTERVAL_MS (1700ms in TimelineScrubber.jsx), which is
+    // SHORTER than IMPACT_ZONE_GROW_MS (1800ms) — so during auto-play,
+    // each new keyframe's animateRiskZones call almost always interrupts
+    // the previous one before it ever wrote lastRadiiRef, meaning
+    // `previous` kept falling back to the stale pre-T+0 default every
+    // single step: exactly the "restarts from T+0 each keyframe" symptom.
+    // Fix: track the truly-latest RENDERED radii on every tick (not just
+    // on completion) in currentRadiiRef, and seed `previous` from that
+    // instead of the completion-only lastRadiiRef, so an interrupted
+    // animation always resumes from wherever it visually was.
+    const previous = currentRadiiRef.current || { point: target.point, red: 0.001, yellow: 0.001, green: 0.001 };
+
+    if (riskZoneFrameRef.current) cancelAnimationFrame(riskZoneFrameRef.current);
 
     const start = performance.now();
     const step = (now) => {
       const t = Math.min(1, (now - start) / IMPACT_ZONE_GROW_MS);
-      // Ease-out so the growth decelerates into place rather than
-      // stopping abruptly at full radius.
+      // Ease-out so growth/shrink decelerates into place rather than
+      // stopping/starting abruptly.
       const eased = 1 - (1 - t) ** 2;
-      const radiusKm = Math.max(0.001, IMPACT_ZONE_RADIUS_KM * eased);
-      const circle = turf.circle([center.lng, center.lat], radiusKm, { steps: 64, units: 'kilometers' });
-      source.setData(circle);
+
+      const lerp = (a, b) => a + (b - a) * eased;
+      const currentRadii = {
+        point: target.point,
+        red: Math.max(0.001, lerp(previous.red, target.red)),
+        yellow: Math.max(0.001, lerp(previous.yellow, target.yellow)),
+        green: Math.max(0.001, lerp(previous.green, target.green)),
+      };
+
+      const circleOpts = { steps: 64, units: 'kilometers' };
+      greenSource.setData(turf.circle([currentRadii.point.lng, currentRadii.point.lat], currentRadii.green, circleOpts));
+      yellowSource.setData(turf.circle([currentRadii.point.lng, currentRadii.point.lat], currentRadii.yellow, circleOpts));
+      redSource.setData(turf.circle([currentRadii.point.lng, currentRadii.point.lat], currentRadii.red, circleOpts));
+
+      applyBuildingRiskForRadii(currentRadii);
+
+      // Written every tick (not just on completion) — this is what
+      // lets an interrupted animation resume smoothly instead of
+      // snapping back to a stale pre-activation default. See the
+      // BUGFIX comment above where `previous` is seeded from this ref.
+      currentRadiiRef.current = currentRadii;
+
       if (t < 1) {
-        impactZoneFrameRef.current = requestAnimationFrame(step);
+        riskZoneFrameRef.current = requestAnimationFrame(step);
       } else {
-        impactZoneFrameRef.current = null;
+        riskZoneFrameRef.current = null;
+        lastRadiiRef.current = target;
       }
     };
-    impactZoneFrameRef.current = requestAnimationFrame(step);
+    riskZoneFrameRef.current = requestAnimationFrame(step);
+  }
+
+  /**
+   * The per-tick "hot path" (research §7/§9): scans the precomputed
+   * buildingCandidatesRef array (built once by resolveBuildingCandidates,
+   * NOT rebuilt here) and calls setFeatureState ONLY for buildings whose
+   * classified band differs from the last band applied to them. This
+   * bounds the number of setFeatureState calls per frame to roughly
+   * "buildings near the current radius edge" rather than "every
+   * candidate building every tick" — sidestepping the research
+   * artifact's flagged-unresolved question of a safe per-frame
+   * setFeatureState call-count ceiling (§7/§10.3) rather than needing to
+   * answer it directly.
+   *
+   * A building that leaves every band gets explicitly set to riskLevel
+   * 'none' (not removeFeatureState) per research §2/§9 — 'none' is an
+   * explicit state value the paint expression's `match` doesn't list,
+   * so it falls through to the same gray fallback branch a truly
+   * never-set feature would hit, keeping this to a single API call.
+   */
+  function applyBuildingRiskForRadii(radii) {
+    const map = mapRef.current;
+    if (!map) return;
+    const candidates = buildingCandidatesRef.current;
+    if (candidates.length === 0) return;
+
+    candidates.forEach(({ featureTarget, dedupeKey, distanceKm }) => {
+      const band = classifyBuildingRisk(distanceKm, radii);
+      const lastBand = buildingBandByKeyRef.current[dedupeKey];
+      if (band === lastBand) return; // research §7: skip unchanged bands
+
+      try {
+        map.setFeatureState(featureTarget, { riskLevel: band });
+      } catch (err) {
+        // Research §1: defense-in-depth for the documented first-call
+        // race condition — known to fail once, then succeed on retry,
+        // so we simply let the next tick's re-classification retry it
+        // naturally rather than special-casing a retry here.
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed for a building (will retry next tick if band is still changing)', err);
+        return;
+      }
+      buildingBandByKeyRef.current[dedupeKey] = band;
+    });
+  }
+
+  /**
+   * Resets every currently-tracked building back to gray ('none') and
+   * clears the band-tracking cache. Called on scenario switch (a brand
+   * new scenario.id means a brand new impact point / building set
+   * entirely) so a building affected by the PREVIOUS scenario doesn't
+   * stay stuck colored after switching — checklist item 6 ("scenario
+   * resets" is one of the three explicit reset triggers alongside
+   * radius-shrink, which animateRiskZones already handles via its own
+   * lerp-toward-smaller-target, and "falls outside all bands on a later
+   * keyframe", which applyBuildingRiskForRadii already handles via the
+   * classifyBuildingRisk 'none' branch).
+   */
+  function resetAllBuildingRisk() {
+    const map = mapRef.current;
+    if (!map) return;
+    buildingCandidatesRef.current.forEach(({ featureTarget, dedupeKey }) => {
+      if (buildingBandByKeyRef.current[dedupeKey] === 'none' || buildingBandByKeyRef.current[dedupeKey] === undefined) return;
+      try {
+        map.setFeatureState(featureTarget, { riskLevel: 'none' });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed while resetting a building to gray', err);
+      }
+    });
+    buildingBandByKeyRef.current = {};
+    buildingCandidatesRef.current = [];
+    lastRadiiRef.current = null;
+    currentRadiiRef.current = null;
   }
 
   function animateEvacRoute(baseline, impactCenter) {
