@@ -18,6 +18,7 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&ur
 import * as turf from '@turf/turf';
 import { RISK_HEX } from './MapView';
 import { LANDMARK_IDS, LANDMARKS } from '../data/delhiLandmarks';
+import { METRO_SHELTERS, INACCESSIBLE_AFTER_KARTAVYA_JAM_SHELTER_ID } from '../data/delhiMetroShelters';
 
 /**
  * MapLibreView — Task 8b proof-of-concept 3D map, wired up for the
@@ -128,6 +129,512 @@ const ROAD_CONGESTION_HEX = {
 };
 
 // ---------------------------------------------------------------------
+// Task 9: shelter / metro-station safe-zone overlay. Deliberately a
+// distinct teal/cyan, NOT RISK_HEX.green or the literal string 'green' —
+// reusing either would be a real feature-state collision risk with
+// building-risk bands on any layer that also handles those (see
+// PROJECT_CONTEXT.md §9's resolved design decisions). Reuses the same
+// hex already used by the existing `evac-point-circle` layer so the
+// "this is safe" visual language stays consistent across the app rather
+// than introducing a third color for the same concept.
+// ---------------------------------------------------------------------
+const SAFE_ZONE_HEX = '#5eead4';
+
+// Extrusion height (map units) for every safe-zone polygon's fill.
+// Reported bug fix: at the old fixed height (10), a shelter's teal
+// block got visually swallowed once the growing impact-zone-red (18)
+// and building-risk red (`max(40, render_height)` — see the
+// 3d-buildings-risk layer's 'fill-extrusion-height' expression) blocks
+// grew past it. 55 sits above BOTH of those ceilings so a shelter stays
+// visible through the whole T+0→T+30 scrub. NOTE: an individual real
+// building taller than 55 inside the red band can still poke up further
+// than this in principle — accepted edge case for this demo scene, not
+// something this single constant tries to solve for every possible
+// building height.
+const SAFE_ZONE_FILL_HEIGHT = 55;
+
+// Multiplier applied to a shelter's own footprint size (its LARGER
+// semi-axis, see buildShelterFootprint) to derive
+// resolveShelterExclusionRadiusKm's per-shelter building-risk exclusion
+// radius. Replaces the old single fixed EXCLUSION_RADIUS_KM now that
+// shelters have real, differently-sized footprints (a ~1.3km tunnel
+// area and a small metro concourse shouldn't share one exclusion
+// radius). >1 so the exclusion always comfortably clears the drawn
+// polygon's own edge (plus its jitter), not just be tangent to it — not
+// derived from any engineering standard, picked to look right at this
+// scene's zoom level, same honesty standard as the old constant's
+// comment.
+const EXCLUSION_MARGIN_FACTOR = 1.6;
+
+// Discrete occupancy states a shelter's label cycles through as the
+// timeline advances (see resolveShelterOccupancyLevel below) —
+// deliberately a small fixed enum, not a numeric percentage, since
+// there's no real population/capacity model backing a number here.
+const SHELTER_OCCUPANCY_LEVELS = ['Standing by', 'Filling up', 'Near capacity', 'At capacity'];
+
+// Outline color the one INACCESSIBLE_AFTER_KARTAVYA_JAM_SHELTER_ID
+// shelter's polygon flips to once resolveShelterAccessible resolves it
+// inaccessible (replaces SAFE_ZONE_HEX for that shelter only). Reuses
+// ROAD_CONGESTION_HEX.slow's amber hue rather than the 'jammed' red —
+// the shelter itself isn't on fire/destroyed, it's just unreachable, a
+// materially different situation from a building actually inside the
+// blast radius.
+const SHELTER_INACCESSIBLE_HEX = ROAD_CONGESTION_HEX.slow;
+
+// ---------------------------------------------------------------------
+// Floating shelter status card (canvas-rendered map icon, not a plain
+// GL text layer or a DOM marker — see renderShelterCardCanvas below and
+// the SHELTER_CARD_* constants further down for why). One color per
+// SHELTER_OCCUPANCY_LEVELS index, same array length/order so
+// resolveShelterStatusHex can index directly rather than another
+// lookup table. Deliberately a DIFFERENT palette from
+// SHELTER_INACCESSIBLE_HEX's amber — 'blocked' is a distinct situation
+// (can't be reached at all) from 'at capacity but still reachable', and
+// re-using the same amber for both would read as the same problem when
+// they aren't.
+// ---------------------------------------------------------------------
+const SHELTER_STATUS_HEX = [
+  '#5eead4', // Standing by   — same teal as the base safe-zone color, nothing alarming yet
+  '#a3e635', // Filling up    — lime, still comfortably fine
+  '#f59e0b', // Near capacity — amber, worth noting
+  '#ef4444', // At capacity   — red, the shelter itself is the constraint now
+];
+
+// ---------------------------------------------------------------------
+// Shelter card v2 — rendered as a real MapLibre symbol-layer icon
+// (canvas -> map.addImage -> icon-image), NOT a maplibregl.Marker DOM
+// element. This is a deliberate rewrite after the person explicitly
+// rejected the DOM-marker version: a Marker is a screen-space overlay
+// (fixed CSS pixel size regardless of zoom, positioned via a hardcoded
+// pixel offset that only lines up at one specific camera angle) — see
+// the continuation prompt's root-cause writeup for the full reasoning.
+// A symbol layer's icon is real map content: it's anchored to a real
+// [lng, lat] in world space, reprojects correctly on every pitch/
+// rotate/pan with zero manual offset math, and — critically — its
+// on-screen size is driven by 'icon-size', which we key off ['zoom']
+// below (see the `shelter-cards-symbol` layer), so it shrinks/grows
+// with the camera the way a real object in the scene would instead of
+// staying a fixed CSS size.
+//
+// icon-pitch-alignment / icon-rotation-alignment are both set to
+// 'viewport' on that layer (verified against MapLibre's style-spec
+// docs, not guessed): 'map' alignment would lie the icon flat into the
+// ground plane and rotate/tilt it WITH the camera (right for something
+// like a road shield, wrong here — the person wants a readable card
+// that faces them). 'viewport' keeps the card always facing the
+// camera/screen while its ANCHOR POINT stays locked to the shelter's
+// real world coordinate and zoom-scales with it — i.e. exactly "lives
+// in the 3D scene, positioned on the polygon, but still readable as a
+// card" rather than a flat ground decal.
+// ---------------------------------------------------------------------
+
+// Card canvas authored at this fixed CSS-equivalent size...
+const SHELTER_CARD_CSS_WIDTH = 176;
+const SHELTER_CARD_CSS_HEIGHT = 176;
+// ...rendered at this many device pixels per CSS pixel for crisp text
+// (canvas is created at CSS_WIDTH*RATIO x CSS_HEIGHT*RATIO, then
+// map.addImage is told `pixelRatio: SHELTER_CARD_PIXEL_RATIO` so
+// MapLibre displays it at the intended CSS size when icon-size is 1 —
+// this is what keeps the text from looking blurry/pixelated once
+// zoomed in, same reason any hi-DPI canvas asset uses a supersampled
+// backing store).
+const SHELTER_CARD_PIXEL_RATIO = 3;
+
+// icon-size expression: interpolated by zoom so the card visually
+// shrinks when zooming out and grows when zooming in (the person's
+// explicit complaint #3 — the old Marker version was a fixed CSS size
+// at every zoom). Anchored so the card reads at its "natural" 1x size
+// at this scene's fixed activation zoom (16.5 — see
+// applyScenarioActivation's flyTo), smaller below that and larger
+// above it. These three stops are tuned by eye for THIS scene's actual
+// zoom range (roughly 14–18 per the existing flyTo/maxPitch config),
+// not derived from any formula — same honesty standard as this file's
+// other "tuned to look right at this scene" constants.
+const SHELTER_CARD_ICON_SIZE_EXPR = [
+  'interpolate', ['linear'], ['zoom'],
+  14, 0.5,
+  16.5, 1,
+  18, 1.4,
+];
+
+// Small vertical lift, in rendered-icon pixels (i.e. AFTER icon-size
+// scaling is applied — confirmed against the style-spec's icon-offset
+// definition before using it, since getting the units wrong here would
+// exactly reproduce the "looks right at one zoom, wrong at another"
+// bug this whole rewrite exists to fix), so the card's bottom edge
+// clears the extruded polygon's apex rather than sitting exactly on
+// the anchor point. Deliberately small: most of the "floats above the
+// shelter" effect already comes from `icon-anchor: 'bottom'` placing
+// the card's bottom edge (not center) at the shelter's ground-plane
+// point, plus the card's own drawn tail pointing down at that point —
+// this offset just nudges it clear of the tail itself. Still an
+// approximation (see SAFE_ZONE_FILL_HEIGHT's own comment on the exact
+// same limitation): MapLibre GL JS symbol layers anchor at a ground-
+// plane lng/lat, not a true 3D XYZ point, so there's no clean way to
+// say "hover exactly at world-height 55" without a custom WebGL layer
+// — flagged explicitly rather than silently faked.
+const SHELTER_CARD_ICON_OFFSET = [0, -4];
+
+/**
+ * Deterministic seeded PRNG (mulberry32, keyed off a string seed via a
+ * cheap string hash), used only to jitter buildShelterFootprint's ring
+ * vertices. Deterministic — not Math.random — so a given shelter's
+ * polygon looks IDENTICAL on every reload/re-render instead of
+ * reshaping itself each time map.on('load') reruns, which would read as
+ * a bug ("why did the shelter change shape") rather than the intended
+ * one-time "hand-drawn" irregularity.
+ */
+function seededRandom(seed) {
+  let h = 1779033703 ^ seed.length;
+  for (let i = 0; i < seed.length; i += 1) {
+    h = Math.imul(h ^ seed.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  return function next() {
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Builds one METRO_SHELTERS entry's safe-zone polygon as a real
+ * (non-circular) shape: a turf.ellipse sized/oriented per the entry's
+ * own `footprint` metadata (see delhiMetroShelters.js), then perturbed
+ * with small deterministic per-vertex jitter so it reads as "an actual,
+ * slightly irregular structure" rather than a perfect geometric
+ * primitive. Replaces the old plain turf.circle(...) per person's
+ * explicit "not just a simple radius, actually a good polygon" request.
+ * NOT survey-accurate geometry — nothing in this codebase has traced a
+ * real footprint for these shelters (contrast with delhiLandmarks.js's
+ * LANDMARKS, which back a queryRenderedFeatures lookup against real
+ * building polygons); this is a deliberately-labeled illustrative shape,
+ * same honesty standard as every other shelter-geometry comment in this
+ * file and in delhiMetroShelters.js.
+ */
+function buildShelterFootprint(shelter) {
+  const { xSemiAxisKm, ySemiAxisKm, bearingDeg, jitterFraction = 0.12 } = shelter.footprint;
+  const base = turf.ellipse([shelter.lng, shelter.lat], xSemiAxisKm, ySemiAxisKm, {
+    steps: 48,
+    units: 'kilometers',
+    angle: bearingDeg,
+  });
+  const ring = base.geometry.coordinates[0];
+  const rand = seededRandom(shelter.id);
+  const jittered = ring.map((coord, i) => {
+    // Keep the closing vertex identical to the first so the ring stays
+    // closed — GeoJSON polygons require first === last coordinate, and
+    // jittering them independently would leave a visible gap/seam.
+    if (i === ring.length - 1) return coord;
+    const jitterKm = Math.max(xSemiAxisKm, ySemiAxisKm) * jitterFraction * rand();
+    const jitterBearing = rand() * 360;
+    return turf.destination(coord, jitterKm, jitterBearing, { units: 'kilometers' }).geometry.coordinates;
+  });
+  jittered[jittered.length - 1] = jittered[0];
+  return turf.polygon([jittered], { shelterId: shelter.id });
+}
+
+/**
+ * Per-shelter building-risk exclusion radius, replacing the old single
+ * fixed EXCLUSION_RADIUS_KM constant now that shelters have real,
+ * differently-sized footprints. Derived from the shelter's own larger
+ * semi-axis so a bigger footprint (e.g. pragati-maidan-tunnel) gets a
+ * proportionally bigger exclusion zone than a small metro concourse.
+ */
+function resolveShelterExclusionRadiusKm(shelter) {
+  const { xSemiAxisKm, ySemiAxisKm } = shelter.footprint;
+  return Math.max(xSemiAxisKm, ySemiAxisKm) * EXCLUSION_MARGIN_FACTOR;
+}
+
+/**
+ * "Shelters fill up as time/keyframes advance, closer ones fill faster"
+ * — explicit person request. Pure function of the current
+ * `timelineIndex` (0-based position in scenario.timeline, already used
+ * elsewhere in this file as a time proxy since keyframes are labeled
+ * T+0/T+5/T+10/...) and the shelter's real distance from the current
+ * impact point: closer shelters are assumed to get discovered/used
+ * first, so their occupancy ramp advances a level per timeline step
+ * sooner than a farther shelter's does. No claim to a real
+ * evacuation/crowd-flow model — a monotonic, demo-plausible ramp over
+ * the small SHELTER_OCCUPANCY_LEVELS enum, kept deliberately simple per
+ * the brief's "keep this simple" scope note rather than a numeric
+ * capacity/headcount model with nothing real backing its precision.
+ */
+function resolveShelterOccupancyLevel(timelineIndex, distanceKm) {
+  if (typeof timelineIndex !== 'number' || timelineIndex < 0) return SHELTER_OCCUPANCY_LEVELS[0];
+  // distanceKm / 1.5: a shelter ~1.5km farther away needs roughly one
+  // extra elapsed timeline step to reach the same occupancy level as a
+  // shelter right next to the impact point. Picked to be demo-legible
+  // across this scenario's actual shelter distances (0.3–3.0km, see
+  // delhiMetroShelters.js's header) rather than tuned against any real
+  // pedestrian-flow rate.
+  const effectiveSteps = timelineIndex - Math.floor(distanceKm / 1.5);
+  const levelIndex = Math.min(SHELTER_OCCUPANCY_LEVELS.length - 1, Math.max(0, effectiveSteps));
+  return SHELTER_OCCUPANCY_LEVELS[levelIndex];
+}
+
+/**
+ * The hardcoded "one shelter becomes inaccessible once Kartavya Path
+ * force-jams" rule — explicit person request. Keyed to
+ * INACCESSIBLE_AFTER_KARTAVYA_JAM_SHELTER_ID (see delhiMetroShelters.js
+ * for which shelter and why) and gated by the SAME
+ * `kartavyaOverrideActive` boolean (resolveKartavyaOverrideActive's
+ * T+15 gate) already driving Kartavya Path's own road forced-jam
+ * override, so both effects flip at exactly the same timeline step
+ * instead of needing a second, separately-tuned threshold.
+ */
+function resolveShelterAccessible(shelterId, kartavyaOverrideActive) {
+  if (shelterId !== INACCESSIBLE_AFTER_KARTAVYA_JAM_SHELTER_ID) return true;
+  return !kartavyaOverrideActive;
+}
+
+/**
+ * Occupancy level -> card color. Pure lookup into SHELTER_STATUS_HEX by
+ * SHELTER_OCCUPANCY_LEVELS index, isolated into its own function (rather
+ * than inlined at each call site) so 'blocked' state's override lives
+ * in exactly one place: an inaccessible shelter always renders
+ * SHELTER_INACCESSIBLE_HEX regardless of whatever occupancy level it
+ * happens to also be at, since "can't be reached at all" is a strictly
+ * worse, and visually distinct, situation than "reachable but full".
+ */
+function resolveShelterStatusHex(occupancyLevel, accessible) {
+  if (!accessible) return SHELTER_INACCESSIBLE_HEX;
+  const index = SHELTER_OCCUPANCY_LEVELS.indexOf(occupancyLevel);
+  return SHELTER_STATUS_HEX[index === -1 ? 0 : index];
+}
+
+/**
+ * Word-wraps `text` to fit within `maxWidth` canvas px at the context's
+ * CURRENT font, returning up to `maxLines` lines with an ellipsis
+ * appended to the last line if content was truncated. Plain manual
+ * wrap via ctx.measureText — canvas 2D has no built-in text-wrap, this
+ * is the standard way to fake it.
+ */
+function wrapCanvasText(ctx, text, maxWidth, maxLines) {
+  const words = text.split(' ');
+  const lines = [];
+  let current = '';
+  for (let i = 0; i < words.length; i += 1) {
+    const attempt = current ? `${current} ${words[i]}` : words[i];
+    if (ctx.measureText(attempt).width > maxWidth && current) {
+      lines.push(current);
+      current = words[i];
+      if (lines.length === maxLines) break;
+    } else {
+      current = attempt;
+    }
+  }
+  if (lines.length < maxLines && current) lines.push(current);
+  const truncated = lines.length === maxLines
+    && (words.join(' ').length > lines.join(' ').length);
+  if (truncated) {
+    let last = lines[maxLines - 1];
+    while (ctx.measureText(`${last}\u2026`).width > maxWidth && last.length > 0) {
+      last = last.slice(0, -1);
+    }
+    lines[maxLines - 1] = `${last}\u2026`;
+  }
+  return lines;
+}
+
+/**
+ * Manual rounded-rect path helper, replacing CanvasRenderingContext2D's
+ * native `roundRect()` method. `roundRect` is a genuinely recent
+ * addition to the Canvas 2D API — NOT safe to assume is available in
+ * every browser/engine this app might run in — and this codebase
+ * learned that the hard way: calling it unconditionally threw
+ * `TypeError: ctx.roundRect is not a function` on the very first
+ * shelter card, which aborted the rest of `map.on('load', ...)`
+ * (everything after that point in the callback — impact-zone circle
+ * growth, building-risk coloring, road congestion, evac route — never
+ * ran, since it's all one synchronous callback; see this pass's
+ * continuation prompt for the full trace). This is drawn with plain
+ * `moveTo`/`lineTo`/`arcTo`, a completely standard technique with
+ * universal support, so this function can never be the thing that
+ * takes the rest of the scene down. Adds a rect path to the CURRENT
+ * path (same calling convention as native roundRect) — caller still
+ * owns beginPath()/fill()/stroke().
+ */
+function drawRoundedRectPath(ctx, x, y, width, height, r) {
+  const radius = Math.min(r, width / 2, height / 2);
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + width, y, x + width, y + height, radius);
+  ctx.arcTo(x + width, y + height, x, y + height, radius);
+  ctx.arcTo(x, y + height, x, y, radius);
+  ctx.arcTo(x, y, x + width, y, radius);
+  ctx.closePath();
+}
+
+/**
+ * Draws ONE shelter's floating status card onto a fresh canvas — the
+ * visual replacement for the old buildShelterCardElement DOM version
+ * (background panel, colored border, downward tail, name, structural
+ * badge, live distance, progress bar, status line, feasibility note —
+ * same content, same information, different rendering primitive so it
+ * can live as a real map `icon-image` instead of a screen-space DOM
+ * node; see the SHELTER_CARD_* constants' doc comment for why).
+ * Returns the canvas, which the caller registers/updates via
+ * map.addImage / map.updateImage.
+ */
+function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, fillPercent, statusHex }) {
+  const w = SHELTER_CARD_CSS_WIDTH;
+  const h = SHELTER_CARD_CSS_HEIGHT;
+  const ratio = SHELTER_CARD_PIXEL_RATIO;
+  const canvas = document.createElement('canvas');
+  canvas.width = w * ratio;
+  canvas.height = h * ratio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(ratio, ratio);
+  ctx.clearRect(0, 0, w, h);
+
+  const padX = 10;
+  const tailH = 8;
+  const panelH = h - tailH;
+  const radius = 10;
+
+  // --- panel background (rounded rect) ---
+  ctx.beginPath();
+  drawRoundedRectPath(ctx, 0, 0, w, panelH, radius);
+  ctx.fillStyle = 'rgba(10, 10, 11, 0.88)';
+  ctx.fill();
+  ctx.lineWidth = 2.2;
+  ctx.strokeStyle = statusHex;
+  ctx.stroke();
+
+  // --- downward-pointing tail, same statusHex as the border ---
+  ctx.beginPath();
+  ctx.moveTo(w / 2 - 7, panelH - 1);
+  ctx.lineTo(w / 2 + 7, panelH - 1);
+  ctx.lineTo(w / 2, panelH + tailH - 1);
+  ctx.closePath();
+  ctx.fillStyle = statusHex;
+  ctx.fill();
+
+  let y = 18;
+  ctx.textBaseline = 'alphabetic';
+
+  // --- name ---
+  ctx.font = '700 12px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#e4e4e7';
+  const nameLines = wrapCanvasText(ctx, shelter.name, w - padX * 2, 2);
+  nameLines.forEach((line) => {
+    ctx.fillText(line, padX, y);
+    y += 14;
+  });
+  y += 2;
+
+  // --- structural badge + distance ---
+  const badgeLabel = shelter.metadata.structuralRating.replace('-', ' ').toUpperCase();
+  ctx.font = '600 9px system-ui, -apple-system, sans-serif';
+  const badgeTextWidth = ctx.measureText(badgeLabel).width;
+  const badgePadX = 5;
+  const badgeW = badgeTextWidth + badgePadX * 2;
+  const badgeH = 13;
+  ctx.fillStyle = 'rgba(255,255,255,0.08)';
+  ctx.beginPath();
+  drawRoundedRectPath(ctx, padX, y - badgeH + 3, badgeW, badgeH, 4);
+  ctx.fill();
+  ctx.fillStyle = '#a1a1aa';
+  ctx.fillText(badgeLabel, padX + badgePadX, y);
+  ctx.font = '400 10px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#a1a1aa';
+  ctx.fillText(`${distanceKm.toFixed(2)} km from impact`, padX + badgeW + 8, y);
+  y += 14;
+
+  // --- progress bar track + fill ---
+  const barW = w - padX * 2;
+  const barH = 5;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath();
+  drawRoundedRectPath(ctx, padX, y, barW, barH, 3);
+  ctx.fill();
+  const fillW = Math.max(barH, (fillPercent / 100) * barW);
+  ctx.fillStyle = statusHex;
+  ctx.beginPath();
+  drawRoundedRectPath(ctx, padX, y, fillW, barH, 3);
+  ctx.fill();
+  y += barH + 13;
+
+  // --- status line ---
+  ctx.font = '600 10px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = statusHex;
+  const statusLabel = accessible
+    ? `\u25cf ${occupancy} (${fillPercent}%)`
+    : '\u26d4 Blocked \u2014 Kartavya Path jammed';
+  ctx.fillText(statusLabel, padX, y);
+  y += 13;
+
+  // --- feasibility note, clamped to 3 lines ---
+  ctx.font = '400 9px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#a1a1aa';
+  const noteLines = wrapCanvasText(ctx, shelter.metadata.feasibilityNote, w - padX * 2, 3);
+  noteLines.forEach((line) => {
+    ctx.fillText(line, padX, y);
+    y += 11;
+  });
+
+  return canvas;
+}
+
+/**
+ * Registers or updates a shelter's card image on the map. First call
+ * for a given shelter uses map.addImage; every subsequent call (a
+ * scenario/timelineIndex change) uses map.updateImage to replace the
+ * bitmap in place — MapLibre re-renders any symbol layer referencing
+ * that image id automatically, no source/layer touch needed. Tracked
+ * via `registeredIds` (a Set held in a ref by the caller) since
+ * map.hasImage exists but re-checking it on every call is no cheaper
+ * than just tracking it ourselves alongside the rest of this file's
+ * ref-based bookkeeping.
+ */
+/**
+ * Registers or updates a shelter's card image on the map. Uses
+ * map.hasImage as the SOLE source of truth for whether to addImage vs
+ * updateImage — a prior version tracked this with our own Set instead,
+ * which desynced from the map's real registry under React
+ * StrictMode's double-effect-invoke / Vite HMR in dev.
+ *
+ * ROOT CAUSE of the `RangeError: mismatched image size. expected: 0
+ * but got: 1115136` crash (this pass's actual fix): that error was
+ * firing on the very FIRST addImage call for a brand-new image id, not
+ * just on updateImage/re-add — meaning it was never about stale state,
+ * it was about the argument shape. We were handing map.addImage a raw
+ * HTMLCanvasElement directly. This installed maplibre-gl build reads
+ * that canvas's pixel data via its own internal image-decoding path,
+ * and something in that path was resolving the canvas's width/height
+ * as 0 while still reading its full pixel buffer (528x528x4 =
+ * 1,115,136 bytes) — an internal RGBAImage-vs-source-dimensions
+ * mismatch, not a bug in our canvas drawing code at all. The fix is to
+ * stop handing MapLibre a canvas element and instead extract a real
+ * `ImageData` ourselves via `ctx.getImageData(...)` — ImageData is
+ * one of addImage's officially documented, unambiguous input shapes
+ * (`{width, height, data}`, guaranteed internally consistent since the
+ * browser itself constructs it), so there's no decoding path left for
+ * MapLibre to get the dimensions wrong on.
+ */
+function canvasToImageData(canvas) {
+  const ctx = canvas.getContext('2d');
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+function upsertShelterCardImage(map, imageId, canvas) {
+  const imageData = canvasToImageData(canvas);
+  if (map.hasImage(imageId)) {
+    try {
+      map.updateImage(imageId, imageData);
+      return;
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`updateImage failed for ${imageId}, falling back to re-add`, err);
+      map.removeImage(imageId);
+    }
+  }
+  map.addImage(imageId, imageData, { pixelRatio: SHELTER_CARD_PIXEL_RATIO });
+}
+
+
+// ---------------------------------------------------------------------
 // Automatic road-congestion resolver (pivot away from hand-authored
 // per-id `roadCongestion` JSON entries — see the continuation prompt /
 // PROJECT_CONTEXT.md for the full history of why). Person has no way to
@@ -155,14 +662,19 @@ const DRIVABLE_CLASSES = new Set([
   'living_street',
 ]);
 
-// The security-attack timeline's own explicit rule: the attack happens
-// at T+15, not T+0 — nothing before that point should show any road
-// congestion, no matter how small the radii or how close a road
-// happens to sit to the impact point. Gating off the keyframe LABEL
-// (found by name in scenario.timeline, not a hardcoded array index) so
-// this still holds even if keyframes are reordered/added/removed later,
-// and even if radii are edited to something less conservative than
-// today's tiny 0.08/0.16/0.24km T+0 values.
+// The security-attack timeline's own explicit rule: the ATTACK itself
+// happens at T+15, not T+0. General distance-based road classification
+// (classifyRoadCongestion, below) now runs on every tick from T+0
+// onward, off the exact same radii already driving buildings/circles —
+// it naturally produces a near-empty result at T+0–T+10 since those
+// keyframes' red/yellow radii are tiny (0.08–0.42km), without needing a
+// hard gate. What DOES still need a hard T+15 gate is the Kartavya Path
+// forced-jam override just below: the brief wants that specific
+// boulevard to snap to fully jammed at the actual attack moment, not
+// gradually creep red from T+0 the way a purely distance-derived road
+// would. Gating off the keyframe LABEL (found by name in
+// scenario.timeline, not a hardcoded array index) so this still holds
+// even if keyframes are reordered/added/removed later.
 const ROADS_ACTIVATION_LABEL = 'T+15';
 
 // Kartavya Path (and its former name, Rajpath) — matched by name so the
@@ -198,14 +710,6 @@ function classifyRoadCongestion(distanceKm, radii) {
 const DEFAULT_RED_RADIUS_KM = IMPACT_ZONE_RADIUS_KM * 0.4;
 const DEFAULT_YELLOW_RADIUS_KM = IMPACT_ZONE_RADIUS_KM * 0.7;
 const DEFAULT_GREEN_RADIUS_KM = IMPACT_ZONE_RADIUS_KM;
-
-// Research §7/§9: only re-evaluate a building's band on ticks where the
-// growing/shrinking radius has actually crossed that building's
-// precomputed distance, rather than calling setFeatureState on every
-// candidate building every animation frame. RADIUS_EPSILON_KM guards
-// against float-jitter re-triggering a "band changed" recompute when
-// the radius is effectively unchanged between ticks.
-const RADIUS_EPSILON_KM = 0.0005; // 0.5m
 
 /**
  * Per-building distance -> band classification. Pure function, no map
@@ -538,6 +1042,10 @@ export function MapLibreView({ scenario, timelineIndex }) {
   // candidates against wherever the impact point CURRENTLY is, instead
   // of only the point one specific activation started with.
   const currentImpactCenterRef = useRef(FALLBACK_CENTER);
+  // (Shelter card images are now registered/updated purely off
+  // map.hasImage as the source of truth — see upsertShelterCardImage's
+  // doc comment for why a separately-tracked ref caused a real bug —
+  // so no bookkeeping ref is needed here anymore.)
 
   // -------------------------------------------------------------------
   // Map init — runs once on mount.
@@ -918,6 +1426,170 @@ export function MapLibreView({ scenario, timelineIndex }) {
         });
       });
 
+      // --- 2a. Shelter / metro-station safe zones (Task 9, overhauled) ---
+      // Each shelter now draws a real (non-circular) polygon via
+      // buildShelterFootprint, sized/oriented per its own `footprint`
+      // metadata, instead of a plain turf.circle. Extruded to
+      // SAFE_ZONE_FILL_HEIGHT so it stays visible above the growing
+      // impact-zone/building-risk extrusions (see that constant's
+      // comment for the "shelter gets swallowed" bug it fixes).
+      // Explicitly NOT time-varying: each polygon is drawn once here and
+      // never touched again by animateRiskZones — only its OUTLINE color
+      // (accessible teal vs. inaccessible amber) and the shared label
+      // text change afterward, both via updateShelterStates. Source/
+      // layer ids stay `safe-zone-<id>`, unchanged from the original
+      // Task 9 pass, explicitly not `impact-zone-*`, so there's no
+      // ambiguity in code search/greps later.
+      METRO_SHELTERS.forEach((shelter) => {
+        const sourceId = `safe-zone-${shelter.id}`;
+        map.addSource(sourceId, {
+          type: 'geojson',
+          data: buildShelterFootprint(shelter),
+        });
+        map.addLayer({
+          id: `${sourceId}-fill`,
+          source: sourceId,
+          type: 'fill-extrusion',
+          paint: {
+            'fill-extrusion-color': SAFE_ZONE_HEX,
+            'fill-extrusion-height': SAFE_ZONE_FILL_HEIGHT,
+            'fill-extrusion-base': 0,
+            'fill-extrusion-opacity': 0.3,
+          },
+        });
+        map.addLayer({
+          id: `${sourceId}-outline`,
+          source: sourceId,
+          type: 'line',
+          paint: {
+            'line-color': SAFE_ZONE_HEX,
+            'line-color-transition': { duration: TRANSITION_MS, delay: 0 },
+            'line-width': 2,
+            'line-opacity': 0.8,
+          },
+        });
+      });
+
+      // Floating shelter status cards — v2, rewritten as real map
+      // content per the person's explicit rejection of the DOM-marker
+      // version (see the SHELTER_CARD_* constants' doc comment above
+      // for the full root-cause writeup). One shared GeoJSON point
+      // source (`shelter-cards`) holds one Point feature per shelter at
+      // its own real [lng, lat], each tagged with an `icon` property
+      // naming its own registered image id — mirrors how
+      // `roads-congestion-line` is one shared layer for many road
+      // features rather than one layer per road. The actual card
+      // BITMAPS are rendered per-shelter via renderShelterCardCanvas and
+      // registered with map.addImage below; updateShelterStates
+      // re-renders + map.updateImage's them in place on every
+      // scenario/timelineIndex change — the source itself never needs
+      // setData() again after this initial build, since which image id
+      // a given shelter points at never changes, only that image's
+      // pixel content does.
+      const shelterCardImageId = (shelter) => `shelter-card-${shelter.id}`;
+
+      // Structural fix (this pass): everything in this try/catch is
+      // shelter-card VISUALS only. This block previously sat inline in
+      // the middle of this same map.on('load', ...) callback with no
+      // error containment — since the whole callback is one synchronous
+      // function, an uncaught exception anywhere in here (e.g.
+      // ctx.roundRect not being supported — see drawRoundedRectPath's
+      // doc comment for that actual incident) silently aborted every
+      // single line AFTER it in the callback, including the impact-zone
+      // circle growth, building-risk coloring, road congestion, and the
+      // evac-route setup — none of which have anything to do with
+      // shelter cards. A broken/missing shelter card is a small,
+      // visible, recoverable problem; a broken scene is not. Wrapping
+      // this in try/catch means the worst a shelter-card bug can now do
+      // is leave the shelter cards themselves missing/stale — logged
+      // loudly via console.error, never silently swallowed — while
+      // everything else in this callback still runs.
+      try {
+        METRO_SHELTERS.forEach((shelter) => {
+          // Initial render uses the T+0 baseline defaults (Standing by,
+          // accessible, 0km-away placeholder) purely so an image exists
+          // for addImage to register before updateShelterStates runs its
+          // first real pass immediately after map.on('load', ...)
+          // finishes (see the updateShelterStates(...) call further
+          // down) — this placeholder is never visible for more than one
+          // frame in practice.
+          const placeholderCanvas = renderShelterCardCanvas(shelter, {
+            occupancy: SHELTER_OCCUPANCY_LEVELS[0],
+            accessible: true,
+            distanceKm: 0,
+            fillPercent: 25,
+            statusHex: SHELTER_STATUS_HEX[0],
+          });
+          upsertShelterCardImage(map, shelterCardImageId(shelter), placeholderCanvas);
+        });
+
+        map.addSource('shelter-cards', {
+          type: 'geojson',
+          data: {
+            type: 'FeatureCollection',
+            features: METRO_SHELTERS.map((shelter) => ({
+              type: 'Feature',
+              geometry: { type: 'Point', coordinates: [shelter.lng, shelter.lat] },
+              properties: { shelterId: shelter.id, icon: shelterCardImageId(shelter) },
+            })),
+          },
+        });
+
+        map.addLayer({
+          id: 'shelter-cards-symbol',
+          source: 'shelter-cards',
+          type: 'symbol',
+          layout: {
+            'icon-image': ['get', 'icon'],
+            'icon-anchor': 'bottom',
+            'icon-allow-overlap': true,
+            'icon-ignore-placement': true,
+            'icon-size': SHELTER_CARD_ICON_SIZE_EXPR,
+            'icon-offset': SHELTER_CARD_ICON_OFFSET,
+            // 'viewport' (not 'map') for both — see the SHELTER_CARD_*
+            // constants' doc comment above for why: this keeps the card
+            // always facing the camera like a real floating callout,
+            // while its anchor point stays locked to the shelter's real
+            // world coordinate and zoom-scales with the scene, rather
+            // than being laid flat into the ground plane the way 'map'
+            // alignment would.
+            'icon-pitch-alignment': 'viewport',
+            'icon-rotation-alignment': 'viewport',
+          },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('Shelter-card setup failed — shelter cards will be missing/stale, but the rest of the scene (circles, buildings, roads, evac route) is unaffected:', err);
+      }
+
+      // Devtools confirmation hooks (safe zones aren't setFeatureState-
+      // driven the way roads/buildings are, so there's less "state" to
+      // dump via window.__debugRoads-style helpers). window.__debugMap
+      // is assigned to the map instance itself earlier in this same
+      // map.on('load', ...) handler, so these just add properties to it.
+      map.__safeZonesLoaded = METRO_SHELTERS.every(
+        (shelter) => map.getSource(`safe-zone-${shelter.id}`) !== undefined
+          && map.hasImage(shelterCardImageId(shelter)),
+      ) && map.getLayer('shelter-cards-symbol') !== undefined;
+      // Per-id breakdown — lets Part C's verification pass confirm all
+      // 5 shelters loaded without eyeballing 5 separate getSource()
+      // calls by hand.
+      map.__debugShelters = {
+        loadReport() {
+          const table = METRO_SHELTERS.map((shelter) => ({
+            id: shelter.id,
+            name: shelter.name,
+            polygonLoaded: map.getSource(`safe-zone-${shelter.id}`) !== undefined,
+            cardImageLoaded: map.hasImage(shelterCardImageId(shelter)),
+            exclusionRadiusKm: Number(resolveShelterExclusionRadiusKm(shelter).toFixed(3)),
+            inaccessibleAfterKartavyaJam: shelter.id === INACCESSIBLE_AFTER_KARTAVYA_JAM_SHELTER_ID,
+          }));
+          // eslint-disable-next-line no-console
+          console.table(table);
+          return table;
+        },
+      };
+
       // --- 2b. Road congestion overlay — real vector-tile roads ---
       // Reads directly from BUILDINGS_SOURCE_ID, which already clones
       // the WHOLE `openmaptiles` vector source (see the addSource call
@@ -1134,9 +1806,9 @@ export function MapLibreView({ scenario, timelineIndex }) {
         // current per-road congestion band each candidate has actually
         // been assigned.
         showAutoRoadState() {
-          const gateOpen = resolveRoadsActive(scenario, timelineIndex);
+          const kartavyaGateOpen = resolveKartavyaOverrideActive(scenario, timelineIndex);
           // eslint-disable-next-line no-console
-          console.log(`[__debugRoads] timelineIndex=${timelineIndex}, gate (>= ${ROADS_ACTIVATION_LABEL}) open: ${gateOpen}`);
+          console.log(`[__debugRoads] timelineIndex=${timelineIndex}, general classification: always active (T+0+) | Kartavya Path forced-jam gate (>= ${ROADS_ACTIVATION_LABEL}) open: ${kartavyaGateOpen}`);
           // eslint-disable-next-line no-console
           console.log(`[__debugRoads] ${roadCandidatesRef.current.length} road candidates resolved near current impact point`);
           const table = roadCandidatesRef.current
@@ -1199,6 +1871,7 @@ export function MapLibreView({ scenario, timelineIndex }) {
       applyScenarioActivation(scenario);
       applyLandmarkRisk(scenario);
       applyRoadCongestion(scenario.baseline);
+      updateShelterStates(scenario, timelineIndex);
       // Task 8f FIX D: idle "surveillance drift" camera rotation has
       // been removed entirely per explicit request — the camera now
       // only moves in response to user input (drag) or a scenario
@@ -1266,6 +1939,11 @@ export function MapLibreView({ scenario, timelineIndex }) {
       window.removeEventListener('pointermove', onCustomDragPointerMove);
       window.removeEventListener('pointerup', onCustomDragPointerUp);
       container.removeEventListener('contextmenu', onContainerContextMenu);
+      // Shelter cards are now real map content (a GeoJSON source +
+      // symbol layer + registered images) — unlike the old
+      // maplibregl.Marker version, map.remove() below tears all of that
+      // down on its own along with the rest of the GL context, so no
+      // explicit per-shelter cleanup is needed here.
       map.remove();
       mapRef.current = null;
       loadedRef.current = false;
@@ -1320,7 +1998,7 @@ export function MapLibreView({ scenario, timelineIndex }) {
     // so every keyframe scrub silently fell back to the same fixed
     // default radii/point instead of the keyframe's actual values —
     // this is why scrubbing to T+5/T+10/etc. visibly did nothing.
-    animateRiskZones(scenario.baseline, impactCenter, resolveRoadsActive(scenario, timelineIndex));
+    animateRiskZones(scenario.baseline, impactCenter, resolveKartavyaOverrideActive(scenario, timelineIndex));
     // Road congestion has no growth/shrink animation to drive (§3.4 of
     // the research doc — `level` is a discrete enum per road, not an
     // interpolatable number) — applyRoadCongestion just diffs+applies
@@ -1329,6 +2007,12 @@ export function MapLibreView({ scenario, timelineIndex }) {
     // that read as a crossfade rather than a hard cut, exactly like
     // buildings.
     applyRoadCongestion(scenario.baseline);
+    // Shelter occupancy/accessibility labels + the one inaccessible
+    // shelter's outline color both depend on timelineIndex (occupancy
+    // ramp) and the Kartavya Path T+15 gate (accessibility) — recompute
+    // on every scrub exactly like landmarks/roads above, not just once
+    // on scenario activation.
+    updateShelterStates(scenario, timelineIndex);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenario, timelineIndex]);
 
@@ -1421,6 +2105,81 @@ export function MapLibreView({ scenario, timelineIndex }) {
   }
 
   /**
+   * Updates every shelter's floating status card (name, structural
+   * badge, live distance-from-impact, occupancy progress bar + its
+   * color, status text, and the card's border/tail/bar color — all
+   * driven off the SAME occupancy level via resolveShelterStatusHex) in
+   * place, plus keeps flipping the polygon outline between
+   * SAFE_ZONE_HEX / SHELTER_INACCESSIBLE_HEX exactly as before. Runs
+   * every time scenario/timelineIndex changes. Mirrors
+   * applyLandmarkRisk/applyRoadCongestion's "recompute from scratch off
+   * the current merged state" shape rather than trying to diff/patch
+   * individual shelters — there are only 5, recomputing all 5 every
+   * call is trivial cost.
+   */
+  function updateShelterStates(currentScenario, index) {
+    const map = mapRef.current;
+    if (!map) return;
+    const primary = findPrimaryImpactBuilding(currentScenario.baseline);
+    const impactCenter = currentScenario.baseline?.impactPoint
+      || (primary ? { lat: primary.lat, lng: primary.lng } : FALLBACK_CENTER);
+    const impactPointFeature = turf.point([impactCenter.lng, impactCenter.lat]);
+    const kartavyaOverrideActive = resolveKartavyaOverrideActive(currentScenario, index);
+
+    METRO_SHELTERS.forEach((shelter) => {
+      const shelterPoint = turf.point([shelter.lng, shelter.lat]);
+      const distanceKm = turf.distance(impactPointFeature, shelterPoint, { units: 'kilometers' });
+      const occupancy = resolveShelterOccupancyLevel(index, distanceKm);
+      const accessible = resolveShelterAccessible(shelter.id, kartavyaOverrideActive);
+      const statusHex = resolveShelterStatusHex(occupancy, accessible);
+      // Bar fill percent: (occupancy-level index + 1) / level count —
+      // e.g. 'Standing by' (index 0) reads as 25%, 'At capacity'
+      // (index 3, the last level) reads as a full 100% bar. A +1 offset
+      // rather than index/levelCount so the very first level still
+      // shows a visibly nonzero bar (a 0%-width bar at 'Standing by'
+      // would look broken/empty rather than "not full yet").
+      const levelIndex = Math.max(0, SHELTER_OCCUPANCY_LEVELS.indexOf(occupancy));
+      const fillPercent = Math.round(((levelIndex + 1) / SHELTER_OCCUPANCY_LEVELS.length) * 100);
+
+      // Outline color on the polygon itself — unchanged behavior from
+      // the previous pass, kept exactly as-is per this pass's scope
+      // (only the card is new/re-colored; the polygon's own
+      // accessible/inaccessible outline logic already worked).
+      const outlineLayerId = `safe-zone-${shelter.id}-outline`;
+      if (map.getLayer(outlineLayerId)) {
+        map.setPaintProperty(
+          outlineLayerId,
+          'line-color',
+          accessible ? SAFE_ZONE_HEX : SHELTER_INACCESSIBLE_HEX,
+        );
+      }
+
+      // Card is now a canvas-rendered map image, not a DOM node — re-
+      // render it with the current state and push it in place via
+      // map.updateImage (upsertShelterCardImage handles addImage vs.
+      // updateImage). The GeoJSON source itself never needs setData()
+      // again: the point feature's `icon` property always names the
+      // SAME image id for a given shelter (see shelterCardImageId in
+      // the setup effect) — only that image's pixel content changes.
+      // try/catch'd per-shelter, same reasoning as the setup effect's
+      // shelter-card block: a rendering bug for one shelter's card
+      // should never stop this forEach from finishing the rest (outline
+      // colors, other shelters' cards), let alone anything outside this
+      // function entirely.
+      try {
+        const imageId = `shelter-card-${shelter.id}`;
+        const canvas = renderShelterCardCanvas(shelter, {
+          occupancy, accessible, distanceKm, fillPercent, statusHex,
+        });
+        upsertShelterCardImage(map, imageId, canvas);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`Shelter-card update failed for ${shelter.id} — its card may be stale, everything else is unaffected:`, err);
+      }
+    });
+  }
+
+  /**
    * Applies real-road congestion from `state.roadCongestion` — a NEW
    * field (separate from the legacy fake `roads` array, which is left
    * untouched for MapView.jsx's SVG rendering only) shaped as
@@ -1450,13 +2209,18 @@ export function MapLibreView({ scenario, timelineIndex }) {
     if (!map) return;
     const entries = state?.roadCongestion || [];
     const seenIds = new Set();
-    // Keep the automatic resolver (applyRoadCongestionForRadii) aware of
+    // DECISION (Task 9 continuation pass): kept, not deleted. Every
+    // scenario's `roadCongestion` array is empty today and there is no
+    // current plan to populate one, but this channel is intentionally
+    // preserved as an override escape hatch for a future hand-authored
+    // scenario that wants to force a specific real road id to a specific
+    // level without going through distance-based classification. Keep
+    // the automatic resolver (applyRoadCongestionForRadii) aware of
     // which ids currently have a manually-authored entry, so it treats
     // this legacy channel as an override layered on top rather than
     // fighting over the same feature-state. security-attack.json's
     // roadCongestion arrays are all empty per the automation pivot (see
-    // the constant's own doc comment), so this is a no-op today — kept
-    // for any future scenario/dataset that DOES want a manual override.
+    // the constant's own doc comment), so this is a no-op today.
     manualRoadIdsRef.current = new Set(entries.filter((e) => e?.id !== undefined && e?.id !== null).map((e) => String(e.id)));
 
     entries.forEach(({ id, level }) => {
@@ -1574,7 +2338,8 @@ export function MapLibreView({ scenario, timelineIndex }) {
       resolveBuildingCandidates(impactCenter);
       resolveRoadCandidates(impactCenter);
       resolveKartavyaPathFeatures();
-      animateRiskZones(currentScenario.baseline, impactCenter, resolveRoadsActive(currentScenario, timelineIndex));
+      animateRiskZones(currentScenario.baseline, impactCenter, resolveKartavyaOverrideActive(currentScenario, timelineIndex));
+      updateShelterStates(currentScenario, timelineIndex);
     };
     if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
       beginBuildingRiskEngine();
@@ -1688,6 +2453,26 @@ export function MapLibreView({ scenario, timelineIndex }) {
           } catch (err) {
             return;
           }
+
+          // Task 9 building-risk exclusion (required, not optional — see
+          // PROJECT_CONTEXT.md §9's resolved design decisions): skip any
+          // candidate building whose representative point falls within
+          // that shelter's OWN resolveShelterExclusionRadiusKm (derived
+          // from its real footprint size — see that function's comment;
+          // replaces the old single fixed EXCLUSION_RADIUS_KM now that
+          // shelters have differently-sized real footprints), so the
+          // building-risk engine can never paint a safe zone red/yellow/
+          // green purely because it happens to sit inside a growing blast
+          // radius. Checked here, before the candidate is ever pushed, so
+          // an excluded building never enters buildingCandidatesRef at
+          // all (not just skipped at classification time) — it keeps
+          // whatever color the base 3d-buildings style already gives it.
+          const isInsideSafeZone = METRO_SHELTERS.some((shelter) => {
+            const shelterPoint = turf.point([shelter.lng, shelter.lat]);
+            const exclusionRadiusKm = resolveShelterExclusionRadiusKm(shelter);
+            return turf.distance(representativePoint, shelterPoint, { units: 'kilometers' }) < exclusionRadiusKm;
+          });
+          if (isInsideSafeZone) return;
 
           // Building-recoloring-never-sticks fix: look up (or assign
           // once, then reuse forever) a STABLE id for this exact
@@ -1919,41 +2704,35 @@ export function MapLibreView({ scenario, timelineIndex }) {
 
   /**
    * The road-congestion equivalent of applyBuildingRiskForRadii — the
-   * per-tick hot path for the automatic resolver. Gated entirely off
-   * `roadsActive` (derived from the current keyframe label vs.
-   * ROADS_ACTIVATION_LABEL, resolved by the caller — see
-   * animateRiskZones): when the gate is closed (before T+15), every
-   * currently-jammed/slow road tracked in roadBandByKeyRef is reset to
-   * 'none' and classification is skipped entirely for the tick, so nothing
-   * ever colors early regardless of how small/large the radii are.
+   * per-tick hot path for the automatic resolver.
    *
-   * When the gate is open, classifies every resolved road candidate via
-   * classifyRoadCongestion and diffs against roadBandByKeyRef exactly
-   * like applyBuildingRiskForRadii, then applies the Kartavya Path
-   * override afterward so it's never accidentally left at a
-   * distance-derived 'slow'/'none' level. Roads present in
-   * manualRoadIdsRef (an authored override layered on top, if any ever
-   * exist) are skipped entirely by the automatic pass — see
-   * applyRoadCongestion's doc comment for why that channel is kept.
+   * General distance-based classification (classifyRoadCongestion) now
+   * runs UNCONDITIONALLY on every tick from T+0 onward, off the exact
+   * same `radii` object already driving buildings/circles — there is no
+   * more hard on/off gate here. This is deliberate: at T+0–T+10 the red/
+   * yellow radii are tiny (0.08–0.42km per security-attack.json), so this
+   * naturally yields a near-empty (but not necessarily exactly empty —
+   * see the resolveKartavyaOverrideActive doc comment) set of jammed/slow
+   * roads, growing in lockstep with buildings/circles instead of popping
+   * in at T+15.
+   *
+   * `kartavyaOverrideActive` (derived from the current keyframe label vs.
+   * ROADS_ACTIVATION_LABEL, resolved by the caller — see
+   * resolveKartavyaOverrideActive / animateRiskZones) gates ONLY the
+   * Kartavya Path forced-jam override applied at the end of this
+   * function: that boulevard is meant to snap to fully jammed at the
+   * actual attack moment (T+15), not gradually creep red from T+0 like a
+   * purely distance-derived road would. Before the override activates,
+   * Kartavya Path's segment(s) are just another road candidate and are
+   * classified the same distance-based way as everything else.
+   *
+   * Roads present in manualRoadIdsRef (an authored override layered on
+   * top, if any ever exist) are skipped entirely by the automatic pass —
+   * see applyRoadCongestion's doc comment for why that channel is kept.
    */
-  function applyRoadCongestionForRadii(radii, roadsActive) {
+  function applyRoadCongestionForRadii(radii, kartavyaOverrideActive) {
     const map = mapRef.current;
     if (!map) return;
-
-    if (!roadsActive) {
-      Object.keys(roadBandByKeyRef.current).forEach((dedupeKey) => {
-        if (roadBandByKeyRef.current[dedupeKey] === 'none') return;
-        const id = /^-?\d+$/.test(dedupeKey) ? Number(dedupeKey) : dedupeKey;
-        try {
-          map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'none' });
-        } catch (err) {
-          // eslint-disable-next-line no-console
-          console.warn('[MapLibreView] setFeatureState failed while clearing a road before T+15', err);
-        }
-        roadBandByKeyRef.current[dedupeKey] = 'none';
-      });
-      return;
-    }
 
     const candidates = roadCandidatesRef.current;
     candidates.forEach(({ featureTarget, dedupeKey, distanceKm }) => {
@@ -1971,22 +2750,28 @@ export function MapLibreView({ scenario, timelineIndex }) {
       roadBandByKeyRef.current[dedupeKey] = band;
     });
 
-    // Kartavya Path override — applied AFTER the general pass so it can
-    // never be left at whatever the distance-based classification
-    // computed for the same id; always fully jammed once active.
-    kartavyaPathFeatureIdsRef.current.forEach((id) => {
-      const dedupeKey = String(id);
-      if (manualRoadIdsRef.current.has(dedupeKey)) return;
-      if (roadBandByKeyRef.current[dedupeKey] === 'jammed') return;
-      try {
-        map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'jammed' });
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.warn('[MapLibreView] setFeatureState failed while forcing Kartavya Path jammed', err);
-        return;
-      }
-      roadBandByKeyRef.current[dedupeKey] = 'jammed';
-    });
+    // Kartavya Path override — applied AFTER the general pass, and only
+    // once kartavyaOverrideActive (>= T+15), so it can never be left at
+    // whatever the distance-based classification computed for the same
+    // id; always fully jammed once active. Before T+15 this block is a
+    // no-op and Kartavya Path's band is whatever the general pass above
+    // just assigned it (typically 'none', per its real distance from the
+    // impact point at those tiny early radii).
+    if (kartavyaOverrideActive) {
+      kartavyaPathFeatureIdsRef.current.forEach((id) => {
+        const dedupeKey = String(id);
+        if (manualRoadIdsRef.current.has(dedupeKey)) return;
+        if (roadBandByKeyRef.current[dedupeKey] === 'jammed') return;
+        try {
+          map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'jammed' });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[MapLibreView] setFeatureState failed while forcing Kartavya Path jammed', err);
+          return;
+        }
+        roadBandByKeyRef.current[dedupeKey] = 'jammed';
+      });
+    }
   }
 
   /**
@@ -2013,18 +2798,24 @@ export function MapLibreView({ scenario, timelineIndex }) {
   }
 
   /**
-   * Resolves whether the automatic road-congestion resolver should be
+   * Resolves whether the Kartavya Path forced-jam override should be
    * active for the given scenario/timelineIndex — the T+15 gate
-   * described at ROADS_ACTIVATION_LABEL's definition above. Looks up
-   * ROADS_ACTIVATION_LABEL's position in scenario.timeline BY LABEL
-   * (not a hardcoded index) so this keeps holding even if keyframes are
-   * reordered/added/removed later. Defaults to false (gate closed) for
-   * any case that isn't an unambiguous "yes, we're at or past T+15" —
-   * missing timelineIndex, a timeline that doesn't define T+15 at all,
-   * etc. — since "roads accidentally jam early" is a much worse failure
-   * mode for this demo than "roads occasionally fail to jam at all".
+   * described at ROADS_ACTIVATION_LABEL's definition above. NOTE: this
+   * no longer gates general road classification (that now runs
+   * unconditionally from T+0 — see applyRoadCongestionForRadii); it only
+   * controls whether Kartavya Path gets forced to fully 'jammed'
+   * regardless of its real distance from the impact point.
+   *
+   * Looks up ROADS_ACTIVATION_LABEL's position in scenario.timeline BY
+   * LABEL (not a hardcoded index) so this keeps holding even if
+   * keyframes are reordered/added/removed later. Defaults to false (gate
+   * closed) for any case that isn't an unambiguous "yes, we're at or
+   * past T+15" — missing timelineIndex, a timeline that doesn't define
+   * T+15 at all, etc. — since "Kartavya Path forced jammed early" is a
+   * much worse failure mode for this demo than "the override occasionally
+   * fails to activate".
    */
-  function resolveRoadsActive(currentScenario, index) {
+  function resolveKartavyaOverrideActive(currentScenario, index) {
     if (typeof index !== 'number') return false;
     const timeline = currentScenario?.timeline;
     if (!Array.isArray(timeline) || timeline.length === 0) return false;
@@ -2048,7 +2839,7 @@ export function MapLibreView({ scenario, timelineIndex }) {
    * On first activation (no previous radii recorded), it eases up from
    * ~0 exactly like the old single-circle animation did.
    */
-  function animateRiskZones(currentState, impactCenter, roadsActive) {
+  function animateRiskZones(currentState, impactCenter, kartavyaOverrideActive) {
     const map = mapRef.current;
     const greenSource = map?.getSource('impact-zone-green');
     const yellowSource = map?.getSource('impact-zone-yellow');
@@ -2097,12 +2888,16 @@ export function MapLibreView({ scenario, timelineIndex }) {
       // Automatic road-congestion resolver — same per-tick hot path as
       // buildings, driven off the SAME currentRadii, so roads and
       // buildings always grow/shrink in lockstep with one shared
-      // requestAnimationFrame loop rather than a second one. `roadsActive`
-      // is resolved once by the caller (see resolveRoadsActive) and stays
-      // constant for this whole animation run — it does not need to be
-      // re-evaluated per tick, since it only depends on which keyframe is
-      // currently selected, not on the radii themselves.
-      applyRoadCongestionForRadii(currentRadii, roadsActive);
+      // requestAnimationFrame loop rather than a second one. General
+      // classification inside applyRoadCongestionForRadii runs
+      // unconditionally every tick regardless of this flag.
+      // `kartavyaOverrideActive` only gates the Kartavya Path forced-jam
+      // override and is resolved once by the caller (see
+      // resolveKartavyaOverrideActive) and stays constant for this whole
+      // animation run — it does not need to be re-evaluated per tick,
+      // since it only depends on which keyframe is currently selected,
+      // not on the radii themselves.
+      applyRoadCongestionForRadii(currentRadii, kartavyaOverrideActive);
 
       // Written every tick (not just on completion) — this is what
       // lets an interrupted animation resume smoothly instead of
@@ -2244,8 +3039,26 @@ export function MapLibreView({ scenario, timelineIndex }) {
       // indistinguishable at 0.0001.
       const safeT = Math.min(t, 0.9999);
       const distanceKm = totalLengthKm * safeT;
-      const point = turf.along(route, distanceKm, { units: 'kilometers' });
-      pointSource.setData(point);
+      // Pre-existing upstream turf issue (see comment above) apparently
+      // still surfaces occasionally even with the 0.9999 clamp (e.g. a
+      // very short/degenerate route where floating-point rounding still
+      // lands distanceKm at/past the line's real length). NOT part of
+      // this pass's scope to root-cause further, but left uncaught this
+      // was an UNCAUGHT exception inside a requestAnimationFrame
+      // callback — which silently kills that rAF chain forever (no
+      // further frames ever get scheduled, since the `if (t < 1)`
+      // reschedule line never runs once turf.along throws above it).
+      // try/catch here is the same "one feature's bug can't take out
+      // unrelated things" containment already applied to the shelter-
+      // card code — a single skipped animation frame is a much smaller
+      // problem than the evac-route animation permanently freezing.
+      try {
+        const point = turf.along(route, distanceKm, { units: 'kilometers' });
+        pointSource.setData(point);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('turf.along failed for the evac-route animation frame (known upstream edge case) — skipping this frame:', err);
+      }
       if (t < 1) {
         routeFrameRef.current = requestAnimationFrame(step);
       } else {
