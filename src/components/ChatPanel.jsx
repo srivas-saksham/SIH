@@ -7,26 +7,39 @@ import { ChatMessage } from './ChatMessage';
  * 2 point 5 / Section 7) — this component never truncates or replaces
  * it, only renders whatever CommandShell has accumulated so far.
  *
+ * `scrollNonce` is bumped by CommandShell on every event that should
+ * force a jump to the bottom — a turn appended, a reveal tick, a "next"
+ * submission — even when `turns` itself hasn't changed length yet (e.g.
+ * the instant "next" is submitted, before the briefing turn lands). This
+ * guarantees the chat always ends up pinned to its latest content rather
+ * than relying solely on `turns` identity changes.
+ *
  * Always mounted — header, this panel, and the timeline strip stay
  * visible before AND after scenario activation; only the map viewport
  * (owned by CommandShell) switches between its idle/active look.
  */
-export function ChatPanel({ turns, inputValue, onInputChange, onSubmit, isThinking, placeholder }) {
+export function ChatPanel({ turns, inputValue, onInputChange, onSubmit, isThinking, placeholder, onAdvance, scrollNonce }) {
   const historyRef = useRef(null);
 
   // Always snap to the newest content — including on every incremental
   // reveal tick (a processing line printing, a headline character
   // typing), not just when a whole new turn is appended, so the person
-  // never has to manually scroll to follow what's being "typed".
+  // never has to manually scroll to follow what's being "typed". Runs
+  // twice via requestAnimationFrame (immediate + one frame later) so it
+  // still lands correctly even if the new content's height hasn't been
+  // committed to layout yet at the moment this fires.
   const scrollToBottom = useCallback(() => {
     const el = historyRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
+    window.requestAnimationFrame(() => {
+      if (el) el.scrollTop = el.scrollHeight;
+    });
   }, []);
 
   useEffect(() => {
     scrollToBottom();
-  }, [turns, scrollToBottom]);
+  }, [turns, scrollNonce, scrollToBottom]);
 
   return (
     <aside className="flex min-h-0 flex-1 flex-col xl:w-[35%] xl:flex-none">
@@ -46,7 +59,7 @@ export function ChatPanel({ turns, inputValue, onInputChange, onSubmit, isThinki
           </div>
         )}
         {turns.map((turn) => (
-          <ChatMessage key={turn.id} turn={turn} onReveal={scrollToBottom} />
+          <ChatMessage key={turn.id} turn={turn} onReveal={scrollToBottom} onAdvance={onAdvance} />
         ))}
       </div>
 

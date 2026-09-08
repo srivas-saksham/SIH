@@ -1,9 +1,15 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { describeDelta } from '../utils/describeKeyframeDelta';
 import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
-import { matchScenario } from '../utils/scenarioMatcher';
-import { buildAnalystContent } from '../utils/buildAnalystContent';
-import { buildProcessingLines, estimateProcessingDurationMs } from '../utils/processingCascade';
+import { matchScenario, hasNoConfidentScenarioMatch } from '../utils/scenarioMatcher';
+import { buildAnalystContent, buildTimelineBriefingContent } from '../utils/buildAnalystContent';
+import { computeCausalFactors } from '../utils/causalFactors';
+import {
+  buildProcessingLines,
+  buildTimelineAdvanceLines,
+  estimateProcessingDurationMs,
+} from '../utils/processingCascade';
+import { parseTimelineIntent } from '../utils/timelineIntent';
 import { ChatPanel } from './ChatPanel';
 import { MapLibreView } from './MapLibreView';
 import { MapToolbar } from './MapToolbar';
@@ -34,17 +40,29 @@ function getMergedStateForIndex(scenario, index) {
 }
 
 /**
- * Causal factors are a static per-scenario snapshot by default, with an
- * optional per-keyframe override (unchanged from the prior docked-panel
- * era — Task 1 only changes WHERE this renders, not how it's derived).
+ * Causal factors are read PRIMARILY from each keyframe's hand-authored
+ * `causalFactors` object in the scenario JSON (per follow-up feedback:
+ * these are now a deliberately hardcoded, hand-tuned story — shelter
+ * deficit rising as shelters fill, road accessibility spiking then
+ * recovering as routes reopen, infrastructure damage climbing steadily,
+ * population density held roughly flat) rather than purely derived from
+ * the merged map state. If a keyframe doesn't define an explicit
+ * `causalFactors` object (e.g. a future scenario that hasn't been
+ * hand-tuned yet), this falls back to computeCausalFactors, which
+ * derives the same four figures live from shelter occupancy ratios,
+ * building risk mix, and road status — so every scenario still shows
+ * *some* real, moving numbers even without hand-authored data.
  */
 function getCausalFactorsForIndex(scenario, index) {
   const timeline = scenario.timeline;
-  if (!Array.isArray(timeline) || timeline.length === 0 || index <= 0) {
-    return scenario.causalFactors;
-  }
-  const clampedIndex = Math.min(index, timeline.length - 1);
-  return timeline[clampedIndex]?.causalFactors ?? scenario.causalFactors;
+  const explicitOverride =
+    Array.isArray(timeline) && timeline.length > 0
+      ? timeline[Math.min(Math.max(index, 0), timeline.length - 1)]?.causalFactors
+      : undefined;
+  if (explicitOverride) return explicitOverride;
+
+  const mapState = getMergedStateForIndex(scenario, index);
+  return computeCausalFactors(mapState);
 }
 
 // Small buffer added on top of the processing cascade's own reveal
@@ -71,6 +89,15 @@ export function CommandShell() {
   // turns (Section 2 point 5 / Section 7) — never replaced wholesale.
   const [chatTurns, setChatTurns] = useState([]);
   const pendingResponseTimeoutRef = useRef(null);
+  const pendingAdvanceTimeoutRef = useRef(null);
+
+  // Bumped every time a new turn should force the chat to snap to the
+  // very bottom, regardless of whether `chatTurns` itself has grown yet
+  // (e.g. the moment "next" is submitted, before the briefing turn has
+  // even been appended) — ChatPanel scrolls on both `chatTurns` changes
+  // AND this counter changing.
+  const [scrollNonce, setScrollNonce] = useState(0);
+  const bumpScroll = useCallback(() => setScrollNonce((n) => n + 1), []);
 
   // Timeline scrubber state. Lives here (not inside TimelineScrubber)
   // because MapView/MapLibreView are siblings that also need the derived
@@ -125,23 +152,89 @@ export function CommandShell() {
     return describeDelta(prevState, mergedMapState);
   }, [activeScenario, currentKeyframeIndex, mergedMapState]);
 
-  // NOTE: per-keyframe causal factors (getCausalFactorsForIndex) are
-  // recomputed directly inside handleChatSubmit for the T+0 activation
-  // response below. A `currentKeyframeIndex`-reactive version of this
-  // will be needed again once Task 2 builds the timeline-briefing turn
-  // for later keyframes.
+  const appendTurn = useCallback(
+    (turn) => {
+      setChatTurns((prev) => [...prev, { id: nextTurnId(), ...turn }]);
+      bumpScroll();
+    },
+    [bumpScroll],
+  );
 
-  const appendTurn = useCallback((turn) => {
-    setChatTurns((prev) => [...prev, { id: nextTurnId(), ...turn }]);
-  }, []);
+  /**
+   * The one shared timeline-advancement handler (Task 2's must-deliver
+   * list, refined per follow-up feedback): `target` is either the
+   * literal string 'next' or an explicit keyframe index. Wired to BOTH
+   * the inline "Next: T+N" chat button (rendered at the end of
+   * activation/briefing turns) AND the text dispatcher inside
+   * handleChatSubmit below — there is only one code path that actually
+   * changes `currentKeyframeIndex` and appends a briefing turn, so the
+   * two triggers can never drift out of sync.
+   *
+   * Refinement: this no longer flips `currentKeyframeIndex` (and
+   * therefore the map) instantly. It now runs its own processing
+   * cascade turn first — mirroring scenario activation's pattern —
+   * with the map viewport showing the same "thinking" overlay, and only
+   * commits the index change (map update + briefing turn) once that
+   * cascade has visibly finished, so advancing a keyframe reads as the
+   * system actually recomputing something rather than an instant swap.
+   */
+  const advanceTimeline = useCallback(
+    (target) => {
+      if (!activeScenario || !Array.isArray(activeScenario.timeline) || isThinking) return;
+      const lastIndex = activeScenario.timeline.length - 1;
+      const prevIndex = currentKeyframeIndex;
+      const targetIndex = target === 'next' ? prevIndex + 1 : target;
+      const clampedIndex = Math.max(0, Math.min(lastIndex, targetIndex));
 
-  // The one chat-intent handler this task implements: scenario
-  // activation (Section 5 item 1). Timeline advancement and intervention
-  // parsing are Task 2/3's job — anything typed here today still runs
-  // through matchScenario, same as the old free-text input did. A
-  // fixed, dedicated intent dispatcher (so e.g. "next" doesn't
-  // re-trigger a full scenario re-activation) is explicitly Task 2's
-  // scope (Section 5's closing paragraph / Task 2's must-deliver list).
+      // No-op (already at/past this point, or already at the end and
+      // asked for "next"): don't run a cascade for nothing.
+      if (clampedIndex === prevIndex) return;
+
+      const keyframeLabel = activeScenario.timeline[clampedIndex]?.label || `T+${clampedIndex}`;
+      const lines = buildTimelineAdvanceLines(keyframeLabel);
+      appendTurn({ kind: 'processing', lines });
+      setIsThinking(true);
+
+      if (pendingAdvanceTimeoutRef.current) {
+        window.clearTimeout(pendingAdvanceTimeoutRef.current);
+      }
+      pendingAdvanceTimeoutRef.current = window.setTimeout(() => {
+        const prevState = getMergedStateForIndex(activeScenario, prevIndex);
+        const nextState = getMergedStateForIndex(activeScenario, clampedIndex);
+        const deltaText = describeDelta(prevState, nextState);
+        const prevCausalFactors = getCausalFactorsForIndex(activeScenario, prevIndex);
+        const causalFactors = getCausalFactorsForIndex(activeScenario, clampedIndex);
+        const content = buildTimelineBriefingContent(
+          activeScenario,
+          prevState,
+          nextState,
+          interventionApplied,
+          prevCausalFactors,
+          causalFactors,
+          deltaText,
+          keyframeLabel,
+        );
+
+        const isFinal = clampedIndex >= lastIndex;
+        const nextLabel = isFinal ? null : activeScenario.timeline[clampedIndex + 1]?.label;
+
+        // Commit the map/timeline change and the briefing turn together,
+        // right as the cascade finishes — same "real update lands when
+        // the fake processing visibly completes" pattern as activation.
+        setCurrentKeyframeIndex(clampedIndex);
+        appendTurn({ kind: 'timeline-briefing', content, isFinal, nextLabel });
+        setIsThinking(false);
+      }, estimateProcessingDurationMs(lines) + RESPONSE_APPEND_BUFFER_MS);
+    },
+    [activeScenario, currentKeyframeIndex, interventionApplied, isThinking, appendTurn],
+  );
+
+  // Intent dispatcher (Task 2's must-deliver list): runs BEFORE
+  // matchScenario. Checks the typed text against the small fixed
+  // timeline-advancement vocabulary first; only falls through to
+  // matchScenario (today's only prior path) if it doesn't match. This is
+  // the fix for the Section 5 "typing 'next' currently re-activates the
+  // scenario" behavior — "next" no longer reaches matchScenario at all.
   function handleChatSubmit(event) {
     event.preventDefault();
     if (isThinking) return; // ignore double-submits mid "thinking"
@@ -151,6 +244,32 @@ export function CommandShell() {
 
     appendTurn({ kind: 'user', text: query });
     setInputValue('');
+
+    // Only meaningful once a scenario is active — there is no timeline
+    // to advance before that, so an active scenario's keyframes are
+    // passed in; if none is active this only recognizes bare "next"-
+    // style words, which parseTimelineIntent still returns for (there's
+    // simply nothing to do with them below).
+    const timelineIntent = parseTimelineIntent(query, activeScenario?.timeline);
+    if (timelineIntent && activeScenario) {
+      if (timelineIntent.type === 'next') {
+        advanceTimeline('next');
+      } else {
+        advanceTimeline(timelineIntent.index);
+      }
+      return;
+    }
+
+    // matchScenario always returns *some* scenario (even the generic
+    // fallback) on zero keyword matches — it never signals "I don't know
+    // what you mean" on its own. hasNoConfidentScenarioMatch is the
+    // separate check Task 2 needs to catch stray/unclear input and show
+    // the clarify-fallback turn instead of silently activating
+    // generic-fallback.
+    if (hasNoConfidentScenarioMatch(query)) {
+      appendTurn({ kind: 'clarify-fallback' });
+      return;
+    }
 
     const matched = matchScenario(query);
 
@@ -173,15 +292,21 @@ export function CommandShell() {
       const t0MapState = getMergedStateForIndex(matched, 0);
       const t0CausalFactors = getCausalFactorsForIndex(matched, 0);
       const content = buildAnalystContent(matched, t0MapState, false, t0CausalFactors);
-      appendTurn({ kind: 'activation-response', content });
+      const hasMultipleKeyframes = Array.isArray(matched.timeline) && matched.timeline.length > 1;
+      const nextLabel = hasMultipleKeyframes ? matched.timeline[1]?.label : null;
+      appendTurn({ kind: 'activation-response', content, nextLabel });
       setIsThinking(false);
     }, estimateProcessingDurationMs(lines) + RESPONSE_APPEND_BUFFER_MS);
   }
 
-  // Task 1 keeps TimelineScrubber fully interactive (unchanged from
-  // before) — whether it becomes read-only once chat drives advancement
-  // is Task 2's explicitly-flagged judgment call (Section 3), not
-  // resolved here.
+  // TASK 2 DECISION (Section 3's flagged judgment call): TimelineScrubber
+  // stays fully interactive rather than becoming read-only. Chat is the
+  // primary/advertised control surface (inline "Next" button + typed
+  // commands), but the scrubber is left as a secondary, direct-manipulation
+  // shortcut for judges/demo audiences who want to jump around without
+  // typing — dragging it is an instant, silent jump (no cascade, no
+  // briefing turn), since it's treated as "looking", not "asking the
+  // analyst for a briefing".
   function handleTimelineIndexChange(nextIndex) {
     setCurrentKeyframeIndex(nextIndex);
   }
@@ -233,7 +358,10 @@ export function CommandShell() {
                 <div className="flex flex-col items-center gap-3">
                   {/* A simple pulsing building silhouette, so the map
                       viewport reads as "actively building the scene"
-                      rather than just a spinner. */}
+                      rather than just a spinner. Also shown during
+                      timeline advancement now, not just activation, so
+                      "next" visibly re-processes the map instead of
+                      instant-swapping. */}
                   <svg viewBox="0 0 64 48" width="56" height="42" className="animate-pulse text-accent/70" fill="none">
                     <rect x="6" y="20" width="12" height="24" fill="currentColor" opacity="0.5" />
                     <rect x="22" y="10" width="12" height="34" fill="currentColor" opacity="0.75" />
@@ -242,7 +370,7 @@ export function CommandShell() {
                   </svg>
                   <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
                   <p className="animate-pulse text-[11px] uppercase tracking-[0.32em] text-accent">
-                    Compiling threat picture…
+                    {isActivated ? 'Recomputing threat picture…' : 'Compiling threat picture…'}
                   </p>
                 </div>
               </div>
@@ -279,6 +407,8 @@ export function CommandShell() {
           onInputChange={setInputValue}
           onSubmit={handleChatSubmit}
           isThinking={isThinking}
+          onAdvance={() => advanceTimeline('next')}
+          scrollNonce={scrollNonce}
           placeholder={
             isActivated ? 'e.g. next, or describe a new scenario' : 'e.g. high-severity hostile attack in Central Delhi'
           }

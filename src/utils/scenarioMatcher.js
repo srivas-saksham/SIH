@@ -88,4 +88,24 @@ export function matchScenario(userInput) {
   return bestScenario;
 }
 
+/**
+ * `matchScenario` always returns *some* scenario (including the generic
+ * fallback) even on zero keyword matches — it never itself signals "I
+ * don't know what you mean" (Task 2's must-deliver list, Section 5). This
+ * is the separate "confidently no match" check Task 2 needs: it re-runs
+ * the same scoring used internally and reports whether ANY real scenario
+ * scored above zero, so callers can distinguish "this genuinely looks
+ * like a scenario description that just happens to match nothing" from
+ * "this is stray/unclear text that should get a clarify-fallback turn
+ * instead of silently activating generic-fallback."
+ *
+ * @param {string} userInput
+ * @returns {boolean} true if no real scenario scored above zero
+ */
+export function hasNoConfidentScenarioMatch(userInput) {
+  if (!userInput || !userInput.trim()) return true;
+  const normalizedInput = normalize(userInput);
+  return scenarios.every((scenario) => scoreScenario(scenario, normalizedInput) === 0);
+}
+
 export default matchScenario;

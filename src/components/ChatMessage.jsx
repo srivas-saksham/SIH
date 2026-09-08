@@ -201,10 +201,28 @@ function TypewriterHeadline({ text, onDone, onReveal }) {
   );
 }
 
+/** Inline "Next: T+N" button offered at the end of an activation or
+ * briefing turn (Task 2). Wired to the same `advanceTimeline` handler
+ * the text-dispatcher uses. Omitted entirely once the final keyframe is
+ * reached (Task 2's must-deliver list) — callers simply don't pass
+ * `onAdvance`/`nextLabel` in that case. */
+function NextStepButton({ nextLabel, onAdvance }) {
+  if (!nextLabel || !onAdvance) return null;
+  return (
+    <button
+      type="button"
+      onClick={onAdvance}
+      className="mt-4 inline-flex items-center gap-2 border border-accent/40 bg-accent/10 px-3 py-1.5 text-[11px] uppercase tracking-[0.2em] text-accent transition hover:bg-accent/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+    >
+      Next: {nextLabel}
+    </button>
+  );
+}
+
 /** Full analyst-response turn — headline types out first, then stats,
  * roads, shelters, and causal factors each reveal in sequence
  * (Section 6) rather than appearing all at once. */
-function ActivationResponseTurn({ content, onReveal }) {
+function ActivationResponseTurn({ content, onReveal, nextLabel, onAdvance }) {
   // 0 = headline typing, 1 = stats shown, 2 = +roads, 3 = +shelters,
   // 4 = +causal factors (fully revealed).
   const [phase, setPhase] = useState(0);
@@ -230,20 +248,92 @@ function ActivationResponseTurn({ content, onReveal }) {
       {phase >= 2 && <RoadsList roads={content.roads} />}
       {phase >= 3 && <SheltersList shelters={content.shelters} />}
       {phase >= 4 && <CausalFactors factors={content.causalFactors} />}
+      {phase >= 4 && <NextStepButton nextLabel={nextLabel} onAdvance={onAdvance} />}
     </div>
   );
 }
 
-export function ChatMessage({ turn, onReveal }) {
+/** Timeline-briefing turn (Task 2): lighter weight than the activation
+ * response — no processing-cascade replay, no camera-flyin narration,
+ * and the headline is NOT typewriter-animated (it's a short, already-
+ * computed delta sentence, not a "the system is thinking" moment).
+ * Stats/roads/shelters/causal-factors still reveal in the same staggered
+ * phases so briefings still visibly "build" rather than dumping at once. */
+function TimelineBriefingTurn({ content, onReveal, nextLabel, onAdvance, isFinal }) {
+  // 1 = stats shown, 2 = +roads, 3 = +shelters, 4 = +causal factors.
+  const [phase, setPhase] = useState(0);
+
+  useEffect(() => {
+    if (phase >= 4) return undefined;
+    const id = window.setTimeout(() => {
+      setPhase((p) => p + 1);
+      onReveal?.();
+    }, PHASE_STAGGER_MS);
+    return () => window.clearTimeout(id);
+  }, [phase, onReveal]);
+
+  return (
+    <div className="border-b border-hairline pb-4">
+      <p className="text-sm leading-relaxed text-ink">{content.headline}</p>
+      {phase >= 1 && <StatBlock stats={content.stats} />}
+      {phase >= 2 && <RoadsList roads={content.roads} />}
+      {phase >= 3 && <SheltersList shelters={content.shelters} />}
+      {phase >= 4 && <CausalFactors factors={content.causalFactors} />}
+      {phase >= 4 && isFinal && (
+        <p className="mt-4 text-[11px] uppercase tracking-[0.22em] text-ink-dim">
+          Scenario timeline complete.
+        </p>
+      )}
+      {phase >= 4 && !isFinal && <NextStepButton nextLabel={nextLabel} onAdvance={onAdvance} />}
+    </div>
+  );
+}
+
+/** Graceful "didn't understand" turn (Task 2 / Section 5's closing
+ * paragraph): shown when typed text matches neither timeline-advancement
+ * vocabulary nor any scenario's keywords confidently — instead of
+ * silently falling through to generic-fallback. */
+function ClarifyFallbackTurn() {
+  return (
+    <div className="border-b border-hairline pb-4">
+      <p className="text-sm leading-relaxed text-ink-dim">
+        I didn&apos;t quite catch that. Try describing a scenario (e.g. &ldquo;hostile attack in Central
+        Delhi&rdquo;), or say &ldquo;next&rdquo; / name a checkpoint (e.g. &ldquo;T+15&rdquo;) to advance an
+        active timeline.
+      </p>
+    </div>
+  );
+}
+
+export function ChatMessage({ turn, onReveal, onAdvance }) {
   switch (turn.kind) {
     case 'user':
       return <UserTurn text={turn.text} />;
     case 'processing':
       return <ProcessingTurn lines={turn.lines} onReveal={onReveal} />;
     case 'activation-response':
-      return <ActivationResponseTurn content={turn.content} onReveal={onReveal} />;
-    // 'timeline-briefing', 'intervention-response', and 'clarify-fallback'
-    // are stubbed/reserved for Tasks 2-3 (Section 7) — not built yet.
+      return (
+        <ActivationResponseTurn
+          content={turn.content}
+          onReveal={onReveal}
+          nextLabel={turn.nextLabel}
+          onAdvance={turn.nextLabel ? onAdvance : undefined}
+        />
+      );
+    case 'timeline-briefing':
+      return (
+        <TimelineBriefingTurn
+          content={turn.content}
+          onReveal={onReveal}
+          nextLabel={turn.nextLabel}
+          onAdvance={turn.nextLabel ? onAdvance : undefined}
+          isFinal={turn.isFinal}
+        />
+      );
+    case 'clarify-fallback':
+      return <ClarifyFallbackTurn />;
+    // 'intervention-response' is stubbed/reserved for Task 3 (Section 7)
+    // — not built yet.
     default:
       return null;
   }

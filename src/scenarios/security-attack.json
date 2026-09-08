@@ -369,10 +369,32 @@
         {
           "id": "r1",
           "status": "congested"
+        },
+        {
+          "id": "r2",
+          "status": "clear"
+        },
+        {
+          "id": "r3",
+          "status": "clear"
+        },
+        {
+          "id": "r4",
+          "status": "clear"
+        },
+        {
+          "id": "r5",
+          "status": "clear"
         }
       ],
       "shelters": [],
-      "roadCongestion": []
+      "roadCongestion": [],
+      "causalFactors": {
+        "shelterDeficit": 8,
+        "populationDensity": 60,
+        "roadAccessibility": 20,
+        "infrastructure": 10
+      }
     },
     {
       "label": "T+5",
@@ -401,6 +423,18 @@
         {
           "id": "r2",
           "status": "congested"
+        },
+        {
+          "id": "r3",
+          "status": "congested"
+        },
+        {
+          "id": "r4",
+          "status": "clear"
+        },
+        {
+          "id": "r5",
+          "status": "clear"
         }
       ],
       "shelters": [
@@ -409,7 +443,13 @@
           "occupancy": 180
         }
       ],
-      "roadCongestion": []
+      "roadCongestion": [],
+      "causalFactors": {
+        "shelterDeficit": 36,
+        "populationDensity": 63,
+        "roadAccessibility": 70,
+        "infrastructure": 28
+      }
     },
     {
       "label": "T+10",
@@ -436,8 +476,24 @@
       ],
       "roads": [
         {
+          "id": "r1",
+          "status": "blocked"
+        },
+        {
+          "id": "r2",
+          "status": "blocked"
+        },
+        {
           "id": "r3",
           "status": "congested"
+        },
+        {
+          "id": "r4",
+          "status": "congested"
+        },
+        {
+          "id": "r5",
+          "status": "clear"
         }
       ],
       "shelters": [
@@ -450,7 +506,13 @@
           "occupancy": 260
         }
       ],
-      "roadCongestion": []
+      "roadCongestion": [],
+      "causalFactors": {
+        "shelterDeficit": 68,
+        "populationDensity": 65,
+        "roadAccessibility": 90,
+        "infrastructure": 52
+      }
     },
     {
       "label": "T+15",
@@ -473,7 +535,23 @@
       ],
       "roads": [
         {
+          "id": "r1",
+          "status": "blocked"
+        },
+        {
+          "id": "r2",
+          "status": "congested"
+        },
+        {
+          "id": "r3",
+          "status": "congested"
+        },
+        {
           "id": "r4",
+          "status": "clear"
+        },
+        {
+          "id": "r5",
           "status": "clear"
         }
       ],
@@ -491,7 +569,13 @@
           "occupancy": 260
         }
       ],
-      "roadCongestion": []
+      "roadCongestion": [],
+      "causalFactors": {
+        "shelterDeficit": 82,
+        "populationDensity": 62,
+        "roadAccessibility": 55,
+        "infrastructure": 71
+      }
     },
     {
       "label": "T+30",
@@ -518,6 +602,22 @@
       ],
       "roads": [
         {
+          "id": "r1",
+          "status": "congested"
+        },
+        {
+          "id": "r2",
+          "status": "clear"
+        },
+        {
+          "id": "r3",
+          "status": "clear"
+        },
+        {
+          "id": "r4",
+          "status": "clear"
+        },
+        {
           "id": "r5",
           "status": "clear"
         }
@@ -536,7 +636,13 @@
           "occupancy": 310
         }
       ],
-      "roadCongestion": []
+      "roadCongestion": [],
+      "causalFactors": {
+        "shelterDeficit": 88,
+        "populationDensity": 58,
+        "roadAccessibility": 15,
+        "infrastructure": 84
+      }
     }
   ],
   "causalFactors": {
