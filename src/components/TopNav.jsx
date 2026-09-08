@@ -31,7 +31,7 @@ export function TopNav() {
           Stable
         </div>
         <div className="flex h-8 w-8 items-center justify-center rounded-full border border-hairline bg-surface text-xs font-medium text-ink">
-          Fmap
+          FS
         </div>
       </div>
     </div>
