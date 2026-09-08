@@ -115,9 +115,9 @@
     {
       "label": "T+15",
       "impactPoint": { "lat": 28.6139, "lng": 77.2090 },
-      "redRadiusKm": 0.28,
-      "yellowRadiusKm": 0.55,
-      "greenRadiusKm": 0.85,
+      "redRadiusKm": 1.5,
+      "yellowRadiusKm": 3.9,
+      "greenRadiusKm": 6.95,
       "buildings": [
         { "id": "b6", "riskLevel": "yellow" },
         { "id": "b7", "riskLevel": "yellow" }
@@ -134,9 +134,9 @@
     {
       "label": "T+30",
       "impactPoint": { "lat": 28.6139, "lng": 77.2090 },
-      "redRadiusKm": 0.2,
-      "yellowRadiusKm": 0.4,
-      "greenRadiusKm": 0.95,
+      "redRadiusKm": 2.2,
+      "yellowRadiusKm": 4.9,
+      "greenRadiusKm": 7.95,
       "buildings": [
         { "id": "b8", "riskLevel": "yellow" },
         { "id": "b9", "riskLevel": "green" },

@@ -218,6 +218,35 @@ function resolveActiveRadii(state, impactCenter) {
 // so it was never a viable fallback here either.
 const BUILDINGS_SOURCE_ID = 'openmaptiles-buildings';
 
+// --- Building-color-bleed fix (see BUILDING_COLOR_BLEED_ROOT_CAUSE.md) ---
+//
+// A single vector-tile "building" feature is not guaranteed to be one
+// visual building: Planetiler merges nearby buildings into one feature
+// at z13, and independently of that, OSM building complexes (attached
+// row-houses, courtyards, government/campus blocks — common around a
+// dense civic core) are frequently tagged as a single multipolygon
+// relation. setFeatureState keys by { source, sourceLayer, id } and
+// recolors the ENTIRE feature in one call — every ring/part — with no
+// way to color just one part of a multipolygon. Since
+// resolveBuildingCandidates below only ever computed one
+// turf.pointOnFeature point (and therefore one distance/band) per
+// feature, a single merged feature with even one part near the impact
+// point got its whole geometry — including far-flung parts — painted
+// the same color. That's the "whole tile/cluster recolors together"
+// symptom.
+//
+// The fix: stop driving the extrusion layer's feature-state directly
+// off the vector tile source. Instead, on every resolveBuildingCandidates
+// run we explode every vector-tile building feature into individual
+// Polygon features (turf.flatten), assign each exploded polygon its own
+// synthetic sequential id, and feed the result into this separate
+// client-held GeoJSON source. `3d-buildings` reads from this source, so
+// setFeatureState now targets one real, spatially-local polygon per id
+// instead of one (possibly multi-building) OSM relation. The vector
+// source (BUILDINGS_SOURCE_ID) is still queried for geometry — it's
+// just no longer what the layer paints from.
+const EXPLODED_BUILDINGS_SOURCE_ID = 'exploded-buildings';
+
 /** Highest-severity building in a baseline, or null if there are none. */
 function findPrimaryImpactBuilding(baseline) {
   const buildings = baseline?.buildings || [];
@@ -347,6 +376,20 @@ export function MapLibreView({ scenario }) {
   // ---------------------------------------------------------------
   const buildingCandidatesRef = useRef([]);
   const buildingBandByKeyRef = useRef({});
+  // Building-recoloring-never-sticks fix: MapLibre GeoJSON sources only
+  // preserve feature-state across setData() for features that KEEP THE
+  // SAME id — reassigning fresh sequential ids on every
+  // resolveBuildingCandidates call (as this used to do) meant every
+  // setData() wiped every previously-set color, and since the
+  // session-long 'idle' listener calls resolveBuildingCandidates on
+  // every idle tick, colors were being erased faster than the browser
+  // could ever paint a frame with them showing. This ref persists a
+  // stable numeric id per dedupeKey ACROSS calls, so a building that
+  // was already resolved keeps the same id (and therefore its
+  // feature-state) on every subsequent rebuild — only genuinely new
+  // buildings get a newly-assigned id.
+  const buildingIdByDedupeKeyRef = useRef(new Map());
+  const nextSyntheticIdRef = useRef(1);
   const riskZoneFrameRef = useRef(null);
   // lastRadiiRef: the most recently fully-settled { point, red, yellow,
   // green } radii, used as the animation's start point so scrubbing the
@@ -359,6 +402,13 @@ export function MapLibreView({ scenario }) {
   // only updates when an animation fully settles). See the BUGFIX
   // comment in animateRiskZones for why this exists.
   const currentRadiiRef = useRef(null);
+  // currentImpactCenterRef: the impact point from the most recent
+  // activation, kept in a ref (not just closed over inside
+  // applyScenarioActivation) so the session-long 'idle' listener added
+  // in map.on('load', ...) below can always re-resolve building
+  // candidates against wherever the impact point CURRENTLY is, instead
+  // of only the point one specific activation started with.
+  const currentImpactCenterRef = useRef(FALLBACK_CENTER);
 
   // -------------------------------------------------------------------
   // Map init — runs once on mount.
@@ -541,9 +591,24 @@ export function MapLibreView({ scenario }) {
             + 'falling back to it directly for 3d-buildings.',
         );
       }
-      const buildingsSourceId = map.getSource(BUILDINGS_SOURCE_ID)
-        ? BUILDINGS_SOURCE_ID
-        : 'openmaptiles';
+      // Not read by any addLayer call anymore — resolveBuildingCandidates
+      // queries this source directly by its constant id for raw geometry
+      // (see the comment block near BUILDINGS_SOURCE_ID/
+      // EXPLODED_BUILDINGS_SOURCE_ID above), and `3d-buildings` now
+      // paints from EXPLODED_BUILDINGS_SOURCE_ID instead.
+
+      // --- Building-color-bleed fix: client-held, per-polygon GeoJSON
+      // source that 3d-buildings actually paints from (see the big
+      // comment block near EXPLODED_BUILDINGS_SOURCE_ID above). Starts
+      // empty; resolveBuildingCandidates populates it via setData() once
+      // the impact point/radii are known, exactly like the impact-zone
+      // circle sources below.
+      if (!map.getSource(EXPLODED_BUILDINGS_SOURCE_ID)) {
+        map.addSource(EXPLODED_BUILDINGS_SOURCE_ID, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        });
+      }
 
       // --- 1. 3D buildings from OpenFreeMap's own OSM building layer ---
       // Task 8c: landmark highlighting used to be a separate overlay
@@ -556,33 +621,101 @@ export function MapLibreView({ scenario }) {
       // unchanged grayscale height interpolation for every building
       // that isn't a matched landmark. No separate 'landmarks' source/
       // layer exists anymore.
+
+      // --- Building-coverage fix ---
+      //
+      // The exploded/synthetic overlay below (`3d-buildings`, reading
+      // EXPLODED_BUILDINGS_SOURCE_ID) only ever contains whatever
+      // resolveBuildingCandidates has explicitly processed. Painting
+      // ALL building rendering from that source meant a building not
+      // yet swept into the candidate list — or never swept in at all —
+      // rendered as literally nothing, not even gray. That's a stronger
+      // version of the "buildings disappear" bug than the idle-retry
+      // issue already fixed: it doesn't matter how persistent the
+      // re-resolution is, a building only ever appears strictly AFTER
+      // being explicitly resolved, and any gap in that sweep (a tile
+      // that loaded but hasn't been re-scanned yet, an edge case in
+      // turf.flatten, etc.) is a permanently invisible building.
+      //
+      // Fix: a separate BASE layer, `3d-buildings-base`, paints every
+      // building directly from the raw vector tile source
+      // (BUILDINGS_SOURCE_ID) unconditionally — no feature-state, no
+      // dependency on candidate resolution, just the same
+      // grayscale-by-height fallback the overlay used to use. This
+      // guarantees every real building in view always renders, exactly
+      // like before the exploded-source fix existed. It also replaces
+      // the old invisible `buildings-tile-loader` layer (opacity 0),
+      // since this visible layer already forces BUILDINGS_SOURCE_ID's
+      // tiles to be requested/kept in memory.
+      //
+      // `3d-buildings` (below) stays exactly as the color-bleed fix
+      // built it — same exploded source, same per-polygon setFeatureState
+      // targeting — but now acts purely as a risk-color OVERLAY drawn on
+      // top of this base layer: fully transparent wherever no band is
+      // set, and colored only where a real, spatially-correct band is.
+      // The two layers never fight over which one is "the" building,
+      // because the overlay is invisible except where it has something
+      // to add.
+      if (!map.getLayer('3d-buildings-base')) {
+        map.addLayer(
+          {
+            id: '3d-buildings-base',
+            source: BUILDINGS_SOURCE_ID,
+            'source-layer': 'building',
+            type: 'fill-extrusion',
+            minzoom: 14,
+            paint: {
+              'fill-extrusion-color': [
+                'interpolate',
+                ['linear'],
+                ['coalesce', ['get', 'render_height'], 8],
+                0,
+                BUILDING_DEFAULT_GRAY,
+                100,
+                '#8a8a94',
+              ],
+              'fill-extrusion-height': ['coalesce', ['get', 'render_height'], 8],
+              'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0],
+              'fill-extrusion-opacity': 0.85,
+            },
+          },
+          labelLayerId,
+        );
+      }
+
+      // Tile level-of-detail tuning for BUILDINGS_SOURCE_ID, confirmed
+      // against MapLibre's own setSourceTileLodParams docs:
+      // maxZoomLevelsOnScreen=1 slows the zoom-level decay toward the
+      // horizon (keeps building tiles detailed further out at this
+      // scene's high pitch/bearing), and tileCountMaxMinRatio=128 raises
+      // how many tiles are allowed to load at once at that pitch. Only
+      // applied to BUILDINGS_SOURCE_ID (not EXPLODED_BUILDINGS_SOURCE_ID,
+      // which is a GeoJSON source this API doesn't apply to) since it's
+      // the vector source resolveBuildingCandidates actually pages tiles
+      // in from. Guarded with try/catch since this API may not exist on
+      // every maplibre-gl version this repo could be pinned to.
+      if (typeof map.setSourceTileLodParams === 'function') {
+        try {
+          map.setSourceTileLodParams(1, 128, BUILDINGS_SOURCE_ID);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[MapLibreView] setSourceTileLodParams failed', err);
+        }
+      }
+
       map.addLayer(
         {
           id: '3d-buildings',
-          source: buildingsSourceId,
-          'source-layer': 'building',
+          // Building-color-bleed fix: paints from the exploded,
+          // per-polygon GeoJSON source (no `source-layer` — GeoJSON
+          // sources don't have one) instead of the raw vector tile
+          // source, so setFeatureState always targets one spatially-local
+          // polygon. See the comment block near EXPLODED_BUILDINGS_SOURCE_ID
+          // above for the full rationale.
+          source: EXPLODED_BUILDINGS_SOURCE_ID,
           type: 'fill-extrusion',
           minzoom: 14,
-          paint: {
-            // Research §3/§9: `match` on the categorical 'riskLevel'
-            // feature-state, with an explicit gray fallback branch —
-            // this is what makes a building with NO feature-state set
-            // (never-touched) and a building explicitly set to 'none'
-            // (left every band, see evaluateAndApplyBuildingRisk)
-            // render identically: both resolve ['feature-state',
-            // 'riskLevel'] to something that isn't 'red'/'yellow'/
-            // 'green', which `match` falls through to the last
-            // (fallback) argument for. Only three risk colors exist in
-            // this path — no 'orange' branch — per the task's
-            // acceptance checklist; the 5-landmark code below still
-            // writes 'orange' as one of ITS possible values (unchanged
-            // legacy behavior, see applyLandmarkRisk), so 'orange'
-            // simply isn't given its own branch here and instead falls
-            // through to gray, exactly like 'none' does. (Landmarks are
-            // a separate, older highlighting path layered on the same
-            // feature-state key — see Section on landmark code below —
-            // and are out of scope for this task's re-work; flagged in
-            // the implementation summary.)
+                    paint: {
             'fill-extrusion-color': [
               'match',
               ['feature-state', 'riskLevel'],
@@ -592,10 +725,6 @@ export function MapLibreView({ scenario }) {
               BUILDING_RISK_HEX.yellow,
               'green',
               BUILDING_RISK_HEX.green,
-              // Fallback for every unaffected building — same
-              // grayscale-by-height interpolation as before, lightened
-              // (Task 8d FIX 1) from #3a3a3f→#5a5a60 to #5a5a62→#8a8a94
-              // so it reads against dark-matter's near-black basemap.
               [
                 'interpolate',
                 ['linear'],
@@ -606,25 +735,7 @@ export function MapLibreView({ scenario }) {
                 '#8a8a94',
               ],
             ],
-            // Research §3: fill-extrusion-color is Transitionable and
-            // documented as supporting feature-state expressions;
-            // whether the crossfade is actually smooth for a
-            // feature-state-driven change (vs. snapping instantly) is
-            // flagged unresolved/unverified in the research artifact —
-            // left enabled here since it's the documented-correct
-            // config either way, and a snap-instead-of-fade is an
-            // acceptable degraded case, not a bug in this config.
             'fill-extrusion-color-transition': { duration: TRANSITION_MS },
-            // Height boost only for red/yellow (green is "still
-            // affected, least severe" per the task brief, not
-            // "safe/normal" — but we intentionally do NOT boost green's
-            // height, to keep the innermost bands visually dominant on
-            // the skyline; green is communicated via color only). The
-            // fallback branch is a flat coalesced height (NOT a
-            // zoom-interpolated ramp) — nesting ['zoom'] inside a case
-            // branch is invalid MapLibre style syntax and previously
-            // broke this entire layer (see PROJECT_CONTEXT.md / Task 8d
-            // bug writeup). Left as-is here.
             'fill-extrusion-height': [
               'case',
               ['==', ['feature-state', 'riskLevel'], 'red'],
@@ -633,11 +744,8 @@ export function MapLibreView({ scenario }) {
               ['max', 20, ['coalesce', ['get', 'render_height'], 8]],
               ['coalesce', ['get', 'render_height'], 8],
             ],
-            // Matches the 400ms ease convention used for color above and
-            // throughout the app (PROJECT_CONTEXT.md Section 9), so a
-            // risk-level change animates height and color in sync.
             'fill-extrusion-height-transition': { duration: TRANSITION_MS, delay: 0 },
-            'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0],
+            'fill-extrusion-base': ['+', ['coalesce', ['get', 'render_min_height'], 0], 0.05],
             'fill-extrusion-opacity': 0.85,
           },
         },
@@ -748,6 +856,31 @@ export function MapLibreView({ scenario }) {
     // settled.
     map.on('idle', () => {
       tryResolveLandmarkFeatures();
+    });
+
+    // Building-disappearance fix: resolveBuildingCandidates used to
+    // only be re-run for a fixed 6-tick window right after activation
+    // (see the old idleRetriesLeft/onIdleReresolve block, removed from
+    // applyScenarioActivation below). setSourceTileLodParams only
+    // controls which tiles MapLibre requests — it does nothing if
+    // nothing re-scans for them once they arrive. Once those 6 ticks
+    // passed, any tile that paged in later (zooming out, dropping pitch
+    // below ~60 which reshapes the LOD footprint, or panning) never got
+    // exploded into EXPLODED_BUILDINGS_SOURCE_ID, so buildings there
+    // simply never existed in that source to begin with — not
+    // "disappearing", never having appeared, which read as random
+    // depending on exact camera timing during the original window.
+    //
+    // Fix: a single session-long 'idle' listener, registered once here
+    // (not inside applyScenarioActivation, which re-runs per scenario
+    // switch and would otherwise stack duplicate listeners), that
+    // re-resolves against whatever the CURRENT impact point is via
+    // currentImpactCenterRef — never expires, and resolveBuildingCandidates
+    // is already idempotent/cheap (a single querySourceFeatures scan
+    // that fully replaces buildingCandidatesRef each time), so running
+    // it on every idle for the map's whole lifetime is fine.
+    map.on('idle', () => {
+      resolveBuildingCandidates(currentImpactCenterRef.current);
     });
 
     return () => {
@@ -915,6 +1048,12 @@ export function MapLibreView({ scenario }) {
     const primary = findPrimaryImpactBuilding(currentScenario.baseline);
     const impactCenter = currentScenario.baseline?.impactPoint
       || (primary ? { lat: primary.lat, lng: primary.lng } : FALLBACK_CENTER);
+    // Building-disappearance fix: keep the session-long 'idle' listener
+    // (registered once in map.on('load', ...)) pointed at whichever
+    // impact point is currently active, since that listener outlives
+    // any single activation and closes over this ref, not a local
+    // variable.
+    currentImpactCenterRef.current = impactCenter;
 
     // Cinematic camera move into the impact zone.
     map.flyTo({
@@ -962,24 +1101,14 @@ export function MapLibreView({ scenario }) {
       };
       map.on('idle', onIdleStart);
     }
-    // Re-resolve candidates on every 'idle' for a short window after
-    // activation, not just once on moveend. 'idle' (not moveend) is the
-    // correct "tiles have actually settled" signal (research §1 — this
-    // matches the exact reasoning already used for tryResolveLandmarkFeatures
-    // above); moveend only means the camera stopped, tiles can still be
-    // in flight for several more idle cycles as the flyTo's intermediate
-    // zoom levels page in new tiles. Re-running resolveBuildingCandidates
-    // repeatedly is cheap (a single querySourceFeatures scan) and
-    // idempotent — each call fully replaces buildingCandidatesRef, so a
-    // later, more-complete idle simply supersedes an earlier, sparser
-    // one rather than accumulating duplicates.
-    let idleRetriesLeft = 6; // ~a few seconds of idle events after activation
-    const onIdleReresolve = () => {
-      resolveBuildingCandidates(impactCenter);
-      idleRetriesLeft -= 1;
-      if (idleRetriesLeft <= 0) map.off('idle', onIdleReresolve);
-    };
-    map.on('idle', onIdleReresolve);
+    // Beyond the initial isSourceLoaded check above, ongoing
+    // re-resolution is handled by the session-long 'idle' listener
+    // registered once in map.on('load', ...) (see the
+    // building-disappearance fix comment there) — it re-runs
+    // resolveBuildingCandidates against currentImpactCenterRef.current
+    // for the map's whole lifetime, correctly picking up tiles that page
+    // in later from zooming, panning, or pitch changes, rather than
+    // only during a fixed number of ticks right after each activation.
     animateEvacRoute(currentScenario.baseline, impactCenter);
   }
 
@@ -1022,40 +1151,101 @@ export function MapLibreView({ scenario }) {
         return;
       }
 
-      const seenIds = new Set();
+      // Building-color-bleed fix (see BUILDING_COLOR_BLEED_ROOT_CAUSE.md
+      // §5 and the comment block near EXPLODED_BUILDINGS_SOURCE_ID
+      // above): a vector-tile "building" feature can legitimately be a
+      // merged/multi-part relation covering more than one real-world
+      // footprint. We explode every MultiPolygon into individual
+      // Polygon features via turf.flatten, give each exploded polygon
+      // its own synthetic sequential id, and compute distance PER
+      // EXPLODED POLYGON rather than per original feature — this is now
+      // spatially correct because each polygon is one real building
+      // footprint (or at worst one building part), not a whole relation.
+      const seenOriginalIds = new Set();
       const impactPointFeature = turf.point([impactCenter.lng, impactCenter.lat]);
       const candidates = [];
+      const explodedFeatures = [];
 
       features.forEach((feature) => {
         // feature.id here is the vector tile's own native id (no
         // promoteId involved anymore — see the comment block near
-        // BUILDINGS_SOURCE_ID above for why). Planetiler already
-        // derives that id from the real-world OSM element id, so it's
-        // stable across every tile/zoom the building appears in. Skip
-        // anything that didn't resolve to an id at all (research §1:
-        // setFeatureState requires feature.id to be present) — this
-        // should now be rare/never instead of "always every building".
-        if (feature.id === undefined || feature.id === null) return;
-        const dedupeKey = String(feature.id);
-        if (seenIds.has(dedupeKey)) return; // research §5: tile-boundary duplication
-        seenIds.add(dedupeKey);
+        // BUILDINGS_SOURCE_ID above for why). It's only used here to
+        // dedupe the SAME original feature seen twice across tile
+        // boundaries (research §5) — it's no longer what setFeatureState
+        // targets (that's now the synthetic per-polygon id below), so a
+        // missing/undefined original id no longer needs to drop the
+        // feature entirely, just skip the original-id dedupe check.
+        const originalKey = feature.id === undefined || feature.id === null ? null : String(feature.id);
+        if (originalKey !== null) {
+          if (seenOriginalIds.has(originalKey)) return; // tile-boundary duplication
+          seenOriginalIds.add(originalKey);
+        }
 
-        let representativePoint;
+        let flattened;
         try {
-          representativePoint = turf.pointOnFeature(feature);
+          // turf.flatten splits Multi* geometries into one Feature per
+          // part; for an already-single Polygon it just returns that one
+          // polygon unchanged, so this is safe to run unconditionally.
+          flattened = turf.flatten(feature);
         } catch (err) {
           return; // malformed geometry — skip rather than crash the whole batch
         }
 
-        const distanceKm = turf.distance(impactPointFeature, representativePoint, { units: 'kilometers' });
-        candidates.push({
-          featureTarget: { source: feature.source, sourceLayer: feature.sourceLayer, id: feature.id },
-          dedupeKey,
-          distanceKm,
+        flattened.features.forEach((polygon, partIndex) => {
+          let representativePoint;
+          try {
+            // Research §6: pointOnFeature over centroid, since a
+            // centroid can fall outside a concave/L-shaped footprint.
+            // Now computed per exploded polygon (one real building/
+            // building-part) instead of per merged relation, which is
+            // the actual fix for the color-bleed bug — see §3c/§5.
+            representativePoint = turf.pointOnFeature(polygon);
+          } catch (err) {
+            return;
+          }
+
+          // Building-recoloring-never-sticks fix: look up (or assign
+          // once, then reuse forever) a STABLE id for this exact
+          // building part, keyed by dedupeKey — not a fresh counter
+          // value every call. This is what lets setData() preserve this
+          // feature's feature-state across every subsequent rebuild.
+          const dedupeKey = `${originalKey ?? 'noid'}:${partIndex}`;
+          let syntheticId = buildingIdByDedupeKeyRef.current.get(dedupeKey);
+          if (syntheticId === undefined) {
+            syntheticId = nextSyntheticIdRef.current;
+            nextSyntheticIdRef.current += 1;
+            buildingIdByDedupeKeyRef.current.set(dedupeKey, syntheticId);
+          }
+          polygon.id = syntheticId;
+          polygon.properties = { ...feature.properties };
+
+          const distanceKm = turf.distance(impactPointFeature, representativePoint, { units: 'kilometers' });
+          candidates.push({
+            featureTarget: { source: EXPLODED_BUILDINGS_SOURCE_ID, id: syntheticId },
+            dedupeKey,
+            distanceKm,
+          });
+          explodedFeatures.push(polygon);
         });
       });
 
+      const explodedSource = map.getSource(EXPLODED_BUILDINGS_SOURCE_ID);
+      if (explodedSource) {
+        explodedSource.setData({ type: 'FeatureCollection', features: explodedFeatures });
+      }
+
       buildingCandidatesRef.current = candidates;
+      // Building-recoloring-never-sticks fix: ids are now STABLE across
+      // calls (see buildingIdByDedupeKeyRef above), so MapLibre already
+      // preserves feature-state for every building that kept its id —
+      // no more blanket reset needed. buildingBandByKeyRef's own
+      // per-candidate diffing (band === lastBand → skip) now does
+      // exactly the right thing on its own: unchanged buildings are
+      // left alone (already correctly colored and already stable across
+      // the setData call above), and genuinely new buildings (not yet
+      // in buildingBandByKeyRef) get colored for the first time here.
+      const activeRadii = currentRadiiRef.current || lastRadiiRef.current;
+      if (activeRadii) applyBuildingRiskForRadii(activeRadii);
     };
 
     if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
@@ -1225,6 +1415,18 @@ export function MapLibreView({ scenario }) {
     buildingCandidatesRef.current = [];
     lastRadiiRef.current = null;
     currentRadiiRef.current = null;
+    // Building-color-bleed fix: also clear the exploded per-polygon
+    // source so a scenario switch doesn't leave stale polygons (and
+    // their now-orphaned synthetic ids) sitting in it.
+    const explodedSource = map.getSource(EXPLODED_BUILDINGS_SOURCE_ID);
+    if (explodedSource) {
+      explodedSource.setData({ type: 'FeatureCollection', features: [] });
+    }
+    // Building-recoloring-never-sticks fix: also clear the stable id
+    // map so a new scenario starts with a clean id space rather than
+    // carrying forward dedupeKey→id mappings from buildings that no
+    // longer exist in the (now-emptied) exploded source.
+    buildingIdByDedupeKeyRef.current = new Map();
   }
 
   function animateEvacRoute(baseline, impactCenter) {
@@ -1256,7 +1458,15 @@ export function MapLibreView({ scenario }) {
     const animStart = performance.now();
     const step = (now) => {
       const t = Math.min(1, (now - animStart) / ROUTE_ANIMATE_MS);
-      const distanceKm = totalLengthKm * t;
+      // turf.along throws "coord is required" when distance lands
+      // exactly on the line's total length (Turfjs/turf#1802 — known
+      // upstream bug in the last-segment overshoot math). Clamp just
+      // under 1 for the along() call only, so it never hits the exact
+      // endpoint; the loop's own completion check (`t < 1` below) is
+      // unaffected and still fires exactly on schedule. Visually
+      // indistinguishable at 0.0001.
+      const safeT = Math.min(t, 0.9999);
+      const distanceKm = totalLengthKm * safeT;
       const point = turf.along(route, distanceKm, { units: 'kilometers' });
       pointSource.setData(point);
       if (t < 1) {
