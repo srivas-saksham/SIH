@@ -1,10 +1,10 @@
-import { useMemo, useState } from 'react';
-import { scenarioPresets } from '../scenarios/scenarioPresets';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { describeDelta } from '../utils/describeKeyframeDelta';
 import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
-import { getScenarioById, matchScenario, scenarios } from '../utils/scenarioMatcher';
-import { CausalBreakdown } from './CausalBreakdown';
-import { ComparisonPanel } from './ComparisonPanel';
+import { matchScenario } from '../utils/scenarioMatcher';
+import { buildAnalystContent } from '../utils/buildAnalystContent';
+import { buildProcessingLines, estimateProcessingDurationMs } from '../utils/processingCascade';
+import { ChatPanel } from './ChatPanel';
 import { MapLibreView } from './MapLibreView';
 import { MapToolbar } from './MapToolbar';
 import { MapView } from './MapView';
@@ -18,11 +18,11 @@ import { TopNav } from './TopNav';
  * mergeKeyframesUpTo. Wrapped defensively: if a scenario's timeline is
  * malformed (missing, wrong shape, or a keyframe that fails to merge),
  * this logs a warning and falls back to the baseline rather than crashing
- * the UI, per Task 5's data-requirements spec.
+ * the UI.
  */
 function getMergedStateForIndex(scenario, index) {
-  if (index <= 0 || !Array.isArray(scenario.timeline) || scenario.timeline.length === 0) {
-    return scenario.baseline;
+  if (!scenario || index <= 0 || !Array.isArray(scenario.timeline) || scenario.timeline.length === 0) {
+    return scenario ? scenario.baseline : null;
   }
   try {
     return mergeKeyframesUpTo(scenario.baseline, scenario.timeline, index);
@@ -34,16 +34,9 @@ function getMergedStateForIndex(scenario, index) {
 }
 
 /**
- * Causal factors are a static per-scenario snapshot by default (Task 2's
- * data model — one `causalFactors` object per scenario, not per
- * keyframe). This adds a lightweight, backward-compatible per-keyframe
- * override on top of that: if the keyframe object at `scenario.timeline`
- * index `index` optionally carries its own `causalFactors`, that's used
- * instead; otherwise this falls back to the scenario-level static value.
- * No existing scenario JSON needs to change for this — none of the four
- * current datasets define per-keyframe factors yet, so today's behavior
- * is identical to the plain static approach, but a future task/dataset
- * can add per-keyframe factors without touching this code again.
+ * Causal factors are a static per-scenario snapshot by default, with an
+ * optional per-keyframe override (unchanged from the prior docked-panel
+ * era — Task 1 only changes WHERE this renders, not how it's derived).
  */
 function getCausalFactorsForIndex(scenario, index) {
   const timeline = scenario.timeline;
@@ -54,221 +47,182 @@ function getCausalFactorsForIndex(scenario, index) {
   return timeline[clampedIndex]?.causalFactors ?? scenario.causalFactors;
 }
 
-// Fake "AI thinking" delay range (ms) for free-text scenario input, so
-// the keyword match feels like real processing rather than an instant
-// lookup. Preset chips skip this entirely (see handlePresetClick).
-const THINKING_DELAY_MIN = 1100;
-const THINKING_DELAY_MAX = 1900;
+// Small buffer added on top of the processing cascade's own reveal
+// duration (Section 6) before the analyst-response turn appends, so the
+// last cascade line has fully faded in rather than the response landing
+// mid-animation.
+const RESPONSE_APPEND_BUFFER_MS = 200;
 
-function randomThinkingDelay() {
-  return THINKING_DELAY_MIN + Math.random() * (THINKING_DELAY_MAX - THINKING_DELAY_MIN);
+let turnIdCounter = 0;
+function nextTurnId() {
+  turnIdCounter += 1;
+  return `turn-${turnIdCounter}`;
 }
 
-// Task 8: preset chips lost their bordered/pill treatment in the flat
-// layout, but still need to read as a severity signal at a glance — so
-// each chip's label color (not a border/background) maps to its
-// existing `severity` field via the same risks-* tokens riskStyles.js
-// already uses elsewhere.
-const PRESET_TEXT_CLASS = {
-  green: 'text-risks-green',
-  yellow: 'text-risks-yellow',
-  orange: 'text-risks-orange',
-  red: 'text-risks-red',
-};
-
 export function CommandShell() {
-  // Security scenarios are the primary demo use case, so that's the
-  // default active scenario (matches Task 3's hardcoded starting point).
-  const [activeScenario, setActiveScenario] = useState(scenarios[0]);
+  // Nullable: no scenario is active until the person types one into
+  // chat (Section 4). The shell (header/chat/timeline slot) is always
+  // rendered regardless — only the map viewport changes look.
+  const [activeScenario, setActiveScenario] = useState(null);
   const [inputValue, setInputValue] = useState('');
   const [isThinking, setIsThinking] = useState(false);
 
+  // Chat history: a real, permanently-scrollable, append-only array of
+  // turns (Section 2 point 5 / Section 7) — never replaced wholesale.
+  const [chatTurns, setChatTurns] = useState([]);
+  const pendingResponseTimeoutRef = useRef(null);
+
   // Timeline scrubber state. Lives here (not inside TimelineScrubber)
-  // because MapView is a sibling that also needs the derived merged
-  // state — same reasoning as why activeScenario lives here (Task 4).
+  // because MapView/MapLibreView are siblings that also need the derived
+  // merged state.
   const [currentKeyframeIndex, setCurrentKeyframeIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
 
-  // Task 7: whether the user has clicked "Apply intervention" for the
-  // current scenario. Owned here, same pattern as the timeline state
-  // above, since both ComparisonPanel and MapView need to react to it.
-  const [interventionApplied, setInterventionApplied] = useState(false);
+  // Whether an intervention has been applied for the current scenario.
+  // Owned here (same pattern as the timeline state above) even though
+  // no chat command drives this yet — Task 3 wires the chat-triggered
+  // path; this task just keeps the underlying state/derivation intact
+  // so MapLibreView's props don't need to change shape again later.
+  const [interventionApplied] = useState(false);
 
-  // Map toolbar: shelters default OFF — per explicit person request,
-  // shelters shouldn't appear automatically the instant a scenario
-  // activates at T+0; the person toggles them on deliberately via
-  // MapToolbar. Lives here (not inside MapLibreView) since MapToolbar
-  // is rendered as a sibling overlay on top of the map, same pattern as
-  // every other piece of shared map/scrubber state in this component.
+  // Map toolbar: shelters default OFF.
   const [sheltersVisible, setSheltersVisible] = useState(false);
 
-  // Switching scenarios (free-text match or preset chip) must never carry
-  // a mid-timeline position — or an applied intervention — into the
-  // newly-selected scenario. Reset it during render (React's documented
-  // "adjust state when a prop changes" pattern) rather than in a
-  // useEffect, so the reset lands in the same commit as the scenario
-  // change instead of flashing the old state for one extra frame.
-  const [resetForScenarioId, setResetForScenarioId] = useState(activeScenario.id);
-  if (resetForScenarioId !== activeScenario.id) {
-    setResetForScenarioId(activeScenario.id);
+  // Switching scenarios (via chat) must never carry a mid-timeline
+  // position into the newly-activated scenario. Reset it during render
+  // (React's documented "adjust state when a prop changes" pattern)
+  // rather than in a useEffect, so the reset lands in the same commit as
+  // the scenario change instead of flashing the old state for one extra
+  // frame.
+  const [resetForScenarioId, setResetForScenarioId] = useState(activeScenario?.id ?? null);
+  if (resetForScenarioId !== (activeScenario?.id ?? null)) {
+    setResetForScenarioId(activeScenario?.id ?? null);
     setCurrentKeyframeIndex(0);
     setIsPlaying(false);
-    setInterventionApplied(false);
     setSheltersVisible(false);
   }
 
   const mergedMapState = useMemo(
-    () => getMergedStateForIndex(activeScenario, currentKeyframeIndex),
+    () => (activeScenario ? getMergedStateForIndex(activeScenario, currentKeyframeIndex) : null),
     [activeScenario, currentKeyframeIndex],
   );
 
-  // Task 7: when an intervention has been applied, MapView shows the
-  // scenario's `intervention` state instead of the timeline-merged one —
-  // chosen over trying to also fold the current `currentKeyframeIndex` on
-  // top of it, since `intervention` already represents a full alternate
-  // baseline-shaped end-state ("what we did about it"), not another point
-  // on the same unmitigated timeline. Combining both cleanly would need a
-  // second merge axis for comparatively little demo value. Scrubbing the
-  // timeline while an intervention is active resets `interventionApplied`
-  // instead (see handleTimelineIndexChange) specifically so this override
-  // can stay this simple without the two ever needing to coexist.
-  const activeMapState = interventionApplied ? activeScenario.intervention : mergedMapState;
+  const activeMapState = interventionApplied && activeScenario ? activeScenario.intervention : mergedMapState;
 
-  // MapView already renders `scenario.baseline` as its data source (Task
-  // 3/4), so the simplest way to feed it either the time-merged state or
-  // the intervention state is to pass a shallow-cloned scenario with
-  // `baseline` swapped for whichever applies — no MapView changes needed
-  // for *which* state it renders, and it animates into the new state via
-  // the same CSS-transition/ghost-crossfade machinery from Task 5.
+  // MapView already renders `scenario.baseline` as its data source, so
+  // the simplest way to feed it either the time-merged state or the
+  // intervention state is to pass a shallow-cloned scenario with
+  // `baseline` swapped for whichever applies.
   const mapViewScenario = useMemo(
-    () => ({ ...activeScenario, baseline: activeMapState }),
+    () => (activeScenario ? { ...activeScenario, baseline: activeMapState } : null),
     [activeScenario, activeMapState],
   );
 
   const timelineStatusText = useMemo(() => {
+    if (!activeScenario) return '';
     if (currentKeyframeIndex <= 0) return 'Scenario baseline established.';
     const prevState = getMergedStateForIndex(activeScenario, currentKeyframeIndex - 1);
     return describeDelta(prevState, mergedMapState);
   }, [activeScenario, currentKeyframeIndex, mergedMapState]);
 
-  const activeCausalFactors = useMemo(
-    () => getCausalFactorsForIndex(activeScenario, currentKeyframeIndex),
-    [activeScenario, currentKeyframeIndex],
-  );
+  // NOTE: per-keyframe causal factors (getCausalFactorsForIndex) are
+  // recomputed directly inside handleChatSubmit for the T+0 activation
+  // response below. A `currentKeyframeIndex`-reactive version of this
+  // will be needed again once Task 2 builds the timeline-briefing turn
+  // for later keyframes.
 
-  // Task 8: "Quick Analytics" glanceable stat tiles. Derived entirely from
-  // data already flowing into CausalBreakdown/ComparisonPanel — the three
-  // comparisonStats figures (flipping to the "after" value once an
-  // intervention is applied, same convention ComparisonPanel itself uses)
-  // plus a shelter count read off the same activeMapState already passed
-  // to MapView. No new data source is introduced for this panel.
-  const quickStats = useMemo(() => {
-    const stats = activeScenario.comparisonStats;
-    return [
-      {
-        key: 'evacTime',
-        label: 'Evac time',
-        value: `${interventionApplied ? stats.evacTimeAfter : stats.evacTimeBefore} min`,
-      },
-      {
-        key: 'overload',
-        label: 'Overload',
-        value: `${interventionApplied ? stats.overloadAfter : stats.overloadBefore}%`,
-      },
-      {
-        key: 'riskZones',
-        label: 'Risk zones',
-        value: `${interventionApplied ? stats.riskZonesAfter : stats.riskZonesBefore}`,
-      },
-      {
-        key: 'shelters',
-        label: 'Shelters',
-        value: `${activeMapState.shelters.length}`,
-      },
-    ];
-  }, [activeScenario, interventionApplied, activeMapState]);
+  const appendTurn = useCallback((turn) => {
+    setChatTurns((prev) => [...prev, { id: nextTurnId(), ...turn }]);
+  }, []);
 
-  function handleScenarioSubmit(event) {
+  // The one chat-intent handler this task implements: scenario
+  // activation (Section 5 item 1). Timeline advancement and intervention
+  // parsing are Task 2/3's job — anything typed here today still runs
+  // through matchScenario, same as the old free-text input did. A
+  // fixed, dedicated intent dispatcher (so e.g. "next" doesn't
+  // re-trigger a full scenario re-activation) is explicitly Task 2's
+  // scope (Section 5's closing paragraph / Task 2's must-deliver list).
+  function handleChatSubmit(event) {
     event.preventDefault();
     if (isThinking) return; // ignore double-submits mid "thinking"
 
-    const query = inputValue;
+    const query = inputValue.trim();
+    if (!query) return;
+
+    appendTurn({ kind: 'user', text: query });
+    setInputValue('');
+
+    const matched = matchScenario(query);
+
+    // Real work (map mount / camera fly-in) starts immediately, running
+    // CONCURRENTLY with the fake processing cascade below — not gated
+    // behind it (Section 6).
+    setActiveScenario(matched);
+
+    const lines = buildProcessingLines(matched);
+    appendTurn({ kind: 'processing', lines });
     setIsThinking(true);
 
-    // Fake AI processing delay — the actual match is instant, but a
-    // real lookup happening in 0ms wouldn't sell the "AI interpreting
-    // your scenario" moment the demo is going for.
-    window.setTimeout(() => {
-      const matched = matchScenario(query);
-      setActiveScenario(matched);
+    if (pendingResponseTimeoutRef.current) {
+      window.clearTimeout(pendingResponseTimeoutRef.current);
+    }
+    // Timed to line up with how long the cascade visibly takes to
+    // finish printing its lines (see ProcessingTurn in ChatMessage.jsx),
+    // plus a small settle buffer.
+    pendingResponseTimeoutRef.current = window.setTimeout(() => {
+      const t0MapState = getMergedStateForIndex(matched, 0);
+      const t0CausalFactors = getCausalFactorsForIndex(matched, 0);
+      const content = buildAnalystContent(matched, t0MapState, false, t0CausalFactors);
+      appendTurn({ kind: 'activation-response', content });
       setIsThinking(false);
-    }, randomThinkingDelay());
+    }, estimateProcessingDurationMs(lines) + RESPONSE_APPEND_BUFFER_MS);
   }
 
-  function handlePresetClick(scenarioId) {
-    // Preset chips are a known, direct scenario reference — no need to
-    // run them through the matcher or fake a thinking delay.
-    const matched = getScenarioById(scenarioId);
-    setActiveScenario(matched);
-    setInputValue('');
-  }
-
-  // Task 7, point 4: scrubbing the timeline while an intervention is
-  // applied automatically clears `interventionApplied` — treated as
-  // "stepping back into the unmitigated timeline." Chosen over dimming
-  // the scrubber and ignoring input, since a single choke point here
-  // (every drag/click/keyboard/autoplay path in TimelineScrubber routes
-  // through onIndexChange) is simpler to get right than disabling an
-  // interactive control mid-gesture.
+  // Task 1 keeps TimelineScrubber fully interactive (unchanged from
+  // before) — whether it becomes read-only once chat drives advancement
+  // is Task 2's explicitly-flagged judgment call (Section 3), not
+  // resolved here.
   function handleTimelineIndexChange(nextIndex) {
-    if (interventionApplied) setInterventionApplied(false);
     setCurrentKeyframeIndex(nextIndex);
   }
 
-  // Task 7, point 5: no revert affordance — once applied, the button is
-  // simply disabled (see ComparisonPanel) until a scenario switch or
-  // timeline scrub resets it. Simpler than adding a secondary "Reset"
-  // link, and those two existing reset paths already cover "I want to see
-  // the baseline again" without a redundant third control.
-  function handleApplyIntervention() {
-    if (interventionApplied) return;
-    setInterventionApplied(true);
-  }
+  const isActivated = Boolean(activeScenario);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-canvas text-ink">
+      {/* Header, chat panel, and the timeline slot below are ALWAYS
+          rendered — only the map viewport itself switches between its
+          idle (pre-activation) and active look. */}
       <header className="shrink-0 border-b border-hairline bg-canvas">
         <TopNav />
       </header>
 
       <main className="flex min-h-0 flex-1 flex-col xl:flex-row">
-        {/* LEFT: map (hero element) + timeline scrubber pinned beneath it */}
+        {/* LEFT: map viewport (hero element) + timeline strip pinned beneath it */}
         <section className="flex min-h-0 flex-1 flex-col border-hairline xl:w-[65%] xl:flex-none xl:border-r">
-          <div className="relative min-h-[320px] flex-1">
-            {/*
-              TEMPORARY BRIDGE (Task 8b): MapLibreView (real 3D MapLibre
-              GL JS map) is wired up for the security-attack scenario
-              ONLY, as a proof of concept. Every other scenario
-              (earthquake/flood/generic-fallback) still renders through
-              the original SVG MapView, untouched. Both components share
-              the exact same `scenario` prop shape (mapViewScenario, with
-              baseline already swapped for the active timeline/
-              intervention state), so this condition is the only thing
-              that needs to change once MapLibreView is proven out for
-              the remaining scenarios — see PROJECT_CONTEXT.md Section 8
-              for the full migration plan.
-            */}
-            {activeScenario.id === 'security-attack' ? (
+          <div className="relative min-h-[320px] flex-1 bg-canvas">
+            {!isActivated ? (
+              // Idle map viewport (Section 4): full-black canvas, no map
+              // mounted, brand text centered within the viewport only —
+              // header/chat/timeline stay visible around it.
+              <div className="absolute inset-0 flex items-center justify-center">
+                <p className="text-2xl uppercase tracking-[0.5em] text-ink-dim/70">Foreseen</p>
+              </div>
+            ) : activeScenario.id === 'security-attack' ? (
               <>
+                {/*
+                  TEMPORARY BRIDGE: MapLibreView (real 3D MapLibre GL JS
+                  map) is wired up for the security-attack scenario ONLY.
+                  Every other scenario still renders through the legacy
+                  SVG MapView, untouched — unrelated to this task's chat
+                  redesign.
+                */}
                 <MapLibreView
                   scenario={mapViewScenario}
                   timelineIndex={currentKeyframeIndex}
                   sheltersVisible={sheltersVisible}
                 />
-                <MapToolbar
-                  sheltersVisible={sheltersVisible}
-                  onToggleShelters={setSheltersVisible}
-                />
+                <MapToolbar sheltersVisible={sheltersVisible} onToggleShelters={setSheltersVisible} />
               </>
             ) : (
               <MapView scenario={mapViewScenario} />
@@ -277,9 +231,18 @@ export function CommandShell() {
             {isThinking && (
               <div className="absolute inset-0 z-20 flex items-center justify-center bg-canvas/70 backdrop-blur-sm">
                 <div className="flex flex-col items-center gap-3">
-                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
+                  {/* A simple pulsing building silhouette, so the map
+                      viewport reads as "actively building the scene"
+                      rather than just a spinner. */}
+                  <svg viewBox="0 0 64 48" width="56" height="42" className="animate-pulse text-accent/70" fill="none">
+                    <rect x="6" y="20" width="12" height="24" fill="currentColor" opacity="0.5" />
+                    <rect x="22" y="10" width="12" height="34" fill="currentColor" opacity="0.75" />
+                    <rect x="38" y="26" width="10" height="18" fill="currentColor" opacity="0.4" />
+                    <rect x="50" y="16" width="10" height="28" fill="currentColor" opacity="0.6" />
+                  </svg>
+                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
                   <p className="animate-pulse text-[11px] uppercase tracking-[0.32em] text-accent">
-                    AI interpreting scenario…
+                    Compiling threat picture…
                   </p>
                 </div>
               </div>
@@ -287,88 +250,42 @@ export function CommandShell() {
           </div>
 
           <div className="shrink-0 px-4 py-3">
-            <TimelineScrubber
-              keyframes={activeScenario.timeline}
-              currentIndex={currentKeyframeIndex}
-              onIndexChange={handleTimelineIndexChange}
-              isPlaying={isPlaying}
-              onPlayToggle={setIsPlaying}
-              statusText={timelineStatusText}
-            />
+            {isActivated ? (
+              <TimelineScrubber
+                keyframes={activeScenario.timeline}
+                currentIndex={currentKeyframeIndex}
+                onIndexChange={handleTimelineIndexChange}
+                isPlaying={isPlaying}
+                onPlayToggle={setIsPlaying}
+                statusText={timelineStatusText}
+              />
+            ) : (
+              // Same slot/height as the real scrubber so the layout
+              // never shifts on activation — just an inactive label
+              // until a scenario exists to scrub through.
+              <div className="flex h-[52px] items-center text-[10px] uppercase tracking-[0.3em] text-ink-faint">
+                Timeline — awaiting scenario activation
+              </div>
+            )}
           </div>
         </section>
 
-        {/* RIGHT: quick analytics / detailed analytics / scenario chat, each
-            separated by a single hairline divider — no nested card boxes */}
-        <aside className="flex min-h-0 flex-1 flex-col overflow-y-auto xl:w-[35%] xl:flex-none">
-          <div className="shrink-0 border-b border-hairline px-4 py-4">
-            <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Quick analytics</p>
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              {quickStats.map((stat) => (
-                <div key={stat.key} className="rounded-lg bg-surface px-3 py-2.5">
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-ink-dim">{stat.label}</p>
-                  <p className="mt-1 text-xl font-semibold text-ink">{stat.value}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="min-h-0 flex-1 space-y-6 overflow-y-auto border-b border-hairline px-4 py-4">
-            <div>
-              <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Detailed analytics</p>
-              <div className="mt-3">
-                <CausalBreakdown factors={activeCausalFactors} />
-              </div>
-            </div>
-
-            <ComparisonPanel
-              comparisonStats={activeScenario.comparisonStats}
-              interventionApplied={interventionApplied}
-              onApply={handleApplyIntervention}
-            />
-          </div>
-
-          <div className="shrink-0 border-t border-hairline px-4 py-4">
-            <div className="flex flex-wrap gap-1">
-              {scenarioPresets.map((preset) => (
-                <button
-                  key={preset.name}
-                  type="button"
-                  onClick={() => handlePresetClick(preset.scenarioId)}
-                  className={`rounded-md px-2 py-1 text-[10px] uppercase tracking-[0.24em] transition hover:bg-surface ${
-                    PRESET_TEXT_CLASS[preset.severity] || 'text-ink-dim'
-                  }`}
-                >
-                  {preset.name}
-                </button>
-              ))}
-            </div>
-
-            <label htmlFor="scenario" className="mt-3 block text-[10px] uppercase tracking-[0.3em] text-ink-dim">
-              Scenario input
-            </label>
-            <form
-              onSubmit={handleScenarioSubmit}
-              className="mt-2 flex items-center gap-2 border-b border-hairline pb-2"
-            >
-              {isThinking ? (
-                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
-              ) : (
-                <span className="text-accent">›</span>
-              )}
-              <input
-                id="scenario"
-                type="text"
-                value={inputValue}
-                onChange={(event) => setInputValue(event.target.value)}
-                disabled={isThinking}
-                placeholder="e.g. high-severity hostile attack in Central Delhi"
-                className="w-full border-0 bg-transparent font-mono text-sm text-ink outline-none placeholder:text-ink-faint disabled:opacity-60"
-              />
-            </form>
-          </div>
-        </aside>
+        {/* RIGHT: the chat — the ONLY control surface (Section 1),
+            always visible, input pinned in place regardless of
+            activation state. */}
+        <ChatPanel
+          turns={chatTurns}
+          inputValue={inputValue}
+          onInputChange={setInputValue}
+          onSubmit={handleChatSubmit}
+          isThinking={isThinking}
+          placeholder={
+            isActivated ? 'e.g. next, or describe a new scenario' : 'e.g. high-severity hostile attack in Central Delhi'
+          }
+        />
       </main>
     </div>
   );
 }
+
+export default CommandShell;

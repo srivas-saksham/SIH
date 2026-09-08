@@ -546,8 +546,8 @@
     "infrastructure": 45
   },
   "comparisonStats": {
-    "evacTimeBefore": 46,
-    "evacTimeAfter": 27,
+    "evacTimeBefore": 15,
+    "evacTimeAfter": 9,
     "overloadBefore": 91,
     "overloadAfter": 58,
     "riskZonesBefore": 5,
