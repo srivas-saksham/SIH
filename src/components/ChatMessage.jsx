@@ -48,20 +48,23 @@ function StatBlock({ stats }) {
 
 /** Causal-factor bars that visibly fill from 0 to their real value on
  * mount, so this reads as "the system is computing this now" rather
- * than a static pre-filled chart. */
-function CausalFactors({ factors }) {
-  const [animateIn, setAnimateIn] = useState(false);
+ * than a static pre-filled chart. Exported: also used as the fixed
+ * "Quick Analytics" block pinned above the chat panel (ChatPanel.jsx) —
+ * no longer rendered inline inside individual chat turns (see note
+ * below), so this is now the ONE place these bars render. */
+export function CausalFactors({ factors, animate = true }) {
+  const [animateIn, setAnimateIn] = useState(!animate);
 
   useEffect(() => {
+    if (!animate) return undefined;
     const id = window.setTimeout(() => setAnimateIn(true), BAR_ANIMATE_DELAY_MS);
     return () => window.clearTimeout(id);
-  }, []);
+  }, [animate]);
 
   if (!factors) return null;
 
   return (
-    <div className="mt-4 space-y-2 animate-[fadeIn_0.35s_ease-out_forwards]">
-      <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Why this area is at risk</p>
+    <div className="space-y-2">
       {CAUSAL_FACTORS.map(({ key, label }, index) => {
         const target = Math.max(0, Math.min(100, factors?.[key] ?? 0));
         const value = animateIn ? target : 0;
@@ -93,6 +96,33 @@ function CausalFactors({ factors }) {
   );
 }
 
+/** Skeleton placeholder for the "Quick Analytics" bars, shown while
+ * `isThinking` spans a scenario activation or a timeline advance
+ * (ChatPanel.jsx) — so the panel visibly "processes" instead of
+ * snapping to its final values before the response has even landed.
+ * Mirrors CausalFactors' exact row layout (same label column width,
+ * same bar height) so nothing shifts when the real bars swap in, with
+ * each row's shimmer bar set to a different resting width purely for
+ * visual variety, not real data. */
+export function CausalFactorsSkeleton() {
+  const widths = [62, 40, 78, 50];
+  return (
+    <div className="space-y-2" aria-hidden="true">
+      {CAUSAL_FACTORS.map(({ key, label }, index) => (
+        <div key={key} className="flex items-center gap-3">
+          <span className="w-[110px] shrink-0 text-xs text-slate-500">{label}</span>
+          <div className="relative h-4 flex-1 overflow-hidden rounded-full bg-slate-700/30">
+            <div
+              className="h-full animate-pulse rounded-full bg-slate-600/50"
+              style={{ width: `${widths[index % widths.length]}%`, animationDelay: `${index * 120}ms` }}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Compact roads/shelters chip lists are no longer rendered inline by
  * default on every activation/briefing turn (per explicit follow-up:
  * that repetition was the whole complaint) — they're only shown via
@@ -100,18 +130,13 @@ function CausalFactors({ factors }) {
  * quick-action buttons or a typed query.
  */
 
-/** The "why this area is at risk" narrative — a real sentence or two
- * that names the dominant causal factor(s) and ties them to the
- * scenario's attack timing/phase, replacing the old static caption that
- * sat above the bars unchanged every keyframe. Rendered right below the
- * bars (per explicit follow-up: evac time / overload / risk zones /
- * shelters, THEN this, every single time). */
-function WhyAtRiskNarrative({ text }) {
-  if (!text) return null;
-  return (
-    <p className="mt-2 text-xs leading-relaxed text-ink-dim animate-[fadeIn_0.35s_ease-out_forwards]">{text}</p>
-  );
-}
+// NOTE: the "why this area is at risk" narrative used to render here,
+// inline under the causal bars on every activation/briefing turn. It's
+// now a FIXED section pinned above the whole chat panel (ChatPanel.jsx),
+// sourced directly from CommandShell's current keyframe rather than
+// per-turn content, so it stays correct across scrubber drags too —
+// not just chat-driven advances. Removed from here to avoid showing it
+// twice.
 
 const ROAD_FILTERS = [
   { key: 'all', label: 'All' },
@@ -345,8 +370,6 @@ function ActivationResponseTurn({ content, onReveal, nextLabel, onAdvance, onQue
     <div className="border-b border-hairline pb-4">
       <TypewriterHeadline text={content.headline} onReveal={onReveal} onDone={() => setHeadlineDone(true)} />
       {phase >= 1 && <StatBlock stats={content.stats} />}
-      {phase >= 1 && <WhyAtRiskNarrative text={content.whyAtRisk} />}
-      {phase >= 4 && <CausalFactors factors={content.causalFactors} />}
       {phase >= 4 && <QuickActionButtons onQueryRoads={onQueryRoads} onQueryShelters={onQueryShelters} />}
       {phase >= 4 && <NextStepButton nextLabel={nextLabel} onAdvance={onAdvance} />}
     </div>
@@ -376,8 +399,6 @@ function TimelineBriefingTurn({ content, onReveal, nextLabel, onAdvance, isFinal
     <div className="border-b border-hairline pb-4">
       <p className="text-sm leading-relaxed text-ink">{content.headline}</p>
       {phase >= 1 && <StatBlock stats={content.stats} />}
-      {phase >= 1 && <WhyAtRiskNarrative text={content.whyAtRisk} />}
-      {phase >= 4 && <CausalFactors factors={content.causalFactors} />}
       {phase >= 4 && <QuickActionButtons onQueryRoads={onQueryRoads} onQueryShelters={onQueryShelters} />}
       {phase >= 4 && isFinal && (
         <p className="mt-4 text-[11px] uppercase tracking-[0.22em] text-ink-dim">

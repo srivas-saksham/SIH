@@ -158,6 +158,20 @@ export function CommandShell() {
     return describeDelta(prevState, mergedMapState);
   }, [activeScenario, currentKeyframeIndex, mergedMapState]);
 
+  // Fixed "Quick Analytics" panel (pinned above the chat history, not a
+  // per-turn element): the causal-factors object for whatever keyframe
+  // is currently on screen, derived straight from
+  // activeScenario/currentKeyframeIndex — same source
+  // ActivationResponseTurn/TimelineBriefingTurn used before these bars
+  // were pulled out of chat turns — so it updates on EVERY keyframe
+  // change, including a direct TimelineScrubber drag, not only
+  // chat-driven "next" turns.
+  const currentKeyframe = activeScenario?.timeline?.[currentKeyframeIndex];
+  const currentCausalFactors = useMemo(
+    () => (activeScenario ? getCausalFactorsForIndex(activeScenario, currentKeyframeIndex) : null),
+    [activeScenario, currentKeyframeIndex],
+  );
+
   const appendTurn = useCallback(
     (turn) => {
       setChatTurns((prev) => [...prev, { id: nextTurnId(), ...turn }]);
@@ -478,6 +492,8 @@ export function CommandShell() {
           onQueryRoads={handleQueryRoads}
           onQueryShelters={handleQueryShelters}
           scrollNonce={scrollNonce}
+          causalFactors={isActivated ? currentCausalFactors : null}
+          keyframeLabel={currentKeyframe?.label}
           placeholder={
             isActivated ? 'e.g. next, or describe a new scenario' : 'e.g. high-severity hostile attack in Central Delhi'
           }
