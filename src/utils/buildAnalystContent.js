@@ -515,6 +515,79 @@ export function buildInterventionResponseContent(scenario, percent) {
   };
 }
 
+/**
+ * Content bundle for the 'capacity-boost-response' chat turn (Task 3's
+ * dedicated "what if shelter size increased by X%" branch — distinct
+ * from `buildInterventionResponseContent` above, which replays a single
+ * fixed hand-authored outcome). Everything here is computed LIVE off
+ * `boostedState` (the actual post-boost merged state, from
+ * shelterCapacityBoost.js's applyShelterCapacityBoost) rather than a
+ * pre-written before/after pair, so a 30% ask and a 60% ask produce
+ * genuinely different numbers.
+ *
+ * `shelterRoster` is the "very good looking… list of all the shelters"
+ * the person explicitly asked for: every METRO_SHELTERS entry (the
+ * real, named 5-shelter roster used elsewhere for the map cards),
+ * correlated against the boosted JSON shelters (`s1..s4`) by nearest-
+ * distance match so each named shelter gets a live capacity/occupancy/
+ * headroom figure instead of just a name+distance. There is no shared
+ * id between the two rosters (METRO_SHELTERS is named real-world
+ * stations; boostedState.shelters is the small s1..s4 numeric model),
+ * so each METRO_SHELTERS entry is paired with the nearest s-id shelter
+ * by geographic distance — close enough for this model's purposes,
+ * and it means every visible shelter card gets a real, boosted number
+ * rather than leaving most of the roster without one.
+ */
+export function buildCapacityBoostResponseContent(scenario, boostedState, percent) {
+  const impactPoint = resolveImpactPoint(scenario);
+  const boostedShelters = boostedState?.shelters || [];
+
+  const shelterRoster = buildSheltersInRange(scenario, METRO_SHELTERS.length).map((namedShelter) => {
+    const nearestNumeric = [...boostedShelters]
+      .map((s) => ({ ...s, pairDistanceKm: haversineDistanceKm(namedShelter, s) }))
+      .sort((a, b) => a.pairDistanceKm - b.pairDistanceKm)[0];
+
+    const capacity = nearestNumeric?.capacity ?? null;
+    const occupancy = nearestNumeric?.occupancy ?? null;
+    const headroom = capacity != null && occupancy != null ? Math.max(0, capacity - occupancy) : null;
+    const fillPercent = capacity ? Math.round((occupancy / capacity) * 100) : null;
+
+    return {
+      id: namedShelter.id,
+      name: namedShelter.name,
+      distanceKm: Number(namedShelter.distanceKm.toFixed(2)),
+      structuralRating: namedShelter.metadata?.structuralRating || null,
+      capacity,
+      occupancy,
+      headroom,
+      fillPercent,
+    };
+  });
+
+  const { totalCapacity, totalOccupancy, overloadPercent } = aggregateShelterLoad(boostedShelters);
+  const causalFactors = computeCausalFactors(boostedState);
+  const riskZones = countActiveRiskZones(boostedState?.buildings);
+
+  const headline =
+    `What-if applied: every shelter's rated capacity increased by ${percent}% more — impact radii are unchanged, ` +
+    `only shelter capacity moves. Network-wide overload eases to ${overloadPercent}% of the new, larger capacity ` +
+    `(${totalOccupancy.toLocaleString()} of ${totalCapacity.toLocaleString()} spaces filled).`;
+
+  return {
+    headline,
+    percent,
+    impactPoint,
+    stats: [
+      { label: 'Overload', value: `${overloadPercent}%` },
+      { label: 'Shelter deficit', value: `${causalFactors.shelterDeficit}%` },
+      { label: 'Infrastructure', value: `${causalFactors.infrastructure}%` },
+      { label: 'Risk zones', value: `${riskZones}` },
+    ],
+    causalFactors,
+    shelterRoster,
+  };
+}
+
 export function buildTimelineBriefingContent(
   scenario,
   prevState,

@@ -171,4 +171,92 @@ export function isClearChatCommand(rawInput) {
   return normalize(rawInput) === 'cls';
 }
 
+/**
+ * "reset" (typed alone, plus a couple of natural variants — "reset
+ * scene", "reset the scene", "restart scene") — a second small
+ * terminal-style meta-command, checked right alongside isClearChatCommand
+ * before every other intent in the dispatcher. Deliberately narrow/exact
+ * rather than fuzzy like the intent parsers below: this is a
+ * destructive action (wipes timeline progress + intervention state), so
+ * it should only fire on an unambiguous, deliberately-typed command, not
+ * on some incidental sentence that happens to contain the word "reset".
+ *
+ * Distinct from isClearChatCommand: "cls" only clears the chat log ("a
+ * typing convenience", per that function's own comment) and touches
+ * nothing about the active scenario/timeline/intervention state at all.
+ * "reset" is the opposite — it explicitly KEEPS the scenario active
+ * (the attack itself stays live) and only rewinds the scene's progress
+ * back to T+0 with the intervention/capacity-boost cleared; it
+ * deliberately does NOT also clear the chat log, since the person may
+ * want to keep reading back through what they'd already tried.
+ */
+export function isResetSceneCommand(rawInput) {
+  if (!rawInput) return false;
+  const normalized = normalize(rawInput);
+  return normalized === 'reset'
+    || normalized === 'reset scene'
+    || normalized === 'reset the scene'
+    || normalized === 'restart scene'
+    || normalized === 'restart the scene';
+}
+
+/**
+ * "What if shelter size/capacity increased by X%" — Task 3's dedicated
+ * capacity-boost "what if" branch. Deliberately a SEPARATE intent from
+ * parseInterventionIntent above: the intervention command swaps in the
+ * scenario's single hand-authored `intervention` state (a fixed,
+ * pre-written outcome), while this one runs a live, percent-driven
+ * transform (see shelterCapacityBoost.js) off WHATEVER shelter state is
+ * currently on screen — a genuinely different mechanism, not just
+ * different copy, so it needs its own detection.
+ *
+ * Broad on phrasing per the same "fuzzy/synonym" requirement as every
+ * other intent parser in this file: "shelter size" / "shelter capacity"
+ * / "shelter capacities" are all accepted (people conflate "size" and
+ * "capacity" when talking about shelters), paired with either an
+ * increase-flavored verb ("increase", "increased", "increases",
+ * "boost", "grow", "expand", "raise", "bump up") or the word "what if"
+ * on its own right next to a shelter mention. The percentage is a
+ * variable X — pulled from the first number in the text, with or
+ * without a trailing "%"/"percent", same extraction approach as
+ * parseInterventionIntent. Unlike that function, a genuinely missing
+ * number here still needs a sensible default (people will absolutely
+ * type "what if shelter capacity increased" with no number at all), so
+ * it falls back to a documented default rather than silently refusing —
+ * consistent with the rest of this file's "never block on unparseable
+ * input" philosophy.
+ *
+ * Checked BEFORE parseInterventionIntent in the dispatcher (see
+ * CommandShell.jsx) since both can match text containing "shelter
+ * capacity" — a "what if"/"increase(d) by" framing should always win
+ * over the fixed-intervention path when both are present, since it's
+ * the more specific ask.
+ *
+ * @param {string} rawInput
+ * @returns {{type:'capacity-boost', percent:number}|null}
+ */
+const SHELTER_SIZE_WORDS = /\b(shelters?\s*(size|capacit(y|ies))|shelter)\b/;
+const INCREASE_VERB_WORDS =
+  /\b(increase(d|s)?|grow(s|n)?|expand(ed|s)?|boost(ed|s)?|raise(d|s)?|bump(ed)?\s*up|scale(d)?\s*up|bigger|larger|more\s+capacity)\b/;
+const WHAT_IF_WORDS = /\bwhat\s*if\b/;
+const DEFAULT_CAPACITY_BOOST_PERCENT = 30;
+
+export function parseCapacityBoostIntent(rawInput) {
+  if (!rawInput) return null;
+  const normalized = normalize(rawInput);
+  if (!normalized) return null;
+
+  const mentionsShelterSize = SHELTER_SIZE_WORDS.test(normalized);
+  if (!mentionsShelterSize) return null;
+
+  const hasIncreaseFraming = INCREASE_VERB_WORDS.test(normalized) || WHAT_IF_WORDS.test(normalized);
+  if (!hasIncreaseFraming) return null;
+
+  const numberMatch = /(\d{1,4})\s*(percent|pct|%)?/.exec(normalized);
+  const parsed = numberMatch ? Number.parseInt(numberMatch[1], 10) : NaN;
+  const percent = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 500) : DEFAULT_CAPACITY_BOOST_PERCENT;
+
+  return { type: 'capacity-boost', percent };
+}
+
 export default parseTimelineIntent;

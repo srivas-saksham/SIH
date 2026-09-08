@@ -276,6 +276,81 @@ const SHELTER_CARD_ICON_SIZE_EXPR = [
 const SHELTER_CARD_ICON_OFFSET = [0, -4];
 
 // ---------------------------------------------------------------------
+// Task 3 follow-up: a SECOND, separate floating label — the capacity-
+// boost badge — stacked directly above each shelter's own status card,
+// per explicit request ("it should be two floating labels... right
+// above the label itself"). This is deliberately its own small
+// canvas -> map.addImage -> symbol-layer icon (same proven pattern as
+// the shelter card and the landmark/road pills), NOT a second row baked
+// into renderShelterCardCanvas — a genuinely separate floating element
+// stacked above the card, matching what was asked for literally.
+//
+// Sizing/placement is tuned by eye, same honesty standard as every
+// other "looks right at this scene's zoom range" constant in this file
+// (see SHELTER_CARD_ICON_SIZE_EXPR's own comment): shelter cards are a
+// variable height (renderShelterCardCanvas derives it from wrapped
+// content, up to roughly ~165 CSS px at this card's current max
+// content — 2-line name + boost row + badge/distance row + bar +
+// status line + 5-line note), so CAPACITY_BADGE_ICON_OFFSET is set
+// clear of that realistic maximum plus a small gap, rather than
+// computed exactly per-shelter from each card's real measured height.
+// A shelter with an unusually short note will show a slightly larger
+// gap between its card and badge — an accepted cosmetic imprecision,
+// not a positioning bug, consistent with this file's other
+// "approximation, not a true 3D anchor" notes (see
+// SHELTER_CARD_ICON_OFFSET's own comment for the same tradeoff).
+// Reuses SHELTER_CARD_ICON_SIZE_EXPR (the card's own zoom curve, not a
+// new one) so the badge scales in lockstep with the card it sits above
+// instead of drifting apart at different zoom levels.
+const CAPACITY_BADGE_CSS_WIDTH = 168;
+const CAPACITY_BADGE_CSS_HEIGHT = 30;
+const CAPACITY_BADGE_PIXEL_RATIO = 3;
+const CAPACITY_BADGE_ICON_OFFSET = [0, -186];
+// Emerald — same "things got better" tone already used for this exact
+// message inside the card (see renderShelterCardCanvas's own boost-row
+// fillStyle), kept consistent between the two now-separate elements.
+const CAPACITY_BADGE_HEX = '#34d399';
+
+/**
+ * Draws the standalone "▲ +X% Capacity" pill shown above a shelter's
+ * card while a Task 3 capacity-boost what-if is active. Same rounded-
+ * pill construction as renderLabelPillCanvas (dark translucent fill,
+ * colored border, centered text) but simpler — a single line, no
+ * status dot, no distance line — since this is purely an annotation on
+ * top of the card below it, not a standalone label needing its own
+ * identity marker.
+ */
+function renderCapacityBadgeCanvas(percent) {
+  const w = CAPACITY_BADGE_CSS_WIDTH;
+  const h = CAPACITY_BADGE_CSS_HEIGHT;
+  const ratio = CAPACITY_BADGE_PIXEL_RATIO;
+  const canvas = document.createElement('canvas');
+  canvas.width = w * ratio;
+  canvas.height = h * ratio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(ratio, ratio);
+  ctx.clearRect(0, 0, w, h);
+
+  const radius = h / 2;
+  ctx.beginPath();
+  drawRoundedRectPath(ctx, 0, 0, w, h, radius);
+  ctx.fillStyle = 'rgba(6, 30, 24, 0.9)';
+  ctx.fill();
+  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = CAPACITY_BADGE_HEX;
+  ctx.stroke();
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '700 12px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = CAPACITY_BADGE_HEX;
+  ctx.fillText(`\u25b2 Capacity +${percent}%`, w / 2, h / 2 + 1);
+  ctx.textAlign = 'left'; // reset — every other canvas function in this file assumes the default alignment
+
+  return canvas;
+}
+
+// ---------------------------------------------------------------------
 // Landmark / road labels — the SAME proven canvas -> map.addImage ->
 // symbol-layer `icon-image` pattern the shelter cards use (see the
 // SHELTER_CARD_* block above for the full reasoning on why a symbol
@@ -559,13 +634,14 @@ function drawRoundedRectPath(ctx, x, y, width, height, r) {
  * Returns the canvas, which the caller registers/updates via
  * map.addImage / map.updateImage.
  */
-function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, fillPercent, statusHex }) {
+function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, fillPercent, statusHex, capacityBoostPercent = null }) {
   const w = SHELTER_CARD_CSS_WIDTH;
   const ratio = SHELTER_CARD_PIXEL_RATIO;
   const padX = 10;
   const tailH = 8;
   const radius = 10;
   const bottomPad = 10;
+  const hasBoost = typeof capacityBoostPercent === 'number' && capacityBoostPercent > 0;
 
   // --- measurement pass (font metrics only depend on the font string,
   // not the canvas's pixel size, so this scratch context can safely
@@ -584,6 +660,11 @@ function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, f
   let y = 18;
   y += nameLines.length * 14;
   y += 2; // gap after name
+  // Task 3: an extra row above the badge/distance row when a capacity
+  // boost is active ("+X% capacity" banner) — added to the measurement
+  // pass first so the card's own computed height accounts for it,
+  // exactly like every other row here.
+  if (hasBoost) y += 13;
   y += 14; // badge + distance row
   y += 5 + 13; // progress bar + gap
   y += 13; // status line
@@ -627,6 +708,20 @@ function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, f
     y += 14;
   });
   y += 2;
+
+  // --- capacity-boost banner (Task 3): "Capacity increased by X% more"
+  // — only drawn while a what-if capacity boost is active, in the same
+  // emerald tone used elsewhere in this app for "things got better"
+  // states (see SHELTER_STATUS_HEX's own green, and
+  // InterventionResponseTurn's badge in ChatMessage.jsx), so it reads
+  // consistently as a positive, non-alarm annotation distinct from the
+  // status-colored border/tail.
+  if (hasBoost) {
+    ctx.font = '700 9px system-ui, -apple-system, sans-serif';
+    ctx.fillStyle = '#34d399';
+    ctx.fillText(`▲ Capacity increased by ${capacityBoostPercent}% more`, padX, y);
+    y += 13;
+  }
 
   // --- structural badge + distance ---
   const badgeLabel = shelter.metadata.structuralRating.replace('-', ' ').toUpperCase();
@@ -1053,7 +1148,13 @@ function queryBoxAround(point) {
   ];
 }
 
-export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false, flyToTarget = null }) {
+export function MapLibreView({
+  scenario,
+  timelineIndex,
+  sheltersVisible = false,
+  flyToTarget = null,
+  capacityBoostPercent = null,
+}) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const loadedRef = useRef(false);
@@ -1065,6 +1166,15 @@ export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false,
   // to that callback. Kept in sync on every render (see below).
   const sheltersVisibleRef = useRef(sheltersVisible);
   sheltersVisibleRef.current = sheltersVisible;
+
+  // Task 3's capacity-boost "what if" branch: when set, shelter cards
+  // show a reduced fill bar and a "+X% capacity" annotation instead of
+  // their normal timeline-driven occupancy read. Mirrored into a ref for
+  // the same reason as sheltersVisibleRef above — updateShelterStates is
+  // called from several places, including the one-time map.on('load')
+  // setup path, which only has refs available, not fresh props.
+  const capacityBoostPercentRef = useRef(capacityBoostPercent);
+  capacityBoostPercentRef.current = capacityBoostPercent;
 
   // Animation bookkeeping, kept in refs since none of it should trigger
   // React re-renders — it's imperative canvas/map state.
@@ -1678,6 +1788,58 @@ export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false,
             // alignment would.
             'icon-pitch-alignment': 'viewport',
             'icon-rotation-alignment': 'viewport',
+          },
+        });
+        // --- Task 3 follow-up: the standalone capacity-boost badge ---
+        // Same point source shape as shelter-cards above (one Feature
+        // per shelter, all pointing at their own registered image id),
+        // but its own separate source/layer so it can be shown/hidden
+        // independently — it should only ever be visible while a
+        // capacity-boost what-if is actually active (see
+        // applyCapacityBadges below), unlike the card itself which is
+        // gated purely by the shelters toolbar toggle.
+        const capacityBadgeImageId = (shelter) => `shelter-capacity-badge-${shelter.id}`;
+        METRO_SHELTERS.forEach((shelter) => {
+          // Placeholder text/percent doesn't matter here — the layer
+          // starts hidden (see 'none' below) and applyCapacityBadges
+          // re-renders the real percent into every image the first
+          // time a boost actually goes active.
+          const placeholderBadge = renderCapacityBadgeCanvas(0);
+          upsertShelterCardImage(map, capacityBadgeImageId(shelter), placeholderBadge);
+        });
+
+        map.addSource('shelter-capacity-badges', {
+          type: 'geojson',
+          data: {
+            type: 'FeatureCollection',
+            features: METRO_SHELTERS.map((shelter) => ({
+              type: 'Feature',
+              geometry: { type: 'Point', coordinates: [shelter.lng, shelter.lat] },
+              properties: { shelterId: shelter.id, icon: capacityBadgeImageId(shelter) },
+            })),
+          },
+        });
+
+        map.addLayer({
+          id: 'shelter-capacity-badges-symbol',
+          source: 'shelter-capacity-badges',
+          type: 'symbol',
+          layout: {
+            'icon-image': ['get', 'icon'],
+            'icon-anchor': 'bottom',
+            'icon-allow-overlap': true,
+            'icon-ignore-placement': true,
+            // Same zoom curve as the card itself (see
+            // CAPACITY_BADGE_ICON_OFFSET's doc comment above) so the two
+            // stay visually locked together as the camera zooms.
+            'icon-size': SHELTER_CARD_ICON_SIZE_EXPR,
+            'icon-offset': CAPACITY_BADGE_ICON_OFFSET,
+            'icon-pitch-alignment': 'viewport',
+            'icon-rotation-alignment': 'viewport',
+            // Hidden until a capacity-boost what-if is actually applied
+            // — applyCapacityBadges (called from updateShelterStates and
+            // the shelters-visibility effect) flips this to 'visible'.
+            visibility: 'none',
           },
         });
       } catch (err) {
@@ -2471,6 +2633,46 @@ export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false,
         console.error(`Shelter-card update failed for ${shelter.id} — its card may be stale, everything else is unaffected:`, err);
       }
     });
+
+    // Task 3 follow-up: the standalone badge stacked above the card
+    // (see CAPACITY_BADGE_* constants above) — re-rendered here too so
+    // its own text always reflects whatever percent is currently
+    // active, exactly like the card itself does on every
+    // scenario/timelineIndex change.
+    applyCapacityBadges(capacityBoostPercentRef.current);
+  }
+
+  /**
+   * Task 3 follow-up: shows/hides the standalone "▲ +X% Capacity" badge
+   * stacked above every shelter card, and — while active — re-renders
+   * each shelter's badge image with the CURRENT percent (a person can
+   * ask for a different X on a later "what if" without a page reload,
+   * and the badge text needs to track that same live number the card's
+   * own boost row already does).
+   *
+   * Gated by BOTH `percent` (is a boost currently active at all) and
+   * the shelters toolbar toggle (sheltersVisibleRef.current) — a badge
+   * floating above an otherwise-hidden card would look like an orphaned
+   * label with nothing to annotate, so it never shows on its own.
+   */
+  function applyCapacityBadges(percent) {
+    const map = mapRef.current;
+    if (!map || !map.getLayer('shelter-capacity-badges-symbol')) return;
+
+    const active = typeof percent === 'number' && percent > 0 && sheltersVisibleRef.current;
+    map.setLayoutProperty('shelter-capacity-badges-symbol', 'visibility', active ? 'visible' : 'none');
+    if (!active) return;
+
+    METRO_SHELTERS.forEach((shelter) => {
+      try {
+        const imageId = `shelter-capacity-badge-${shelter.id}`;
+        const canvas = renderCapacityBadgeCanvas(percent);
+        upsertShelterCardImage(map, imageId, canvas);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`Capacity-badge update failed for ${shelter.id} — its badge may be stale/missing, everything else is unaffected:`, err);
+      }
+    });
   }
 
   /**
@@ -2499,6 +2701,12 @@ export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false,
     if (map.getLayer('shelter-cards-symbol')) {
       map.setLayoutProperty('shelter-cards-symbol', 'visibility', visibility);
     }
+    // Task 3 follow-up: re-derive the badge's own visibility rather than
+    // just mirroring `visible` directly — the badge additionally
+    // requires an active capacity boost (capacityBoostPercentRef), so
+    // toggling shelters back ON while no boost is active must NOT also
+    // reveal a stale/placeholder badge.
+    applyCapacityBadges(capacityBoostPercentRef.current);
   }
 
   /**

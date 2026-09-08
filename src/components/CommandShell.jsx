@@ -8,8 +8,10 @@ import {
   buildRoadsQueryContent,
   buildSheltersQueryContent,
   buildInterventionResponseContent,
+  buildCapacityBoostResponseContent,
 } from '../utils/buildAnalystContent';
 import { computeCausalFactors } from '../utils/causalFactors';
+import { applyShelterCapacityBoost } from '../utils/shelterCapacityBoost';
 import {
   buildProcessingLines,
   buildTimelineAdvanceLines,
@@ -20,7 +22,9 @@ import {
   parseTimelineIntent,
   parseContentQueryIntent,
   parseInterventionIntent,
+  parseCapacityBoostIntent,
   isClearChatCommand,
+  isResetSceneCommand,
 } from '../utils/timelineIntent';
 import { METRO_SHELTERS } from '../data/delhiMetroShelters';
 import { ChatPanel } from './ChatPanel';
@@ -126,6 +130,17 @@ export function CommandShell() {
   // Task 2 already relied on this state existing for.
   const [interventionApplied, setInterventionApplied] = useState(false);
 
+  // Task 3's dedicated "what if shelter size increased by X%" branch.
+  // null = inactive (normal timeline-driven rendering). A number means
+  // this what-if keyframe is live: shelters visually reflect the boost
+  // (see boostedMapState below) and KeyframeBlurb shows an override
+  // label/text instead of whatever the underlying T+N keyframe says.
+  // Deliberately a SEPARATE flag from interventionApplied — the two
+  // systems never combine (whichever the person asks for last wins;
+  // see handleApplyCapacityBoost/handleApplyIntervention).
+  const [capacityBoostPercent, setCapacityBoostPercent] = useState(null);
+  const pendingCapacityBoostTimeoutRef = useRef(null);
+
   // Map toolbar: shelters default OFF.
   const [sheltersVisible, setSheltersVisible] = useState(false);
 
@@ -149,6 +164,7 @@ export function CommandShell() {
     setIsPlaying(false);
     setSheltersVisible(false);
     setInterventionApplied(false);
+    setCapacityBoostPercent(null);
     lastShelterIdRef.current = null;
   }
 
@@ -157,7 +173,22 @@ export function CommandShell() {
     [activeScenario, currentKeyframeIndex],
   );
 
-  const activeMapState = interventionApplied && activeScenario ? activeScenario.intervention : mergedMapState;
+  const baseMapState = interventionApplied && activeScenario ? activeScenario.intervention : mergedMapState;
+
+  // Task 3: layered on top of whatever base state (timeline-merged or
+  // the fixed intervention state) is currently active — never replaces
+  // the radii/buildings/roads on that state, only rescales `shelters`
+  // (see shelterCapacityBoost.js). useMemo so this recomputes only when
+  // the base state or the percent actually changes, not on every
+  // unrelated re-render (this feeds MapLibreView's shelter-card redraw
+  // effect, so an unstable reference here would redraw cards every
+  // render for no reason).
+  const activeMapState = useMemo(
+    () => (capacityBoostPercent != null && baseMapState
+      ? applyShelterCapacityBoost(baseMapState, capacityBoostPercent)
+      : baseMapState),
+    [baseMapState, capacityBoostPercent],
+  );
 
   // MapView already renders `scenario.baseline` as its data source, so
   // the simplest way to feed it either the time-merged state or the
@@ -368,6 +399,52 @@ export function CommandShell() {
     [activeScenario, interventionApplied, isThinking, appendTurn],
   );
 
+  /**
+   * Task 3's dedicated "what if shelter size increased by X%" branch —
+   * a live, percent-driven recompute (see shelterCapacityBoost.js),
+   * NOT a replay of the fixed hand-authored `intervention` state.
+   * Mirrors handleApplyIntervention's processing-cascade shape (a fake
+   * cascade turn first, the real state flip lands together with the
+   * response turn once it finishes) but the actual math is fresh every
+   * call, so re-typing this with a DIFFERENT percent genuinely
+   * recomputes different numbers, not just replays a cached response —
+   * unlike handleApplyIntervention's "already applied -> just show it
+   * again" shortcut, this always re-runs the cascade+content build for
+   * whatever percent was just typed.
+   *
+   * Explicit requirement: shelters auto-toggle ON if they're currently
+   * off (no-op if already on) — the person should never have to
+   * separately flip the toolbar to see the effect they just asked for.
+   */
+  const handleApplyCapacityBoost = useCallback(
+    (percent) => {
+      if (!activeScenario || isThinking) return;
+
+      setSheltersVisible((current) => (current ? current : true));
+
+      const lines = buildInterventionLines(percent);
+      appendTurn({ kind: 'processing', lines });
+      setIsThinking(true);
+
+      if (pendingCapacityBoostTimeoutRef.current) {
+        window.clearTimeout(pendingCapacityBoostTimeoutRef.current);
+      }
+      pendingCapacityBoostTimeoutRef.current = window.setTimeout(() => {
+        setCapacityBoostPercent(percent);
+        // boostedState computed directly here (not read back off
+        // activeMapState) since the state setter above hasn't
+        // committed/re-rendered yet at this point in the closure —
+        // same base-state precedence as activeMapState itself.
+        const base = interventionApplied && activeScenario ? activeScenario.intervention : mergedMapState;
+        const boostedState = applyShelterCapacityBoost(base, percent);
+        const content = buildCapacityBoostResponseContent(activeScenario, boostedState, percent);
+        appendTurn({ kind: 'capacity-boost-response', content });
+        setIsThinking(false);
+      }, estimateProcessingDurationMs(lines) + RESPONSE_APPEND_BUFFER_MS);
+    },
+    [activeScenario, interventionApplied, mergedMapState, isThinking, appendTurn],
+  );
+
   // Intent dispatcher (Task 2's must-deliver list): runs BEFORE
   // matchScenario. Checks the typed text against the small fixed
   // timeline-advancement vocabulary first; only falls through to
@@ -387,8 +464,46 @@ export function CommandShell() {
     // both state updates into one render) and before every other
     // intent — it's a meta-command, not scenario/timeline content.
     if (isClearChatCommand(query)) {
-      setChatTurns([]);
+      setChatTurns([{ id: nextTurnId(), kind: 'system-notice', text: 'Chat cleared.' }]);
       setInputValue('');
+      bumpScroll();
+      return;
+    }
+
+    // "reset" (new): rewinds the CURRENT scenario's progress back to
+    // T+0, clears the intervention/capacity-boost state, turns the
+    // shelters overlay back off, and — like "cls" — clears the chat
+    // log too. The one thing it deliberately does NOT touch is
+    // `activeScenario` itself: the attack stays live, only its
+    // progress/state resets. Checked here, before the user's own turn
+    // is echoed, for the same reason as "cls" — it's a meta-command,
+    // not scenario/timeline content, and there's nothing useful about
+    // echoing "reset" as if it were a normal chat message.
+    if (isResetSceneCommand(query)) {
+      setInputValue('');
+      if (!activeScenario) {
+        setChatTurns([{ id: nextTurnId(), kind: 'system-notice', text: 'Nothing to reset — no scenario is active yet.' }]);
+        bumpScroll();
+        return;
+      }
+      // Cancel every in-flight processing-cascade timer so a reset
+      // mid-cascade can't have a stale timeout fire afterward and
+      // silently re-apply whatever it was in the middle of doing
+      // (advance/intervention/capacity-boost) on top of the just-reset
+      // state.
+      if (pendingResponseTimeoutRef.current) window.clearTimeout(pendingResponseTimeoutRef.current);
+      if (pendingAdvanceTimeoutRef.current) window.clearTimeout(pendingAdvanceTimeoutRef.current);
+      if (pendingInterventionTimeoutRef.current) window.clearTimeout(pendingInterventionTimeoutRef.current);
+      if (pendingCapacityBoostTimeoutRef.current) window.clearTimeout(pendingCapacityBoostTimeoutRef.current);
+      setIsThinking(false);
+      setCurrentKeyframeIndex(0);
+      setIsPlaying(false);
+      setInterventionApplied(false);
+      setCapacityBoostPercent(null);
+      setSheltersVisible(false);
+      lastShelterIdRef.current = null;
+      setChatTurns([{ id: nextTurnId(), kind: 'system-notice', text: 'Scene reset — back to T+0, intervention cleared, shelters off, attack still active.' }]);
+      bumpScroll();
       return;
     }
 
@@ -407,6 +522,18 @@ export function CommandShell() {
       } else {
         advanceTimeline(timelineIntent.index);
       }
+      return;
+    }
+
+    // "What if shelter capacity increased by X%" (Task 3's dedicated
+    // what-if branch) — checked BEFORE parseInterventionIntent below,
+    // per parseCapacityBoostIntent's own doc comment: both can match
+    // text containing "shelter capacity", and a "what if"/"increase(d)
+    // by" framing should always win over the fixed-intervention path
+    // when both are present, since it's the more specific ask.
+    const capacityBoostIntent = parseCapacityBoostIntent(query);
+    if (capacityBoostIntent && activeScenario) {
+      handleApplyCapacityBoost(capacityBoostIntent.percent);
       return;
     }
 
@@ -524,11 +651,25 @@ export function CommandShell() {
                   timelineIndex={currentKeyframeIndex}
                   sheltersVisible={sheltersVisible}
                   flyToTarget={flyToTarget}
+                  capacityBoostPercent={capacityBoostPercent}
                 />
                 <MapToolbar sheltersVisible={sheltersVisible} onToggleShelters={setSheltersVisible} />
+                {/*
+                  Task 3: a separate keyframe, reachable ONLY via the
+                  what-if chat command — not part of the T+N timeline
+                  (scrubbing/advancing never lands on it, and it's not
+                  in activeScenario.timeline at all). Overrides the
+                  normal per-keyframe label/blurb while active; falls
+                  straight back to the real current keyframe's own
+                  label/blurb the moment capacityBoostPercent is cleared
+                  (scenario switch — see the reset-on-scenario-switch
+                  block above).
+                */}
                 <KeyframeBlurb
-                  label={activeScenario.timeline?.[currentKeyframeIndex]?.label}
-                  text={activeScenario.timeline?.[currentKeyframeIndex]?.blurb}
+                  label={capacityBoostPercent != null ? `Capacity +${capacityBoostPercent}%` : activeScenario.timeline?.[currentKeyframeIndex]?.label}
+                  text={capacityBoostPercent != null
+                    ? `What-if applied: every shelter's rated capacity increased by ${capacityBoostPercent}% more — impact radii unchanged, only shelter capacity moves.`
+                    : activeScenario.timeline?.[currentKeyframeIndex]?.blurb}
                 />
               </>
             ) : (

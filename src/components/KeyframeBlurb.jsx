@@ -14,6 +14,14 @@ const CHAR_DELAY_MS = 12;
  *
  * Pure UI chrome, same reasoning as MapToolbar: absolutely positioned
  * over the map `<div>`, not a maplibregl.Marker or map layer.
+ *
+ * Task 3 addition: `label`/`text` can be overridden by CommandShell to
+ * show a dedicated blurb for the capacity-boost "what if" keyframe
+ * (e.g. "Capacity +30%" / "Every shelter's rated capacity increased by
+ * 30% more…") instead of whatever the underlying T+N keyframe's own
+ * `blurb` says. This is a plain prop override, not a second code path —
+ * CommandShell decides which text to pass down, this component just
+ * types out whatever it's given, exactly as before.
  */
 export function KeyframeBlurb({ label, text }) {
   const [charCount, setCharCount] = useState(0);

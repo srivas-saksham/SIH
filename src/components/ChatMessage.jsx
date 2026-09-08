@@ -265,6 +265,22 @@ function UserTurn({ text }) {
   );
 }
 
+/**
+ * Small centered system-style notice — used for "cls" (chat cleared)
+ * and "reset" (scene reset) meta-commands. Deliberately much quieter
+ * than every other turn kind here (no border-b, no icon row, small
+ * dim/uppercase text): these are terminal-style acknowledgements of a
+ * meta-command, not analyst content, so they shouldn't compete for
+ * attention with the actual briefing turns around them.
+ */
+function SystemNoticeTurn({ text }) {
+  return (
+    <div className="flex justify-center py-1">
+      <p className="font-mono text-[11px] uppercase tracking-[0.2em] text-ink-dim/70">{text}</p>
+    </div>
+  );
+}
+
 /** Processing cascade — visually distinct (monospace/system treatment),
  * reveals one line at a time on a fixed cadence so it reads as live
  * processing rather than a dumped block, and stays a real, permanent
@@ -444,6 +460,74 @@ function InterventionResponseTurn({ content, onReveal, onQueryRoads, onQueryShel
   );
 }
 
+/** Capacity-boost "what if" turn (Task 3's dedicated branch): the
+ * "very good looking" full shelter roster the person explicitly asked
+ * for — name, structural rating, live boosted capacity/occupancy,
+ * remaining headroom, and a per-shelter fill bar, plus the
+ * network-wide stat strip and causal-factor bars, all computed off the
+ * boosted state. Distinct component from SheltersQueryTurn: this one
+ * needs capacity/occupancy/headroom numbers and a persistent "+X%"
+ * badge, which the plain shelters roster has no reason to carry. */
+function CapacityBoostTurn({ content, onReveal, onQueryRoads, onQueryShelters }) {
+  const [headlineDone, setHeadlineDone] = useState(false);
+  const [phase, setPhase] = useState(0); // 1 = stats, 2 = roster, 3 = causal factors
+
+  useEffect(() => {
+    if (!headlineDone || phase >= 3) return undefined;
+    const id = window.setTimeout(() => {
+      setPhase((p) => p + 1);
+      onReveal?.();
+    }, PHASE_STAGGER_MS);
+    return () => window.clearTimeout(id);
+  }, [headlineDone, phase, onReveal]);
+
+  return (
+    <div className="border-b border-hairline pb-4">
+      <TypewriterHeadline text={content.headline} onReveal={onReveal} onDone={() => setHeadlineDone(true)} />
+      {phase >= 1 && <StatBlock stats={content.stats} />}
+      {phase >= 1 && (
+        <p className="mt-3 inline-flex items-center gap-2 border border-emerald-400/40 bg-emerald-400/10 px-3 py-1.5 text-[11px] uppercase tracking-[0.2em] text-emerald-300">
+          Capacity increased by {content.percent}% more
+        </p>
+      )}
+      {phase >= 2 && (
+        <ul className="mt-3 space-y-3 animate-[fadeIn_0.35s_ease-out_forwards]">
+          {content.shelterRoster.map((shelter) => (
+            <li key={shelter.id} className="rounded-md border border-hairline/70 bg-surface/40 p-2.5 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-slate-200">{shelter.name}</span>
+                <span className="shrink-0 font-mono text-[10px] text-ink-dim">{shelter.distanceKm} km away</span>
+              </div>
+              {shelter.structuralRating && (
+                <p className="mt-0.5 text-[10px] uppercase tracking-[0.16em] text-ink-faint">
+                  {shelter.structuralRating.replace('-', ' ')}
+                </p>
+              )}
+              {shelter.capacity != null && (
+                <>
+                  <div className="mt-2 flex items-center justify-between text-[11px] text-ink-dim">
+                    <span>
+                      {shelter.occupancy}/{shelter.capacity} occupied
+                    </span>
+                    <span className="text-emerald-300">{shelter.headroom} free (+{content.percent}%)</span>
+                  </div>
+                  <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                    <div
+                      className="h-full rounded-full bg-emerald-400 transition-all duration-500"
+                      style={{ width: `${Math.min(100, shelter.fillPercent)}%` }}
+                    />
+                  </div>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {phase >= 2 && <QuickActionButtons onQueryRoads={onQueryRoads} onQueryShelters={onQueryShelters} />}
+    </div>
+  );
+}
+
 /** Graceful "didn't understand" turn (Task 2 / Section 5's closing
  * paragraph): shown when typed text matches neither timeline-advancement
  * vocabulary nor any scenario's keywords confidently — instead of
@@ -455,8 +539,9 @@ function ClarifyFallbackTurn() {
         I didn&apos;t quite catch that. Try describing a scenario (e.g. &ldquo;hostile attack in Central
         Delhi&rdquo;), say &ldquo;next&rdquo; / name a checkpoint (e.g. &ldquo;T+15&rdquo;) to advance an active
         timeline, ask for roads/shelters (e.g. &ldquo;blocked roads&rdquo;, &ldquo;shelters in range&rdquo;),
-        apply an intervention (e.g. &ldquo;increase shelter capacity by 20%&rdquo;), or type &ldquo;cls&rdquo;
-        to clear this chat.
+        apply an intervention (e.g. &ldquo;increase shelter capacity by 20%&rdquo;), ask a &ldquo;what
+        if&rdquo; (e.g. &ldquo;what if shelter size increased by 30%&rdquo;), or type &ldquo;cls&rdquo;
+        to clear this chat, or &ldquo;reset&rdquo; to rewind the active scenario back to T+0.
       </p>
     </div>
   );
@@ -466,6 +551,8 @@ export function ChatMessage({ turn, onReveal, onAdvance, onQueryRoads, onQuerySh
   switch (turn.kind) {
     case 'user':
       return <UserTurn text={turn.text} />;
+    case 'system-notice':
+      return <SystemNoticeTurn text={turn.text} />;
     case 'processing':
       return <ProcessingTurn lines={turn.lines} onReveal={onReveal} />;
     case 'activation-response':
@@ -500,6 +587,15 @@ export function ChatMessage({ turn, onReveal, onAdvance, onQueryRoads, onQuerySh
     case 'intervention-response':
       return (
         <InterventionResponseTurn
+          content={turn.content}
+          onReveal={onReveal}
+          onQueryRoads={onQueryRoads}
+          onQueryShelters={onQueryShelters}
+        />
+      );
+    case 'capacity-boost-response':
+      return (
+        <CapacityBoostTurn
           content={turn.content}
           onReveal={onReveal}
           onQueryRoads={onQueryRoads}
