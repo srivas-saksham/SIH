@@ -91,6 +91,104 @@ const BUILDING_RISK_HEX = {
 };
 const BUILDING_DEFAULT_GRAY = '#5a5a62';
 
+// ---------------------------------------------------------------------
+// Road congestion overlay — REVISED per explicit correction: the first
+// pass of this feature styled the fake `roads` array from
+// security-attack.json (hand-invented straight-line coordinates, used
+// only by the legacy SVG MapView.jsx for a rough illustrative sketch).
+// That is NOT acceptable for the MapLibre scene: every road drawn here
+// must be a real OSM road geometry read from the same vector tile
+// source already used for buildings. `state.roads` (the fake array) is
+// no longer read by this component at all — it's left completely alone
+// for MapView.jsx's own SVG rendering, which is a separate, unrelated
+// consumer of that field.
+//
+// This mirrors the buildings pipeline's actual proven shape (see the
+// big BUILDINGS_SOURCE_ID/EXPLODED_BUILDINGS_SOURCE_ID comment block
+// above): read geometry from the real vector tile source, key
+// setFeatureState off the tile's native numeric id (NOT a promoteId
+// property — `osm_id` was already proven not to exist as an emitted
+// building property, and there is no reason to assume `transportation`
+// exposes one either, so this must be empirically checked the same way,
+// not assumed).
+//
+// IMPORTANT — this codebase has no live browser/devtools access from
+// this authoring environment, so steps that require inspecting a
+// running map (confirming the source-layer name, confirming ids are
+// stable, confirming a specific named real road recolors on click) have
+// NOT been empirically verified here and must not be reported as done.
+// See the `window.__debugRoads` helpers wired up below (search for
+// "DEVTOOLS VERIFICATION HELPERS") — run those in your own browser
+// console against the live map and report back what they print before
+// treating this as finished.
+const ROADS_SOURCE_LAYER = 'transportation'; // per MapLibre/OpenMapTiles convention — VERIFY against map.getStyle().sources.openmaptiles / the actual tile schema before trusting this, same as the instruction requires.
+const ROAD_CONGESTION_HEX = {
+  jammed: '#ef4444', // reuses BUILDING_RISK_HEX.red's hue family for visual consistency
+  slow: '#f97316',
+};
+
+// ---------------------------------------------------------------------
+// Automatic road-congestion resolver (pivot away from hand-authored
+// per-id `roadCongestion` JSON entries — see the continuation prompt /
+// PROJECT_CONTEXT.md for the full history of why). Person has no way to
+// hand-pick real road ids via the live map, so instead of relying on
+// security-attack.json's (now permanently empty) `roadCongestion`
+// arrays, real roads near the impact point are classified automatically
+// every tick, using the SAME red/yellow/green radii already driving the
+// building-risk engine and impact-zone circles (resolveActiveRadii).
+// Mirrors resolveBuildingCandidates/applyBuildingRiskForRadii's shape as
+// closely as possible so this is a straightforward sibling system, not
+// a new one-off pattern.
+// ---------------------------------------------------------------------
+
+// Promoted out of the `sampleMajorRoads` devtools closure (it was
+// trapped there for that helper's own filtering) into a real
+// module-level constant, since resolveRoadCandidates below needs the
+// exact same "is this actually a drivable street" filter, not the raw
+// unfiltered dump of every transportation feature (which is
+// overwhelmingly footpaths/service tracks/transit lines — see the
+// devtools findings above).
+const DRIVABLE_CLASSES = new Set([
+  'motorway', 'motorway_link', 'trunk', 'trunk_link',
+  'primary', 'primary_link', 'secondary', 'secondary_link',
+  'tertiary', 'tertiary_link', 'residential', 'unclassified',
+  'living_street',
+]);
+
+// The security-attack timeline's own explicit rule: the attack happens
+// at T+15, not T+0 — nothing before that point should show any road
+// congestion, no matter how small the radii or how close a road
+// happens to sit to the impact point. Gating off the keyframe LABEL
+// (found by name in scenario.timeline, not a hardcoded array index) so
+// this still holds even if keyframes are reordered/added/removed later,
+// and even if radii are edited to something less conservative than
+// today's tiny 0.08/0.16/0.24km T+0 values.
+const ROADS_ACTIVATION_LABEL = 'T+15';
+
+// Kartavya Path (and its former name, Rajpath) — matched by name so the
+// forced-jam override below finds the boulevard's real road segment(s)
+// without depending on any particular tile's feature id.
+const KARTAVYA_PATH_NAME_PATTERN = /kartavya|rajpath/i;
+
+/**
+ * Per-road distance -> congestion classification, deliberately mirroring
+ * classifyBuildingRisk's shape/innermost-wins ordering above. Roads
+ * inside the red radius jam hardest and earliest; roads inside the
+ * (larger) yellow radius are merely 'slow'; anything at or beyond the
+ * green radius is 'none' (fully transparent, matched by the layer's own
+ * opacity fallback). This is intentionally a simple two-tier version of
+ * classifyBuildingRisk (no separate green-band congestion level exists —
+ * a road doesn't have a 3rd degraded state the way a building has a
+ * distinct green risk color) rather than a novel traffic-simulation
+ * model, per the task's explicit "don't overengineer" guidance.
+ *
+ * @returns {'jammed'|'slow'|'none'}
+ */
+function classifyRoadCongestion(distanceKm, radii) {
+  if (distanceKm <= radii.red) return 'jammed';
+  if (distanceKm <= radii.yellow) return 'slow';
+  return 'none';
+}
 // Fallback radii (km) used only if a scenario/keyframe defines no
 // explicit impactPoint/radii at all (research §9's approach assumes
 // these are always present; this is the "smallest reasonable
@@ -336,7 +434,7 @@ function queryBoxAround(point) {
   ];
 }
 
-export function MapLibreView({ scenario }) {
+export function MapLibreView({ scenario, timelineIndex }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const loadedRef = useRef(false);
@@ -376,6 +474,37 @@ export function MapLibreView({ scenario }) {
   // ---------------------------------------------------------------
   const buildingCandidatesRef = useRef([]);
   const buildingBandByKeyRef = useRef({});
+  // roadCongestionByIdRef: last-applied congestion level per real road
+  // id (keyed by whatever id security-attack.json's roadCongestion
+  // entries use), so applyRoadCongestion only calls setFeatureState
+  // when a road's level actually changed, and can detect+reset roads
+  // that dropped out of the current keyframe's list. See
+  // applyRoadCongestion below.
+  const roadCongestionByIdRef = useRef({});
+  // --- Automatic road-congestion resolver bookkeeping (new) ---
+  // roadCandidatesRef: [{ featureTarget, dedupeKey, distanceKm, name },
+  //   ...] for every real drivable-road feature resolved near the
+  //   current impact point — the road equivalent of
+  //   buildingCandidatesRef. Resolved once per impact-point placement /
+  //   session-long idle re-scan (see resolveRoadCandidates), not per
+  //   tick.
+  // roadBandByKeyRef: last-applied automatic congestion level per road
+  //   (keyed by dedupeKey, same throttling shape as
+  //   buildingBandByKeyRef), so the animation loop only calls
+  //   setFeatureState when a road's level actually changed.
+  // kartavyaPathFeatureIdsRef: real road feature ids resolved for
+  //   Kartavya Path specifically (see resolveKartavyaPathFeatures) — set
+  //   to fully jammed unconditionally once the T+15 gate is active,
+  //   overriding whatever the general distance-based pass computed for
+  //   the same id.
+  // manualRoadIdsRef: ids currently present in the scenario/keyframe's
+  //   own (legacy, hand-authored) `roadCongestion` list, if any — kept
+  //   so the automatic pass never overwrites a manually-authored entry
+  //   layered on top of it (see applyRoadCongestion's doc comment).
+  const roadCandidatesRef = useRef([]);
+  const roadBandByKeyRef = useRef({});
+  const kartavyaPathFeatureIdsRef = useRef([]);
+  const manualRoadIdsRef = useRef(new Set());
   // Building-recoloring-never-sticks fix: MapLibre GeoJSON sources only
   // preserve feature-state across setData() for features that KEEP THE
   // SAME id — reassigning fresh sequential ids on every
@@ -789,6 +918,250 @@ export function MapLibreView({ scenario }) {
         });
       });
 
+      // --- 2b. Road congestion overlay — real vector-tile roads ---
+      // Reads directly from BUILDINGS_SOURCE_ID, which already clones
+      // the WHOLE `openmaptiles` vector source (see the addSource call
+      // above) — it is not scoped to the `building` source-layer, so
+      // `transportation` is already available on it with no new source
+      // needed. ROADS_SOURCE_LAYER is asserted here, not proven — run
+      // the devtools helpers below against the live map to confirm it's
+      // actually correct for this style/tileset before trusting it.
+      //
+      // Feature-state driven, exactly like `3d-buildings`: fully
+      // transparent (opacity 0) wherever 'congestion' is unset, so the
+      // base style's own road rendering underneath is untouched until a
+      // real road id gets a real congestion level via setFeatureState
+      // (see applyRoadCongestion below). No GeoJSON explosion / synthetic
+      // ids here yet — only add that (mirroring
+      // EXPLODED_BUILDINGS_SOURCE_ID / buildingIdByDedupeKeyRef) if the
+      // devtools check below shows ids are missing/unstable or that
+      // MultiLineString relations are actually present near the impact
+      // point; don't build it speculatively.
+      map.addLayer(
+        {
+          id: 'roads-congestion-line',
+          source: BUILDINGS_SOURCE_ID,
+          'source-layer': ROADS_SOURCE_LAYER,
+          type: 'line',
+          layout: { 'line-cap': 'round', 'line-join': 'round' },
+          paint: {
+            'line-color': [
+              'match', ['feature-state', 'congestion'],
+              'jammed', ROAD_CONGESTION_HEX.jammed,
+              'slow', ROAD_CONGESTION_HEX.slow,
+              'rgba(0,0,0,0)', // default (final arg, not a label): unset congestion -> fully transparent, matched by line-opacity's own 0 default below
+            ],
+            'line-color-transition': { duration: TRANSITION_MS, delay: 0 },
+            'line-width': [
+              'interpolate', ['linear'], ['zoom'],
+              12, ['match', ['feature-state', 'congestion'], 'jammed', 3, 'slow', 2, 1],
+              17, ['match', ['feature-state', 'congestion'], 'jammed', 9, 'slow', 6, 2],
+            ],
+            // Unset ('none'/never-set) congestion renders fully
+            // invisible so this is a pure overlay on top of the base
+            // style's own transportation rendering, exactly like the
+            // 3d-buildings-base/3d-buildings split — never touches
+            // road-class styling that already exists below it.
+            'line-opacity': ['match', ['feature-state', 'congestion'], 'jammed', 0.9, 'slow', 0.75, 0],
+          },
+        },
+        labelLayerId,
+      );
+
+      // --- DEVTOOLS VERIFICATION HELPERS ---
+      // Exposed on window so the person running this in an actual
+      // browser can execute steps 1-3 of the correction against the
+      // LIVE map and report real output back — this authoring
+      // environment has no browser/network access to do that itself.
+      // Nothing here is invoked automatically; these are diagnostic
+      // tools only, safe to leave in.
+      window.__debugRoads = {
+        // Step 1: confirm the source-layer name. Prints every
+        // source-layer MapLibre can currently see tiles for, plus the
+        // raw sources block, so 'transportation' (or whatever it's
+        // actually called in this style) can be confirmed by eye.
+        listSourceLayers() {
+          const style = map.getStyle();
+          // eslint-disable-next-line no-console
+          console.log('[__debugRoads] style.sources:', style?.sources);
+          // eslint-disable-next-line no-console
+          console.log(
+            '[__debugRoads] layers referencing BUILDINGS_SOURCE_ID:',
+            (style?.layers || []).filter((l) => l.source === BUILDINGS_SOURCE_ID),
+          );
+        },
+        // Step 2/3, refined: an earlier pass of this helper (blind
+        // `.slice(0, limit)` with no filtering) returned 30 unnamed
+        // `path`/`service`/`transit` features — real, but useless for
+        // picking roads to hardcode, since minor unnamed ways vastly
+        // outnumber named streets in OSM/OpenMapTiles data and
+        // querySourceFeatures doesn't sort or prioritize. This filters
+        // down to classes that are actual drivable roads (motorway
+        // through residential/unclassified, plus their _link variants)
+        // and puts named ones first, so a real street like "Barakhamba
+        // Road" is what you actually see printed.
+        sampleMajorRoads(limit = 30) {
+          const DRIVABLE_CLASSES = new Set([
+            'motorway', 'motorway_link', 'trunk', 'trunk_link',
+            'primary', 'primary_link', 'secondary', 'secondary_link',
+            'tertiary', 'tertiary_link', 'residential', 'unclassified',
+            'living_street',
+          ]);
+          let features;
+          try {
+            features = map.querySourceFeatures(BUILDINGS_SOURCE_ID, { sourceLayer: ROADS_SOURCE_LAYER });
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error('[__debugRoads] querySourceFeatures threw — source likely not loaded yet, try again after idle:', err);
+            return;
+          }
+          const drivable = features.filter((f) => DRIVABLE_CLASSES.has(f.properties?.class));
+          const sorted = [...drivable].sort((a, b) => {
+            const aNamed = a.properties?.name ? 0 : 1;
+            const bNamed = b.properties?.name ? 0 : 1;
+            return aNamed - bNamed;
+          });
+          const sample = sorted.slice(0, limit).map((f) => ({
+            id: f.id,
+            class: f.properties?.class,
+            name: f.properties?.name,
+            geometryType: f.geometry?.type,
+          }));
+          // eslint-disable-next-line no-console
+          console.log(`[__debugRoads] ${drivable.length}/${features.length} queried features are drivable-road classes (${sample.filter((s) => s.name).length} of the first ${sample.length} shown are named).`);
+          // eslint-disable-next-line no-console
+          console.table(sample);
+          return sample;
+        },
+        // Step 2/3 (original, unfiltered): full raw dump, including
+        // paths/service/transit — kept for completeness/debugging, but
+        // prefer sampleMajorRoads() above for actually picking roads.
+        sampleTransportationFeatures(limit = 30) {
+          let features;
+          try {
+            features = map.querySourceFeatures(BUILDINGS_SOURCE_ID, { sourceLayer: ROADS_SOURCE_LAYER });
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error('[__debugRoads] querySourceFeatures threw — source likely not loaded yet, try again after idle:', err);
+            return;
+          }
+          const sample = features.slice(0, limit).map((f) => ({
+            id: f.id,
+            idType: typeof f.id,
+            geometryType: f.geometry?.type,
+            class: f.properties?.class,
+            name: f.properties?.name,
+          }));
+          const idsPopulated = features.filter((f) => f.id !== undefined && f.id !== null).length;
+          const multiLine = features.filter((f) => f.geometry?.type === 'MultiLineString').length;
+          // eslint-disable-next-line no-console
+          console.log(`[__debugRoads] queried ${features.length} transportation features (source-layer "${ROADS_SOURCE_LAYER}")`);
+          // eslint-disable-next-line no-console
+          console.log(`[__debugRoads] ids populated: ${idsPopulated}/${features.length} | MultiLineString features: ${multiLine}/${features.length}`);
+          // eslint-disable-next-line no-console
+          console.table(sample);
+          return sample;
+        },
+        // Step 4 dry-run: manually test that a specific real road id
+        // actually recolors. Find an id via sampleTransportationFeatures
+        // (or by clicking a road with queryRenderedFeatures at a known
+        // pixel), then call e.g.
+        // window.__debugRoads.testSetFeatureState(123456789, 'jammed')
+        // and visually confirm that exact road turns red on the map.
+        testSetFeatureState(id, level = 'jammed') {
+          try {
+            map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: level });
+            // eslint-disable-next-line no-console
+            console.log(`[__debugRoads] setFeatureState({id: ${id}}, {congestion: '${level}'}) called — check the map.`);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error('[__debugRoads] setFeatureState failed:', err);
+          }
+        },
+        // Same as testSetFeatureState, but also re-finds the feature's
+        // own geometry (via querySourceFeatures, filtered to this id)
+        // and flies the camera to fit its bounding box — so you don't
+        // have to already have the right road on-screen to see the
+        // test take effect. This is the one to reach for first; a
+        // "nothing visible" result from testSetFeatureState alone is
+        // ambiguous between "it didn't work" and "it worked but that
+        // road isn't in view right now" — this removes that ambiguity.
+        testSetFeatureStateAndZoom(id, level = 'jammed') {
+          let features;
+          try {
+            features = map.querySourceFeatures(BUILDINGS_SOURCE_ID, { sourceLayer: ROADS_SOURCE_LAYER, filter: ['==', ['id'], id] });
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error('[__debugRoads] querySourceFeatures (for zoom) failed:', err);
+            features = [];
+          }
+          if (features.length === 0) {
+            // eslint-disable-next-line no-console
+            console.warn(`[__debugRoads] no currently-loaded feature with id ${id} to zoom to — setting feature-state anyway, but you may need to pan/zoom manually to find it.`);
+          } else {
+            try {
+              const bbox = turf.bbox({ type: 'FeatureCollection', features });
+              map.fitBounds(bbox, { padding: 120, maxZoom: 18, duration: 800 });
+            } catch (err) {
+              // eslint-disable-next-line no-console
+              console.warn('[__debugRoads] turf.bbox/fitBounds failed, continuing without zoom:', err);
+            }
+          }
+          this.testSetFeatureState(id, level);
+        },
+        // Click the map to identify a road's real id/name under the
+        // cursor via queryRenderedFeatures — the practical way to
+        // hand-pick which real roads to hardcode into
+        // security-attack.json. Queries ALL rendered layers (not just
+        // roads-congestion-line, whose opacity is 0 for uncongested
+        // roads and may not be reliably hit-testable while transparent)
+        // and filters down to transportation source-layer features.
+        identifyRoadAtPoint(clientX, clientY) {
+          const rect = map.getCanvas().getBoundingClientRect();
+          const point = [clientX - rect.left, clientY - rect.top];
+          const matches = map.queryRenderedFeatures(point)
+            .filter((f) => f.sourceLayer === ROADS_SOURCE_LAYER || f.layer?.['source-layer'] === ROADS_SOURCE_LAYER);
+          // eslint-disable-next-line no-console
+          console.log('[__debugRoads] transportation features at point:', matches.map((f) => ({ id: f.id, name: f.properties?.name, class: f.properties?.class })));
+          return matches;
+        },
+        // --- Automatic road-congestion resolver verification helpers ---
+        // Added alongside the automatic resolver (see resolveRoadCandidates/
+        // resolveKartavyaPathFeatures/applyRoadCongestionForRadii above).
+        // Use these to confirm, against the LIVE map, that: candidates
+        // resolved near the impact point, Kartavya Path's real segment(s)
+        // were found, the T+15 gate is (or isn't) currently open, and the
+        // current per-road congestion band each candidate has actually
+        // been assigned.
+        showAutoRoadState() {
+          const gateOpen = resolveRoadsActive(scenario, timelineIndex);
+          // eslint-disable-next-line no-console
+          console.log(`[__debugRoads] timelineIndex=${timelineIndex}, gate (>= ${ROADS_ACTIVATION_LABEL}) open: ${gateOpen}`);
+          // eslint-disable-next-line no-console
+          console.log(`[__debugRoads] ${roadCandidatesRef.current.length} road candidates resolved near current impact point`);
+          const table = roadCandidatesRef.current
+            .map((c) => ({
+              id: c.featureTarget.id,
+              name: c.name,
+              distanceKm: Number(c.distanceKm.toFixed(4)),
+              currentBand: roadBandByKeyRef.current[c.dedupeKey] || 'none',
+            }))
+            .sort((a, b) => a.distanceKm - b.distanceKm);
+          console.table(table);
+          return table;
+        },
+        showKartavyaPathState() {
+          // eslint-disable-next-line no-console
+          console.log('[__debugRoads] Kartavya Path resolved feature ids:', kartavyaPathFeatureIdsRef.current);
+          const table = kartavyaPathFeatureIdsRef.current.map((id) => ({
+            id,
+            currentBand: roadBandByKeyRef.current[String(id)] || 'none',
+          }));
+          console.table(table);
+          return table;
+        },
+      };
+
       // --- 3. Evacuation route: static dashed line + animated point ---
       map.addSource('evac-route', {
         type: 'geojson',
@@ -825,6 +1198,7 @@ export function MapLibreView({ scenario }) {
       loadedRef.current = true;
       applyScenarioActivation(scenario);
       applyLandmarkRisk(scenario);
+      applyRoadCongestion(scenario.baseline);
       // Task 8f FIX D: idle "surveillance drift" camera rotation has
       // been removed entirely per explicit request — the camera now
       // only moves in response to user input (drag) or a scenario
@@ -881,6 +1255,8 @@ export function MapLibreView({ scenario }) {
     // it on every idle for the map's whole lifetime is fine.
     map.on('idle', () => {
       resolveBuildingCandidates(currentImpactCenterRef.current);
+      resolveRoadCandidates(currentImpactCenterRef.current);
+      resolveKartavyaPathFeatures();
     });
 
     return () => {
@@ -944,9 +1320,17 @@ export function MapLibreView({ scenario }) {
     // so every keyframe scrub silently fell back to the same fixed
     // default radii/point instead of the keyframe's actual values —
     // this is why scrubbing to T+5/T+10/etc. visibly did nothing.
-    animateRiskZones(scenario.baseline, impactCenter);
+    animateRiskZones(scenario.baseline, impactCenter, resolveRoadsActive(scenario, timelineIndex));
+    // Road congestion has no growth/shrink animation to drive (§3.4 of
+    // the research doc — `level` is a discrete enum per road, not an
+    // interpolatable number) — applyRoadCongestion just diffs+applies
+    // setFeatureState calls against real road ids; `line-color-transition`
+    // on the layer itself (see map.on('load', ...) above) is what makes
+    // that read as a crossfade rather than a hard cut, exactly like
+    // buildings.
+    applyRoadCongestion(scenario.baseline);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenario]);
+  }, [scenario, timelineIndex]);
 
   // -------------------------------------------------------------------
   // Scenario ACTIVATION — camera fly-in + building-candidate
@@ -962,6 +1346,8 @@ export function MapLibreView({ scenario }) {
   useEffect(() => {
     if (!loadedRef.current) return;
     resetAllBuildingRisk();
+    resetAllRoadCongestion();
+    resetAllAutoRoadCongestion();
     applyScenarioActivation(scenario);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenario.id]);
@@ -1034,6 +1420,103 @@ export function MapLibreView({ scenario }) {
     });
   }
 
+  /**
+   * Applies real-road congestion from `state.roadCongestion` — a NEW
+   * field (separate from the legacy fake `roads` array, which is left
+   * untouched for MapView.jsx's SVG rendering only) shaped as
+   * `[{ id: <real transportation source-layer feature id>, level:
+   * 'jammed' | 'slow' }, ...]`. mergeKeyframe.js's existing generic
+   * mergeById already folds this by `id` across keyframes exactly like
+   * buildings/shelters, so by the time this runs `state.roadCongestion`
+   * is the fully-resolved current list, not a diff.
+   *
+   * Diffs against roadCongestionByIdRef (last-applied level per real
+   * road id) so setFeatureState is only called when a road's level
+   * actually changed — same throttling shape as
+   * applyBuildingRiskForRadii/buildingBandByKeyRef. Any road id present
+   * in that ref but ABSENT from the new list gets explicitly reset to
+   * 'none' (fully transparent, per the layer's opacity match default)
+   * rather than left however it last was, so timeline scrubbing
+   * backward correctly un-jams a road instead of leaving it stuck red.
+   *
+   * `id` values here MUST be real transportation source-layer feature
+   * ids, hand-identified against the live map (see the
+   * `window.__debugRoads` helpers in map.on('load', ...) above) and
+   * written into security-attack.json's roadCongestion arrays — this
+   * function does no geometry lookup or invention of its own.
+   */
+  function applyRoadCongestion(state) {
+    const map = mapRef.current;
+    if (!map) return;
+    const entries = state?.roadCongestion || [];
+    const seenIds = new Set();
+    // Keep the automatic resolver (applyRoadCongestionForRadii) aware of
+    // which ids currently have a manually-authored entry, so it treats
+    // this legacy channel as an override layered on top rather than
+    // fighting over the same feature-state. security-attack.json's
+    // roadCongestion arrays are all empty per the automation pivot (see
+    // the constant's own doc comment), so this is a no-op today — kept
+    // for any future scenario/dataset that DOES want a manual override.
+    manualRoadIdsRef.current = new Set(entries.filter((e) => e?.id !== undefined && e?.id !== null).map((e) => String(e.id)));
+
+    entries.forEach(({ id, level }) => {
+      if (id === undefined || id === null) return; // can't target a road with no real id
+      seenIds.add(id);
+      const lastLevel = roadCongestionByIdRef.current[id];
+      if (lastLevel === level) return; // unchanged — skip, per the same throttling used for buildings
+      try {
+        map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: level });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed for a road (will retry next state change if level is still changing)', err);
+        return;
+      }
+      roadCongestionByIdRef.current[id] = level;
+    });
+
+    // Reset any previously-jammed/slow road that no longer appears in
+    // this keyframe's list back to 'none' (invisible), so scrubbing the
+    // timeline backward or an evacuation clearing up actually reverts
+    // the color instead of leaving a stale road highlighted forever.
+    Object.keys(roadCongestionByIdRef.current).forEach((idKey) => {
+      // Object keys are always strings; road ids from
+      // security-attack.json are expected to be numbers (real OSM/tile
+      // ids), so coerce back for the setFeatureState call and the
+      // seenIds.has check below (which was populated with whatever type
+      // the JSON entries used).
+      const id = /^-?\d+$/.test(idKey) ? Number(idKey) : idKey;
+      if (seenIds.has(id)) return;
+      try {
+        map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'none' });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed while resetting a road to clear', err);
+      }
+      delete roadCongestionByIdRef.current[idKey];
+    });
+  }
+
+  /**
+   * Clears every currently-tracked road's congestion feature-state back
+   * to 'none' and empties the tracking ref — the road-congestion
+   * equivalent of resetAllBuildingRisk, called on scenario switch so a
+   * road jammed by the PREVIOUS scenario doesn't stay stuck colored.
+   */
+  function resetAllRoadCongestion() {
+    const map = mapRef.current;
+    if (!map) return;
+    Object.keys(roadCongestionByIdRef.current).forEach((idKey) => {
+      const id = /^-?\d+$/.test(idKey) ? Number(idKey) : idKey;
+      try {
+        map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'none' });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed while resetting a road on scenario switch', err);
+      }
+    });
+    roadCongestionByIdRef.current = {};
+  }
+
   function applyScenarioActivation(currentScenario) {
     const map = mapRef.current;
     if (!map) return;
@@ -1089,7 +1572,9 @@ export function MapLibreView({ scenario }) {
     // signal here, not moveend.
     const beginBuildingRiskEngine = () => {
       resolveBuildingCandidates(impactCenter);
-      animateRiskZones(currentScenario.baseline, impactCenter);
+      resolveRoadCandidates(impactCenter);
+      resolveKartavyaPathFeatures();
+      animateRiskZones(currentScenario.baseline, impactCenter, resolveRoadsActive(currentScenario, timelineIndex));
     };
     if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
       beginBuildingRiskEngine();
@@ -1266,6 +1751,289 @@ export function MapLibreView({ scenario }) {
   }
 
   /**
+   * Automatic road-congestion candidate resolution — the road
+   * equivalent of resolveBuildingCandidates above, run the same way
+   * (once per impact-point placement, re-scanned on every session-long
+   * 'idle' tick so roads in tiles that page in later still get picked
+   * up). Queries BUILDINGS_SOURCE_ID's `transportation` source-layer via
+   * querySourceFeatures (NOT queryRenderedFeatures — same reasoning as
+   * buildings: the growing radius must be able to reach roads currently
+   * outside the viewport), filters to real drivable classes via
+   * DRIVABLE_CLASSES (promoted from the devtools helper — see that
+   * constant's own comment), and computes each road's distance from the
+   * impact point via the nearest point ON the line (turf.nearestPointOnLine
+   * — NOT turf.pointOnFeature, which is a polygon/point helper and
+   * doesn't operate correctly on line geometry).
+   *
+   * A real road id can legitimately appear more than once in the query
+   * result (confirmed live via the devtools helpers — the same id split
+   * across tile boundaries as one LineString fragment plus one
+   * MultiLineString fragment). Distances are deduped PER ID by keeping
+   * the minimum distance seen across all of that id's fragments, so a
+   * road is classified by whichever of its fragments is actually
+   * closest to the impact point, and setFeatureState is only queued
+   * once per id (it already recolors every fragment sharing that id in
+   * one call, per the devtools-confirmed behavior called out where
+   * ROADS_SOURCE_LAYER is declared above).
+   */
+  function resolveRoadCandidates(impactCenter) {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const runQuery = () => {
+      let features;
+      try {
+        features = map.querySourceFeatures(BUILDINGS_SOURCE_ID, { sourceLayer: ROADS_SOURCE_LAYER });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] querySourceFeatures (roads) failed (source likely still loading), will retry on idle', err);
+        roadCandidatesRef.current = [];
+        return;
+      }
+
+      const impactPointFeature = turf.point([impactCenter.lng, impactCenter.lat]);
+      const byId = new Map(); // id -> { featureTarget, dedupeKey, distanceKm, name }
+
+      features.forEach((feature) => {
+        if (!DRIVABLE_CLASSES.has(feature.properties?.class)) return;
+        if (feature.id === undefined || feature.id === null) return; // can't target a road with no real id
+
+        let distanceKm;
+        try {
+          // turf.nearestPointOnLine only accepts LineString/MultiLineString
+          // geometry (it internally handles MultiLineString by checking
+          // every constituent line), which is exactly what transportation
+          // features are — unlike buildings, no flatten/explode step is
+          // needed here since we only need a single closest-point
+          // distance per fragment, not a full per-part feature list.
+          const nearest = turf.nearestPointOnLine(feature, impactPointFeature, { units: 'kilometers' });
+          distanceKm = nearest.properties.dist;
+        } catch (err) {
+          return; // malformed/empty geometry — skip rather than crash the whole batch
+        }
+
+        const existing = byId.get(feature.id);
+        if (!existing || distanceKm < existing.distanceKm) {
+          byId.set(feature.id, {
+            featureTarget: { source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id: feature.id },
+            dedupeKey: String(feature.id),
+            distanceKm,
+            name: feature.properties?.name,
+          });
+        }
+      });
+
+      roadCandidatesRef.current = Array.from(byId.values());
+    };
+
+    if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
+      runQuery();
+    } else {
+      const onIdleRetry = () => {
+        if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
+          map.off('idle', onIdleRetry);
+          runQuery();
+        }
+      };
+      map.on('idle', onIdleRetry);
+    }
+  }
+
+  /**
+   * Resolves Kartavya Path's real road feature id(s) — an explicit,
+   * forced override applied AFTER the general distance-based pass
+   * (see applyRoadCongestionForRadii below), not just another
+   * distance-classified candidate. Per the person's explicit
+   * instruction, Kartavya Path is always fully jammed once the T+15
+   * gate opens, independent of exactly how far any given segment's
+   * distance-classification would otherwise put it.
+   *
+   * Two-tier resolution, since it's a boulevard (a real corridor, not a
+   * single simple way) and may not carry a consistent `name` tag on
+   * every OSM way that makes it up:
+   *   1. Name match: any drivable-class transportation feature anywhere
+   *      in currently-loaded tiles whose name matches "Kartavya" or its
+   *      former name "Rajpath" (KARTAVYA_PATH_NAME_PATTERN). This is
+   *      the reliable path when the name tag is actually present.
+   *   2. Fallback — geometric proximity: if no named match is found
+   *      (e.g. relevant tiles haven't loaded, or the name tag is
+   *      missing on every segment), sample several points along the
+   *      straight line between Rashtrapati Bhavan and India Gate
+   *      (delhiLandmarks.js's own approximation of the corridor — see
+   *      that file's `kartavya-path` entry) and collect every
+   *      transportation-layer feature rendered near each sample point
+   *      via queryRenderedFeatures, the same box-query approach
+   *      tryResolveLandmarkFeatures already uses for buildings.
+   * All matching ids (there can be more than one — a divided
+   * boulevard/multiple OSM ways for one named corridor) are forced
+   * jammed, not just the first hit.
+   */
+  function resolveKartavyaPathFeatures() {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const ids = new Set();
+
+    // Tier 1: name match, scanned across whatever transportation tiles
+    // are currently loaded.
+    try {
+      const features = map.querySourceFeatures(BUILDINGS_SOURCE_ID, { sourceLayer: ROADS_SOURCE_LAYER });
+      features.forEach((feature) => {
+        if (feature.id === undefined || feature.id === null) return;
+        if (!DRIVABLE_CLASSES.has(feature.properties?.class)) return;
+        const name = feature.properties?.name;
+        if (name && KARTAVYA_PATH_NAME_PATTERN.test(name)) {
+          ids.add(feature.id);
+        }
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[MapLibreView] querySourceFeatures (Kartavya Path name match) failed, will retry on idle', err);
+    }
+
+    // Tier 2: geometric fallback along the Rashtrapati Bhavan <-> India
+    // Gate corridor, only bothering if the name match above found
+    // nothing (avoids over-collecting unrelated nearby roads when the
+    // reliable name-based match already succeeded).
+    if (ids.size === 0) {
+      const rashtrapatiBhavan = LANDMARKS.find((l) => l.id === 'rashtrapati-bhavan');
+      const indiaGate = LANDMARKS.find((l) => l.id === 'india-gate');
+      if (rashtrapatiBhavan && indiaGate) {
+        const SAMPLE_STEPS = 8;
+        for (let i = 0; i <= SAMPLE_STEPS; i += 1) {
+          const t = i / SAMPLE_STEPS;
+          const lat = rashtrapatiBhavan.lat + (indiaGate.lat - rashtrapatiBhavan.lat) * t;
+          const lng = rashtrapatiBhavan.lng + (indiaGate.lng - rashtrapatiBhavan.lng) * t;
+          const point = map.project([lng, lat]);
+          const matches = map.queryRenderedFeatures(queryBoxAround(point), { layers: ['roads-congestion-line'] })
+            .filter((f) => DRIVABLE_CLASSES.has(f.properties?.class));
+          matches.forEach((f) => {
+            if (f.id !== undefined && f.id !== null) ids.add(f.id);
+          });
+        }
+      }
+    }
+
+    kartavyaPathFeatureIdsRef.current = Array.from(ids);
+  }
+
+  /**
+   * The road-congestion equivalent of applyBuildingRiskForRadii — the
+   * per-tick hot path for the automatic resolver. Gated entirely off
+   * `roadsActive` (derived from the current keyframe label vs.
+   * ROADS_ACTIVATION_LABEL, resolved by the caller — see
+   * animateRiskZones): when the gate is closed (before T+15), every
+   * currently-jammed/slow road tracked in roadBandByKeyRef is reset to
+   * 'none' and classification is skipped entirely for the tick, so nothing
+   * ever colors early regardless of how small/large the radii are.
+   *
+   * When the gate is open, classifies every resolved road candidate via
+   * classifyRoadCongestion and diffs against roadBandByKeyRef exactly
+   * like applyBuildingRiskForRadii, then applies the Kartavya Path
+   * override afterward so it's never accidentally left at a
+   * distance-derived 'slow'/'none' level. Roads present in
+   * manualRoadIdsRef (an authored override layered on top, if any ever
+   * exist) are skipped entirely by the automatic pass — see
+   * applyRoadCongestion's doc comment for why that channel is kept.
+   */
+  function applyRoadCongestionForRadii(radii, roadsActive) {
+    const map = mapRef.current;
+    if (!map) return;
+
+    if (!roadsActive) {
+      Object.keys(roadBandByKeyRef.current).forEach((dedupeKey) => {
+        if (roadBandByKeyRef.current[dedupeKey] === 'none') return;
+        const id = /^-?\d+$/.test(dedupeKey) ? Number(dedupeKey) : dedupeKey;
+        try {
+          map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'none' });
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.warn('[MapLibreView] setFeatureState failed while clearing a road before T+15', err);
+        }
+        roadBandByKeyRef.current[dedupeKey] = 'none';
+      });
+      return;
+    }
+
+    const candidates = roadCandidatesRef.current;
+    candidates.forEach(({ featureTarget, dedupeKey, distanceKm }) => {
+      if (manualRoadIdsRef.current.has(dedupeKey)) return; // manual override channel takes precedence
+      const band = classifyRoadCongestion(distanceKm, radii);
+      const lastBand = roadBandByKeyRef.current[dedupeKey];
+      if (band === lastBand) return;
+      try {
+        map.setFeatureState(featureTarget, { congestion: band });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed for a road (will retry next tick if band is still changing)', err);
+        return;
+      }
+      roadBandByKeyRef.current[dedupeKey] = band;
+    });
+
+    // Kartavya Path override — applied AFTER the general pass so it can
+    // never be left at whatever the distance-based classification
+    // computed for the same id; always fully jammed once active.
+    kartavyaPathFeatureIdsRef.current.forEach((id) => {
+      const dedupeKey = String(id);
+      if (manualRoadIdsRef.current.has(dedupeKey)) return;
+      if (roadBandByKeyRef.current[dedupeKey] === 'jammed') return;
+      try {
+        map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'jammed' });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed while forcing Kartavya Path jammed', err);
+        return;
+      }
+      roadBandByKeyRef.current[dedupeKey] = 'jammed';
+    });
+  }
+
+  /**
+   * Resets every currently-tracked automatic road congestion state back
+   * to 'none' and clears the band-tracking cache — the automatic-resolver
+   * equivalent of resetAllBuildingRisk / resetAllRoadCongestion, called
+   * on scenario switch.
+   */
+  function resetAllAutoRoadCongestion() {
+    const map = mapRef.current;
+    if (!map) return;
+    Object.keys(roadBandByKeyRef.current).forEach((dedupeKey) => {
+      const id = /^-?\d+$/.test(dedupeKey) ? Number(dedupeKey) : dedupeKey;
+      try {
+        map.setFeatureState({ source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id }, { congestion: 'none' });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] setFeatureState failed while resetting a road on scenario switch', err);
+      }
+    });
+    roadBandByKeyRef.current = {};
+    roadCandidatesRef.current = [];
+    kartavyaPathFeatureIdsRef.current = [];
+  }
+
+  /**
+   * Resolves whether the automatic road-congestion resolver should be
+   * active for the given scenario/timelineIndex — the T+15 gate
+   * described at ROADS_ACTIVATION_LABEL's definition above. Looks up
+   * ROADS_ACTIVATION_LABEL's position in scenario.timeline BY LABEL
+   * (not a hardcoded index) so this keeps holding even if keyframes are
+   * reordered/added/removed later. Defaults to false (gate closed) for
+   * any case that isn't an unambiguous "yes, we're at or past T+15" —
+   * missing timelineIndex, a timeline that doesn't define T+15 at all,
+   * etc. — since "roads accidentally jam early" is a much worse failure
+   * mode for this demo than "roads occasionally fail to jam at all".
+   */
+  function resolveRoadsActive(currentScenario, index) {
+    if (typeof index !== 'number') return false;
+    const timeline = currentScenario?.timeline;
+    if (!Array.isArray(timeline) || timeline.length === 0) return false;
+    const activationIndex = timeline.findIndex((k) => k?.label === ROADS_ACTIVATION_LABEL);
+    if (activationIndex === -1) return false;
+    return index >= activationIndex;
+  }
+
+  /**
    * Drives BOTH the three concentric impact-zone circles AND the
    * per-building recoloring off a single requestAnimationFrame loop
    * keyed to elapsed wall-clock time (research §9 — "keyed to elapsed
@@ -1280,7 +2048,7 @@ export function MapLibreView({ scenario }) {
    * On first activation (no previous radii recorded), it eases up from
    * ~0 exactly like the old single-circle animation did.
    */
-  function animateRiskZones(currentState, impactCenter) {
+  function animateRiskZones(currentState, impactCenter, roadsActive) {
     const map = mapRef.current;
     const greenSource = map?.getSource('impact-zone-green');
     const yellowSource = map?.getSource('impact-zone-yellow');
@@ -1326,6 +2094,15 @@ export function MapLibreView({ scenario }) {
       redSource.setData(turf.circle([currentRadii.point.lng, currentRadii.point.lat], currentRadii.red, circleOpts));
 
       applyBuildingRiskForRadii(currentRadii);
+      // Automatic road-congestion resolver — same per-tick hot path as
+      // buildings, driven off the SAME currentRadii, so roads and
+      // buildings always grow/shrink in lockstep with one shared
+      // requestAnimationFrame loop rather than a second one. `roadsActive`
+      // is resolved once by the caller (see resolveRoadsActive) and stays
+      // constant for this whole animation run — it does not need to be
+      // re-evaluated per tick, since it only depends on which keyframe is
+      // currently selected, not on the radii themselves.
+      applyRoadCongestionForRadii(currentRadii, roadsActive);
 
       // Written every tick (not just on completion) — this is what
       // lets an interrupted animation resume smoothly instead of

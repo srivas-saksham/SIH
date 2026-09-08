@@ -6,7 +6,13 @@
  * complete snapshot the map/UI can render directly.
  *
  * Both `buildings` and `shelters` are matched and merged by `id`.
- * `roads` are matched and merged by `id` too. Any field present on the
+ * `roads` are matched and merged by `id` too (this is the legacy,
+ * hand-invented-coordinate field used only by MapView.jsx's SVG
+ * rendering — see MapLibreView.jsx for why it is NOT used as a source
+ * of real road geometry there). `roadCongestion` ({ id, level } entries
+ * keyed by real transportation-vector-tile road ids) is merged by `id`
+ * the same way, and is what MapLibreView.jsx actually reads for its
+ * real-road congestion overlay. Any field present on the
  * diff entry overwrites the corresponding field on the base entry;
  * fields not mentioned in the diff (e.g. lat/lng on a building) are kept
  * from the base entry. Entries in the diff whose id isn't found in the
@@ -40,6 +46,13 @@ export function mergeKeyframe(baseState, keyframe) {
     buildings: mergeById(baseState.buildings, keyframe.buildings),
     roads: mergeById(baseState.roads, keyframe.roads),
     shelters: mergeById(baseState.shelters, keyframe.shelters),
+    // roadCongestion: real-road-id congestion entries ({ id, level }),
+    // separate from the legacy `roads` field above (which stays fake/
+    // SVG-only — see MapLibreView.jsx's applyRoadCongestion). Merged by
+    // id with the same mergeById used for buildings/shelters, so a
+    // keyframe only needs to list the roads whose level actually
+    // changed at that point in time.
+    roadCongestion: mergeById(baseState.roadCongestion, keyframe.roadCongestion),
     impactPoint: keyframe.impactPoint !== undefined ? keyframe.impactPoint : baseState.impactPoint,
     redRadiusKm: keyframe.redRadiusKm !== undefined ? keyframe.redRadiusKm : baseState.redRadiusKm,
     yellowRadiusKm: keyframe.yellowRadiusKm !== undefined ? keyframe.yellowRadiusKm : baseState.yellowRadiusKm,
@@ -97,6 +110,7 @@ function cloneState(state) {
     buildings: (state.buildings || []).map((item) => ({ ...item })),
     roads: (state.roads || []).map((item) => ({ ...item })),
     shelters: (state.shelters || []).map((item) => ({ ...item })),
+    roadCongestion: (state.roadCongestion || []).map((item) => ({ ...item })),
     // impactPoint/redRadiusKm/yellowRadiusKm/greenRadiusKm already come
     // through via the `...state` spread above (they're plain
     // scalar/object fields, not id-matched lists) — no extra handling
