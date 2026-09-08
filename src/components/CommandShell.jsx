@@ -1,5 +1,4 @@
 import { useMemo, useState } from 'react';
-import { systemOverview } from '../data/systemOverview';
 import { scenarioPresets } from '../scenarios/scenarioPresets';
 import { describeDelta } from '../utils/describeKeyframeDelta';
 import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
@@ -7,6 +6,7 @@ import { getScenarioById, matchScenario, scenarios } from '../utils/scenarioMatc
 import { CausalBreakdown } from './CausalBreakdown';
 import { ComparisonPanel } from './ComparisonPanel';
 import { MapLibreView } from './MapLibreView';
+import { MapToolbar } from './MapToolbar';
 import { MapView } from './MapView';
 import { TimelineScrubber } from './TimelineScrubber';
 import { TopNav } from './TopNav';
@@ -94,6 +94,14 @@ export function CommandShell() {
   // above, since both ComparisonPanel and MapView need to react to it.
   const [interventionApplied, setInterventionApplied] = useState(false);
 
+  // Map toolbar: shelters default OFF — per explicit person request,
+  // shelters shouldn't appear automatically the instant a scenario
+  // activates at T+0; the person toggles them on deliberately via
+  // MapToolbar. Lives here (not inside MapLibreView) since MapToolbar
+  // is rendered as a sibling overlay on top of the map, same pattern as
+  // every other piece of shared map/scrubber state in this component.
+  const [sheltersVisible, setSheltersVisible] = useState(false);
+
   // Switching scenarios (free-text match or preset chip) must never carry
   // a mid-timeline position — or an applied intervention — into the
   // newly-selected scenario. Reset it during render (React's documented
@@ -106,6 +114,7 @@ export function CommandShell() {
     setCurrentKeyframeIndex(0);
     setIsPlaying(false);
     setInterventionApplied(false);
+    setSheltersVisible(false);
   }
 
   const mergedMapState = useMemo(
@@ -235,16 +244,6 @@ export function CommandShell() {
       <main className="flex min-h-0 flex-1 flex-col xl:flex-row">
         {/* LEFT: map (hero element) + timeline scrubber pinned beneath it */}
         <section className="flex min-h-0 flex-1 flex-col border-hairline xl:w-[65%] xl:flex-none xl:border-r">
-          <div className="flex items-center justify-between gap-4 border-b border-hairline px-4 py-3">
-            <div>
-              <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Network overview</p>
-              <h2 className="mt-1 text-lg font-semibold text-ink">{systemOverview.incident}</h2>
-            </div>
-            <div className="rounded-full border border-risks-red/40 bg-risks-red/10 px-3 py-1 text-[10px] uppercase tracking-[0.22em] text-risks-red">
-              {isThinking ? 'Interpreting scenario…' : activeScenario.name}
-            </div>
-          </div>
-
           <div className="relative min-h-[320px] flex-1">
             {/*
               TEMPORARY BRIDGE (Task 8b): MapLibreView (real 3D MapLibre
@@ -260,7 +259,17 @@ export function CommandShell() {
               for the full migration plan.
             */}
             {activeScenario.id === 'security-attack' ? (
-              <MapLibreView scenario={mapViewScenario} timelineIndex={currentKeyframeIndex} />
+              <>
+                <MapLibreView
+                  scenario={mapViewScenario}
+                  timelineIndex={currentKeyframeIndex}
+                  sheltersVisible={sheltersVisible}
+                />
+                <MapToolbar
+                  sheltersVisible={sheltersVisible}
+                  onToggleShelters={setSheltersVisible}
+                />
+              </>
             ) : (
               <MapView scenario={mapViewScenario} />
             )}

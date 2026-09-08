@@ -275,6 +275,88 @@ const SHELTER_CARD_ICON_SIZE_EXPR = [
 // — flagged explicitly rather than silently faked.
 const SHELTER_CARD_ICON_OFFSET = [0, -4];
 
+// ---------------------------------------------------------------------
+// Landmark / road labels — the SAME proven canvas -> map.addImage ->
+// symbol-layer `icon-image` pattern the shelter cards use (see the
+// SHELTER_CARD_* block above for the full reasoning on why a symbol
+// layer, not a Marker/DOM element, and why 'viewport' pitch/rotation
+// alignment). Deliberately a much smaller, simpler pill than the
+// shelter card: a landmark/road doesn't have a shelter's richness of
+// state (occupancy, accessibility, feasibility notes) — just a name and
+// a live distance-from-impact — so the canvas render function below is
+// a stripped-down sibling of renderShelterCardCanvas, not a reuse of it.
+// ---------------------------------------------------------------------
+const LABEL_PILL_CSS_WIDTH = 168;
+const LABEL_PILL_CSS_HEIGHT = 40;
+const LABEL_PILL_PIXEL_RATIO = 3;
+
+// Smaller/more conservative zoom curve than the shelter cards' — these
+// pills carry far less information (one line of text) and are meant to
+// read as lightweight tags dotted around the scene, not primary focal
+// cards, so they shouldn't dominate the view at high zoom the way a
+// full shelter card is allowed to.
+const LABEL_PILL_ICON_SIZE_EXPR = [
+  'interpolate', ['linear'], ['zoom'],
+  14, 0.45,
+  16.5, 0.85,
+  18, 1.1,
+];
+const LABEL_PILL_ICON_OFFSET = [0, -2];
+
+/**
+ * Draws one landmark or road label pill: a compact rounded-rect tag
+ * with a small colored status dot, the place/road name (single line,
+ * ellipsized rather than wrapped — these are meant to be short), and
+ * its live distance from the current impact point. `accentHex` colors
+ * the dot (and the pill's thin border) so a landmark's risk color or a
+ * road's congestion color still reads at a glance even in this
+ * stripped-down format, without needing a full second badge/bar the
+ * way the shelter card has.
+ */
+function renderLabelPillCanvas(name, distanceKm, accentHex) {
+  const w = LABEL_PILL_CSS_WIDTH;
+  const h = LABEL_PILL_CSS_HEIGHT;
+  const ratio = LABEL_PILL_PIXEL_RATIO;
+  const canvas = document.createElement('canvas');
+  canvas.width = w * ratio;
+  canvas.height = h * ratio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(ratio, ratio);
+  ctx.clearRect(0, 0, w, h);
+
+  const radius = h / 2;
+  ctx.beginPath();
+  drawRoundedRectPath(ctx, 0, 0, w, h, radius);
+  ctx.fillStyle = 'rgba(10, 10, 11, 0.88)';
+  ctx.fill();
+  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = accentHex;
+  ctx.stroke();
+
+  // Status dot
+  const dotCx = 16;
+  const dotCy = h / 2;
+  ctx.beginPath();
+  ctx.arc(dotCx, dotCy, 4, 0, Math.PI * 2);
+  ctx.fillStyle = accentHex;
+  ctx.fill();
+
+  const textX = dotCx + 12;
+  const maxTextWidth = w - textX - 10;
+
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = '700 11px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#e4e4e7';
+  const [nameLine] = wrapCanvasText(ctx, name, maxTextWidth, 1);
+  ctx.fillText(nameLine, textX, h / 2 - 3);
+
+  ctx.font = '400 9px system-ui, -apple-system, sans-serif';
+  ctx.fillStyle = '#a1a1aa';
+  ctx.fillText(`${distanceKm.toFixed(2)} km from impact`, textX, h / 2 + 11);
+
+  return canvas;
+}
+
 /**
  * Deterministic seeded PRNG (mulberry32, keyed off a string seed via a
  * cheap string hash), used only to jitter buildShelterFootprint's ring
@@ -618,6 +700,17 @@ function canvasToImageData(canvas) {
   return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }
 
+// Stable image ids for landmark/road label pills — module-level so both
+// the one-time map.on('load') setup and the recurring update functions
+// (updateLandmarkLabels/updateRoadLabels) agree on the same id for a
+// given landmark/road without needing to pass a closure around.
+function landmarkLabelImageId(landmarkId) {
+  return `landmark-label-${landmarkId}`;
+}
+function roadLabelImageId(dedupeKey) {
+  return `road-label-${dedupeKey}`;
+}
+
 function upsertShelterCardImage(map, imageId, canvas) {
   const imageData = canvasToImageData(canvas);
   if (map.hasImage(imageId)) {
@@ -938,10 +1031,18 @@ function queryBoxAround(point) {
   ];
 }
 
-export function MapLibreView({ scenario, timelineIndex }) {
+export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const loadedRef = useRef(false);
+  // Mirrors the `sheltersVisible` prop into a ref so the one-time
+  // map.on('load') callback (which closes over refs, not props — it
+  // only ever runs once per map instance) can read whatever the LATEST
+  // toggle value is at the moment shelter layers first get created,
+  // without needing `scenario`/`timelineIndex`-style effect deps added
+  // to that callback. Kept in sync on every render (see below).
+  const sheltersVisibleRef = useRef(sheltersVisible);
+  sheltersVisibleRef.current = sheltersVisible;
 
   // Animation bookkeeping, kept in refs since none of it should trigger
   // React re-renders — it's imperative canvas/map state.
@@ -1562,6 +1663,105 @@ export function MapLibreView({ scenario, timelineIndex }) {
         console.error('Shelter-card setup failed — shelter cards will be missing/stale, but the rest of the scene (circles, buildings, roads, evac route) is unaffected:', err);
       }
 
+      // Shelters (footprint polygons + floating status cards) default
+      // to HIDDEN at load time — per explicit person request, shelters
+      // should not appear the instant the scenario activates at T+0;
+      // they're a toolbar-controlled overlay (see the `sheltersVisible`
+      // prop / applySheltersVisibility below and MapToolbar.jsx), off
+      // by default, toggled on deliberately. Applying the prop's
+      // CURRENT value here (rather than always defaulting to 'none')
+      // means a person who's already flipped the toggle before this
+      // effect re-runs (e.g. a dev-mode remount) doesn't lose that
+      // choice.
+      applySheltersVisibility(sheltersVisibleRef.current);
+
+      // ---------------------------------------------------------------
+      // Landmark labels — "the president house and the new parliament
+      // and stuff... should be automatically labeled" (explicit person
+      // request). Reuses LANDMARK_IDS/LANDMARKS (already resolved real
+      // coordinates, see delhiLandmarks.js) and the exact same canvas
+      // -> map.addImage -> symbol-layer pattern as the shelter cards,
+      // just with the much smaller renderLabelPillCanvas. Always on —
+      // unlike shelters, these are NOT gated by the toolbar toggle, and
+      // unlike the roadmap's original "only red/yellow" idea, the
+      // person asked for these labeled unconditionally, so every
+      // landmark gets a pill from the very first frame. One shared
+      // point source, one shared symbol layer — mirrors shelter-cards'
+      // "one source per label TYPE" shape.
+      // ---------------------------------------------------------------
+      try {
+        LANDMARKS.forEach((landmark) => {
+          const placeholderCanvas = renderLabelPillCanvas(landmark.name, 0, '#5eead4');
+          upsertShelterCardImage(map, landmarkLabelImageId(landmark.id), placeholderCanvas);
+        });
+
+        map.addSource('landmark-labels', {
+          type: 'geojson',
+          data: {
+            type: 'FeatureCollection',
+            features: LANDMARKS.map((landmark) => ({
+              type: 'Feature',
+              geometry: { type: 'Point', coordinates: [landmark.lng, landmark.lat] },
+              properties: { landmarkId: landmark.id, icon: landmarkLabelImageId(landmark.id) },
+            })),
+          },
+        });
+
+        map.addLayer({
+          id: 'landmark-labels-symbol',
+          source: 'landmark-labels',
+          type: 'symbol',
+          layout: {
+            'icon-image': ['get', 'icon'],
+            'icon-anchor': 'bottom',
+            'icon-allow-overlap': true,
+            'icon-ignore-placement': true,
+            'icon-size': LABEL_PILL_ICON_SIZE_EXPR,
+            'icon-offset': LABEL_PILL_ICON_OFFSET,
+            'icon-pitch-alignment': 'viewport',
+            'icon-rotation-alignment': 'viewport',
+          },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('Landmark-label setup failed — labels will be missing/stale, rest of the scene is unaffected:', err);
+      }
+
+      // ---------------------------------------------------------------
+      // Road labels — "the road should also be labeled" (explicit
+      // person request). Unlike landmark labels this set is DYNAMIC
+      // (which roads qualify changes as congestion bands change), so
+      // the source's data itself gets replaced via setData on every
+      // update (see updateRoadLabels below) rather than staying static
+      // with only image content changing. Starts empty — nothing is
+      // jammed at T+0, so there's nothing to label yet; updateRoadLabels
+      // populates it the first time a road actually goes jammed.
+      // ---------------------------------------------------------------
+      try {
+        map.addSource('road-labels', {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        });
+        map.addLayer({
+          id: 'road-labels-symbol',
+          source: 'road-labels',
+          type: 'symbol',
+          layout: {
+            'icon-image': ['get', 'icon'],
+            'icon-anchor': 'bottom',
+            'icon-allow-overlap': true,
+            'icon-ignore-placement': true,
+            'icon-size': LABEL_PILL_ICON_SIZE_EXPR,
+            'icon-offset': LABEL_PILL_ICON_OFFSET,
+            'icon-pitch-alignment': 'viewport',
+            'icon-rotation-alignment': 'viewport',
+          },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('Road-label setup failed — labels will be missing/stale, rest of the scene is unaffected:', err);
+      }
+
       // Devtools confirmation hooks (safe zones aren't setFeatureState-
       // driven the way roads/buildings are, so there's less "state" to
       // dump via window.__debugRoads-style helpers). window.__debugMap
@@ -1872,6 +2072,20 @@ export function MapLibreView({ scenario, timelineIndex }) {
       applyLandmarkRisk(scenario);
       applyRoadCongestion(scenario.baseline);
       updateShelterStates(scenario, timelineIndex);
+      // Initial paint for landmark/road labels — mirrors the direct
+      // updateShelterStates(...) call just above. Without this, the
+      // pills registered in the landmark/road-label setup blocks above
+      // stay stuck on their 0km placeholder image until the next time
+      // the [scenario, timelineIndex] React effect happens to re-fire
+      // (e.g. a timeline scrub) — that effect is not guaranteed to run
+      // AFTER applyScenarioActivation has set currentImpactCenterRef on
+      // this same initial mount, since it's a separate effect. Calling
+      // both directly here, right after applyScenarioActivation (which
+      // is what actually sets currentImpactCenterRef.current), is what
+      // makes shelter distances correct immediately too — same fix,
+      // same reasoning.
+      updateLandmarkLabels(scenario);
+      updateRoadLabels();
       // Task 8f FIX D: idle "surveillance drift" camera rotation has
       // been removed entirely per explicit request — the camera now
       // only moves in response to user input (drag) or a scenario
@@ -2013,6 +2227,14 @@ export function MapLibreView({ scenario, timelineIndex }) {
     // on every scrub exactly like landmarks/roads above, not just once
     // on scenario activation.
     updateShelterStates(scenario, timelineIndex);
+    // Landmark/road labels — always-on, independent of the shelters
+    // toggle (see applySheltersVisibility). Landmark labels recompute
+    // live distance-from-impact + risk-color accent; road labels
+    // rebuild off whatever roadBandByKeyRef currently holds (updated by
+    // applyRoadCongestion/applyRoadCongestionForRadii just above/inside
+    // the animation loop this effect kicks off via animateRiskZones).
+    updateLandmarkLabels(scenario);
+    updateRoadLabels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenario, timelineIndex]);
 
@@ -2035,6 +2257,17 @@ export function MapLibreView({ scenario, timelineIndex }) {
     applyScenarioActivation(scenario);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenario.id]);
+
+  // -------------------------------------------------------------------
+  // Shelters toggle (MapToolbar) — purely a visibility flip, kept as
+  // its own effect/dependency array so flipping the toggle never
+  // re-triggers scenario activation or a landmark/road recompute.
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    applySheltersVisibility(sheltersVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sheltersVisible]);
 
   // -------------------------------------------------------------------
   // Imperative helpers (closures over refs, called from the effects
@@ -2177,6 +2410,119 @@ export function MapLibreView({ scenario, timelineIndex }) {
         console.error(`Shelter-card update failed for ${shelter.id} — its card may be stale, everything else is unaffected:`, err);
       }
     });
+  }
+
+  /**
+   * Toggles every shelter-related layer's `visibility` layout property
+   * (footprint fill + outline per shelter, plus the shared floating
+   * status-card symbol layer) between 'visible' and 'none'. This is a
+   * pure layout toggle, not a data change — nothing about the
+   * underlying sources/feature-state/occupancy math is touched, so
+   * flipping it back on always shows whatever the current (already
+   * up-to-date) state is, no re-computation needed. Guarded per-layer
+   * with map.getLayer(...) since this can run before the shelter setup
+   * try/catch above has finished (or if it failed entirely).
+   */
+  function applySheltersVisibility(visible) {
+    const map = mapRef.current;
+    if (!map) return;
+    const visibility = visible ? 'visible' : 'none';
+    METRO_SHELTERS.forEach((shelter) => {
+      ['fill', 'outline'].forEach((suffix) => {
+        const layerId = `safe-zone-${shelter.id}-${suffix}`;
+        if (map.getLayer(layerId)) {
+          map.setLayoutProperty(layerId, 'visibility', visibility);
+        }
+      });
+    });
+    if (map.getLayer('shelter-cards-symbol')) {
+      map.setLayoutProperty('shelter-cards-symbol', 'visibility', visibility);
+    }
+  }
+
+  /**
+   * Updates every landmark's label pill with its live distance from the
+   * current impact point, plus an accent color matching its current
+   * riskLevel (baseline green / yellow / red — same deriveLandmarkRisk
+   * output applyLandmarkRisk already computes). Positions never change
+   * (landmarks don't move) so only the image content is refreshed via
+   * upsertShelterCardImage, same as updateShelterStates — the source's
+   * point features/coordinates set up in map.on('load') never need
+   * setData() again.
+   */
+  function updateLandmarkLabels(currentScenario) {
+    const map = mapRef.current;
+    if (!map) return;
+    const impactCenter = currentImpactCenterRef.current || FALLBACK_CENTER;
+    const impactPointFeature = turf.point([impactCenter.lng, impactCenter.lat]);
+    const riskById = deriveLandmarkRisk(currentScenario.baseline);
+
+    LANDMARKS.forEach((landmark) => {
+      try {
+        const landmarkPoint = turf.point([landmark.lng, landmark.lat]);
+        const distanceKm = turf.distance(impactPointFeature, landmarkPoint, { units: 'kilometers' });
+        const accentHex = RISK_HEX[riskById[landmark.id] || 'green'];
+        const canvas = renderLabelPillCanvas(landmark.name, distanceKm, accentHex);
+        upsertShelterCardImage(map, landmarkLabelImageId(landmark.id), canvas);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`Landmark-label update failed for ${landmark.id} — its label may be stale, everything else is unaffected:`, err);
+      }
+    });
+  }
+
+  /**
+   * Rebuilds the road-labels source/images off the CURRENT set of
+   * jammed, named road candidates — per the roadmap's "jammed only, not
+   * slow, to keep label count low" call, and "must have a real `name`
+   * property" (many drivable segments don't, and labeling them 'b3'-
+   * style with no real name would be useless). Full setData() each
+   * call (not a diff/patch) since the qualifying set itself changes
+   * (a road drops out of the list the moment it's no longer jammed),
+   * unlike landmark labels where the SET is fixed and only image
+   * content changes — mirrors resolveRoadCandidates/roadBandByKeyRef's
+   * own "recompute from scratch off the current state" shape.
+   */
+  function updateRoadLabels() {
+    const map = mapRef.current;
+    if (!map || !map.getSource('road-labels')) return;
+    const impactCenter = currentImpactCenterRef.current || FALLBACK_CENTER;
+    const impactPointFeature = turf.point([impactCenter.lng, impactCenter.lat]);
+
+    const jammed = roadCandidatesRef.current.filter(
+      (candidate) => candidate.name
+        && candidate.midpoint
+        && roadBandByKeyRef.current[candidate.dedupeKey] === 'jammed',
+    );
+
+    const features = [];
+    jammed.forEach((candidate) => {
+      try {
+        const distanceKm = turf.distance(
+          impactPointFeature,
+          turf.point(candidate.midpoint),
+          { units: 'kilometers' },
+        );
+        const canvas = renderLabelPillCanvas(candidate.name, distanceKm, ROAD_CONGESTION_HEX.jammed);
+        const imageId = roadLabelImageId(candidate.dedupeKey);
+        upsertShelterCardImage(map, imageId, canvas);
+        features.push({
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: candidate.midpoint },
+          properties: { roadKey: candidate.dedupeKey, icon: imageId },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`Road-label update failed for road ${candidate.dedupeKey} — skipping this road's label:`, err);
+      }
+    });
+
+    try {
+      map.getSource('road-labels').setData({ type: 'FeatureCollection', features });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[MapLibreView] road-labels setData failed', err);
+    }
   }
 
   /**
@@ -2599,11 +2945,25 @@ export function MapLibreView({ scenario, timelineIndex }) {
 
         const existing = byId.get(feature.id);
         if (!existing || distanceKm < existing.distanceKm) {
+          // Label anchor for road labels (see updateRoadLabels below):
+          // turf.centroid of the segment's own geometry, which works
+          // uniformly for LineString and MultiLineString alike (unlike
+          // turf.along, which needs a single LineString and a length
+          // computed up front) — good enough for a short tag anchor
+          // point, not claimed to be the exact visual midpoint of a
+          // curved road.
+          let midpoint;
+          try {
+            midpoint = turf.centroid(feature).geometry.coordinates;
+          } catch (err) {
+            midpoint = null;
+          }
           byId.set(feature.id, {
             featureTarget: { source: BUILDINGS_SOURCE_ID, sourceLayer: ROADS_SOURCE_LAYER, id: feature.id },
             dedupeKey: String(feature.id),
             distanceKm,
             name: feature.properties?.name,
+            midpoint,
           });
         }
       });
@@ -2734,6 +3094,7 @@ export function MapLibreView({ scenario, timelineIndex }) {
     const map = mapRef.current;
     if (!map) return;
 
+    let bandsChanged = false;
     const candidates = roadCandidatesRef.current;
     candidates.forEach(({ featureTarget, dedupeKey, distanceKm }) => {
       if (manualRoadIdsRef.current.has(dedupeKey)) return; // manual override channel takes precedence
@@ -2748,6 +3109,7 @@ export function MapLibreView({ scenario, timelineIndex }) {
         return;
       }
       roadBandByKeyRef.current[dedupeKey] = band;
+      bandsChanged = true;
     });
 
     // Kartavya Path override — applied AFTER the general pass, and only
@@ -2770,8 +3132,16 @@ export function MapLibreView({ scenario, timelineIndex }) {
           return;
         }
         roadBandByKeyRef.current[dedupeKey] = 'jammed';
+        bandsChanged = true;
       });
     }
+
+    // Road labels only need rebuilding when a band actually changed
+    // this tick (roadmap's explicit "only touch it when the band
+    // changed" cadence) — cheap guard against re-rendering label
+    // canvases on every animation frame when nothing about the jammed
+    // set actually moved.
+    if (bandsChanged) updateRoadLabels();
   }
 
   /**
@@ -2795,6 +3165,18 @@ export function MapLibreView({ scenario, timelineIndex }) {
     roadBandByKeyRef.current = {};
     roadCandidatesRef.current = [];
     kartavyaPathFeatureIdsRef.current = [];
+    // Clear any road labels left over from the previous scenario/
+    // impact point — nothing is jammed immediately after a reset, so
+    // there's nothing to label until the new scenario's own animation
+    // marks something jammed again.
+    if (map.getSource('road-labels')) {
+      try {
+        map.getSource('road-labels').setData({ type: 'FeatureCollection', features: [] });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[MapLibreView] road-labels reset setData failed', err);
+      }
+    }
   }
 
   /**
