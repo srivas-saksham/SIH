@@ -465,6 +465,56 @@ export function buildBriefingNarrative(
  * @param {string} [phase] - this keyframe's `phase` field, if authored
  * @param {boolean} [isAttack] - this keyframe's `isAttack` flag
  */
+/**
+ * Content bundle for the 'intervention-response' chat turn (Task 3).
+ * Unlike the timeline-briefing content, there is no live "before" state
+ * threaded through here — per timelineIntent.js's parseInterventionIntent
+ * doc comment, the before/after figures always come from the scenario's
+ * single hand-authored `intervention` state and `comparisonStats`, since
+ * that's the only intervention outcome this model has authored. `percent`
+ * is narrative only (echoed back as "what was asked for"); it does not
+ * rescale any of the actual shelter/road/risk figures below.
+ *
+ * Falls back to `scenario.baseline` if a scenario has no authored
+ * `intervention` state at all (e.g. a future scenario not yet hand-tuned
+ * for Task 3), so this never throws even off the security-attack path.
+ */
+export function buildInterventionResponseContent(scenario, percent) {
+  const afterState = scenario.intervention || scenario.baseline;
+  const stats = scenario.comparisonStats || {};
+  const causalFactors = computeCausalFactors(afterState);
+
+  const sentences = [`Intervention applied: shelter capacity increased by ${percent}%.`];
+  if (stats.evacTimeBefore != null && stats.evacTimeAfter != null) {
+    sentences.push(
+      `Estimated evacuation time falls from ${stats.evacTimeBefore} to ${stats.evacTimeAfter} minutes.`,
+    );
+  }
+  if (stats.overloadBefore != null && stats.overloadAfter != null) {
+    sentences.push(
+      `Network shelter overload eases from ${stats.overloadBefore}% to ${stats.overloadAfter}% of rated capacity.`,
+    );
+  }
+  if (stats.riskZonesBefore != null && stats.riskZonesAfter != null) {
+    sentences.push(`Active risk zones drop from ${stats.riskZonesBefore} to ${stats.riskZonesAfter}.`);
+  }
+
+  const [topKey, topValue] = Object.entries(causalFactors).sort((a, b) => b[1] - a[1])[0] || [];
+  const whyAtRisk = topKey
+    ? `Post-intervention, the leading risk driver is ${FACTOR_LABELS[topKey]} at ${topValue}%.`
+    : '';
+
+  return {
+    headline: sentences.join(' '),
+    percent,
+    stats: buildStatBlock(scenario, afterState, true),
+    roads: buildRoadsNearby(scenario, afterState),
+    shelters: buildSheltersInRange(scenario),
+    causalFactors,
+    whyAtRisk,
+  };
+}
+
 export function buildTimelineBriefingContent(
   scenario,
   prevState,

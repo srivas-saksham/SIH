@@ -7,14 +7,21 @@ import {
   buildTimelineBriefingContent,
   buildRoadsQueryContent,
   buildSheltersQueryContent,
+  buildInterventionResponseContent,
 } from '../utils/buildAnalystContent';
 import { computeCausalFactors } from '../utils/causalFactors';
 import {
   buildProcessingLines,
   buildTimelineAdvanceLines,
+  buildInterventionLines,
   estimateProcessingDurationMs,
 } from '../utils/processingCascade';
-import { parseTimelineIntent, parseContentQueryIntent, isClearChatCommand } from '../utils/timelineIntent';
+import {
+  parseTimelineIntent,
+  parseContentQueryIntent,
+  parseInterventionIntent,
+  isClearChatCommand,
+} from '../utils/timelineIntent';
 import { ChatPanel } from './ChatPanel';
 import { KeyframeBlurb } from './KeyframeBlurb';
 import { MapLibreView } from './MapLibreView';
@@ -96,6 +103,7 @@ export function CommandShell() {
   const [chatTurns, setChatTurns] = useState([]);
   const pendingResponseTimeoutRef = useRef(null);
   const pendingAdvanceTimeoutRef = useRef(null);
+  const pendingInterventionTimeoutRef = useRef(null);
 
   // Bumped every time a new turn should force the chat to snap to the
   // very bottom, regardless of whether `chatTurns` itself has grown yet
@@ -111,12 +119,11 @@ export function CommandShell() {
   const [currentKeyframeIndex, setCurrentKeyframeIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
 
-  // Whether an intervention has been applied for the current scenario.
-  // Owned here (same pattern as the timeline state above) even though
-  // no chat command drives this yet — Task 3 wires the chat-triggered
-  // path; this task just keeps the underlying state/derivation intact
-  // so MapLibreView's props don't need to change shape again later.
-  const [interventionApplied] = useState(false);
+  // Whether an intervention has been applied for the current scenario
+  // (Task 3). Once true, `activeMapState` below fully swaps to the
+  // scenario's single hand-authored `intervention` state — same pattern
+  // Task 2 already relied on this state existing for.
+  const [interventionApplied, setInterventionApplied] = useState(false);
 
   // Map toolbar: shelters default OFF.
   const [sheltersVisible, setSheltersVisible] = useState(false);
@@ -133,6 +140,7 @@ export function CommandShell() {
     setCurrentKeyframeIndex(0);
     setIsPlaying(false);
     setSheltersVisible(false);
+    setInterventionApplied(false);
   }
 
   const mergedMapState = useMemo(
@@ -282,6 +290,47 @@ export function CommandShell() {
     appendTurn({ kind: 'shelters-query', content });
   }, [activeScenario, appendTurn]);
 
+  /**
+   * Intervention command (Task 3): "increase shelter capacity by 20%",
+   * "apply intervention", "deploy more shelters", etc. Mirrors
+   * advanceTimeline's pattern — a processing cascade turn first, then
+   * the real state change (interventionApplied -> true, which swaps
+   * `activeMapState` to the scenario's authored `intervention` state)
+   * commits together with the intervention-response chat turn right as
+   * the cascade finishes.
+   *
+   * Re-typing an intervention command once one is already applied is
+   * treated as "show me that again" rather than an error or a second
+   * cascade — there is only one authored intervention outcome, so
+   * there's nothing further to compute.
+   */
+  const handleApplyIntervention = useCallback(
+    (percent) => {
+      if (!activeScenario || isThinking) return;
+
+      if (interventionApplied) {
+        const content = buildInterventionResponseContent(activeScenario, percent);
+        appendTurn({ kind: 'intervention-response', content });
+        return;
+      }
+
+      const lines = buildInterventionLines(percent);
+      appendTurn({ kind: 'processing', lines });
+      setIsThinking(true);
+
+      if (pendingInterventionTimeoutRef.current) {
+        window.clearTimeout(pendingInterventionTimeoutRef.current);
+      }
+      pendingInterventionTimeoutRef.current = window.setTimeout(() => {
+        const content = buildInterventionResponseContent(activeScenario, percent);
+        setInterventionApplied(true);
+        appendTurn({ kind: 'intervention-response', content });
+        setIsThinking(false);
+      }, estimateProcessingDurationMs(lines) + RESPONSE_APPEND_BUFFER_MS);
+    },
+    [activeScenario, interventionApplied, isThinking, appendTurn],
+  );
+
   // Intent dispatcher (Task 2's must-deliver list): runs BEFORE
   // matchScenario. Checks the typed text against the small fixed
   // timeline-advancement vocabulary first; only falls through to
@@ -324,9 +373,23 @@ export function CommandShell() {
       return;
     }
 
+    // Intervention-command intent (Task 3) — checked BEFORE the
+    // content-query intent below. Deliberately ordered this way: several
+    // intervention phrasings ("increase shelter capacity by 20%",
+    // "deploy more shelters") also contain the word "shelter(s)", which
+    // parseContentQueryIntent alone would otherwise match first and
+    // misroute to a shelters-query turn instead of actually applying the
+    // intervention.
+    const interventionIntent = parseInterventionIntent(query);
+    if (interventionIntent && activeScenario) {
+      handleApplyIntervention(interventionIntent.percent);
+      return;
+    }
+
     // Content-query intent ("list all blocked roads", "shelters in
-    // range") — checked right after timeline-advancement, still before
-    // matchScenario, and also only meaningful once a scenario is active.
+    // range") — checked right after timeline-advancement/intervention,
+    // still before matchScenario, and also only meaningful once a
+    // scenario is active.
     const contentQueryIntent = parseContentQueryIntent(query);
     if (contentQueryIntent && activeScenario) {
       if (contentQueryIntent.type === 'roads') {

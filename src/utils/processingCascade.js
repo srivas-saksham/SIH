@@ -48,6 +48,29 @@ export function buildTimelineAdvanceLines(keyframeLabel) {
   ];
 }
 
+/**
+ * Intervention cascade (Task 3): shown while a chat-triggered
+ * intervention command ("increase shelter capacity by 20%", "apply
+ * intervention") is being "computed" against the already-active
+ * scenario. Same length class as the timeline-advance cascade — this is
+ * a recomputation, not a cold start — but its lines are written to read
+ * as deploying/allocating resources rather than re-merging a keyframe,
+ * and the requested percentage is echoed into the first line so the
+ * cascade visibly reflects what was actually typed.
+ */
+export function buildInterventionLines(percent) {
+  return [
+    `APPLYING INTERVENTION: SHELTER CAPACITY +${percent}%...`,
+    'ALLOCATING ADDITIONAL SHELTER CANDIDATES...',
+    'REDISTRIBUTING OCCUPANCY LOAD...',
+    'RECOMPUTING SHELTER OVERLOAD RATIO...',
+    'RE-EVALUATING ROAD NETWORK STATUS...',
+    'RECALCULATING CAUSAL RISK FACTORS...',
+    'REFRESHING EVACUATION ESTIMATE...',
+    'COMPILING INTERVENTION IMPACT BRIEFING...',
+  ];
+}
+
 // Per-line reveal delay for the processing cascade (ProcessingTurn in
 // ChatMessage.jsx reveals lines one at a time on this cadence, instead
 // of dumping them all at once) — shared with CommandShell so the fake

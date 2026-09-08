@@ -120,6 +120,48 @@ export function parseContentQueryIntent(rawInput) {
 }
 
 /**
+ * Intervention-command intent (Task 3, Section 2 point 3 / Task 3 spec):
+ * typing "increase shelter capacity by 20%", "apply intervention",
+ * "deploy more shelters", "boost shelter capacity", etc. while a
+ * scenario is active means "apply the scenario's authored intervention
+ * state". Deliberately broad on phrasing for the same reason
+ * parseContentQueryIntent is broad: a "shelter capacity" / "intervention"
+ * / "deploy more shelters" mention is enough, no rigid sentence shape is
+ * required.
+ *
+ * Percentage extraction: pulled from the FIRST number in the text
+ * (with or without a trailing "%"/"percent"). Per the confirmed spec
+ * (Section 2 point 3), a missing or unparseable number is NOT an error
+ * and never produces a clarifying question — it silently defaults to
+ * 20. The percentage is narrative only (it's echoed back in the
+ * intervention-response headline/badge as "what was asked for"); the
+ * actual before/after figures always come from the scenario's single
+ * hand-authored `intervention` state and `comparisonStats`, since that's
+ * the only intervention outcome this model has authored — the percent
+ * is not used to mathematically rescale shelter data.
+ *
+ * @param {string} rawInput
+ * @returns {{type:'intervention', percent:number}|null}
+ */
+const INTERVENTION_WORDS =
+  /\b(intervention|shelter\s*capacity|deploy(ing)?\s+(more|additional|extra)\s+shelters?|boost\s+shelters?|add(ing)?\s+shelters?|expand\s+shelters?|reinforce(ment)?)\b/;
+const DEFAULT_INTERVENTION_PERCENT = 20;
+
+export function parseInterventionIntent(rawInput) {
+  if (!rawInput) return null;
+  const normalized = normalize(rawInput);
+  if (!normalized) return null;
+
+  if (!INTERVENTION_WORDS.test(normalized)) return null;
+
+  const numberMatch = /(\d{1,3})\s*(percent|pct)?/.exec(normalized);
+  const parsed = numberMatch ? Number.parseInt(numberMatch[1], 10) : NaN;
+  const percent = Number.isFinite(parsed) && parsed > 0 && parsed <= 100 ? parsed : DEFAULT_INTERVENTION_PERCENT;
+
+  return { type: 'intervention', percent };
+}
+
+/**
  * "cls" (typed alone, case/whitespace-insensitive) clears the entire
  * chat history — a small terminal-style convenience, checked before
  * every other intent in the dispatcher.

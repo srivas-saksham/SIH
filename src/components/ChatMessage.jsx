@@ -410,6 +410,40 @@ function TimelineBriefingTurn({ content, onReveal, nextLabel, onAdvance, isFinal
   );
 }
 
+/** Intervention-response turn (Task 3): same staggered stat/roads/
+ * shelters/causal-factor reveal pattern as the other content turns, but
+ * the headline is a short, already-computed before/after narrative (not
+ * typewriter-animated, same reasoning as TimelineBriefingTurn), and it
+ * closes with a persistent "Intervention active" badge instead of a
+ * "Next" button — applying the intervention doesn't advance the
+ * timeline, so there's nothing to step to from here. */
+function InterventionResponseTurn({ content, onReveal, onQueryRoads, onQueryShelters }) {
+  // 1 = stats shown, 2 = +roads, 3 = +shelters, 4 = +causal factors/badge.
+  const [phase, setPhase] = useState(0);
+
+  useEffect(() => {
+    if (phase >= 4) return undefined;
+    const id = window.setTimeout(() => {
+      setPhase((p) => p + 1);
+      onReveal?.();
+    }, PHASE_STAGGER_MS);
+    return () => window.clearTimeout(id);
+  }, [phase, onReveal]);
+
+  return (
+    <div className="border-b border-hairline pb-4">
+      <p className="text-sm leading-relaxed text-ink">{content.headline}</p>
+      {phase >= 1 && <StatBlock stats={content.stats} />}
+      {phase >= 4 && <QuickActionButtons onQueryRoads={onQueryRoads} onQueryShelters={onQueryShelters} />}
+      {phase >= 4 && (
+        <p className="mt-4 inline-flex items-center gap-2 border border-emerald-400/40 bg-emerald-400/10 px-3 py-1.5 text-[11px] uppercase tracking-[0.2em] text-emerald-300">
+          Intervention active — shelter capacity +{content.percent}%
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Graceful "didn't understand" turn (Task 2 / Section 5's closing
  * paragraph): shown when typed text matches neither timeline-advancement
  * vocabulary nor any scenario's keywords confidently — instead of
@@ -420,8 +454,9 @@ function ClarifyFallbackTurn() {
       <p className="text-sm leading-relaxed text-ink-dim">
         I didn&apos;t quite catch that. Try describing a scenario (e.g. &ldquo;hostile attack in Central
         Delhi&rdquo;), say &ldquo;next&rdquo; / name a checkpoint (e.g. &ldquo;T+15&rdquo;) to advance an active
-        timeline, ask for roads/shelters (e.g. &ldquo;blocked roads&rdquo;, &ldquo;shelters in range&rdquo;), or
-        type &ldquo;cls&rdquo; to clear this chat.
+        timeline, ask for roads/shelters (e.g. &ldquo;blocked roads&rdquo;, &ldquo;shelters in range&rdquo;),
+        apply an intervention (e.g. &ldquo;increase shelter capacity by 20%&rdquo;), or type &ldquo;cls&rdquo;
+        to clear this chat.
       </p>
     </div>
   );
@@ -462,8 +497,15 @@ export function ChatMessage({ turn, onReveal, onAdvance, onQueryRoads, onQuerySh
       return <SheltersQueryTurn content={turn.content} onReveal={onReveal} />;
     case 'clarify-fallback':
       return <ClarifyFallbackTurn />;
-    // 'intervention-response' is stubbed/reserved for Task 3 (Section 7)
-    // — not built yet.
+    case 'intervention-response':
+      return (
+        <InterventionResponseTurn
+          content={turn.content}
+          onReveal={onReveal}
+          onQueryRoads={onQueryRoads}
+          onQueryShelters={onQueryShelters}
+        />
+      );
     default:
       return null;
   }
