@@ -151,6 +151,34 @@
             77.205
           ]
         ]
+      },
+      {
+        "id": "r6",
+        "status": "clear",
+        "coords": [
+          [
+            28.6165,
+            77.2215
+          ],
+          [
+            28.6158,
+            77.228
+          ]
+        ]
+      },
+      {
+        "id": "r7",
+        "status": "clear",
+        "coords": [
+          [
+            28.6115,
+            77.223
+          ],
+          [
+            28.614,
+            77.235
+          ]
+        ]
       }
     ],
     "shelters": [
@@ -385,6 +413,14 @@
         {
           "id": "r5",
           "status": "clear"
+        },
+        {
+          "id": "r6",
+          "status": "clear"
+        },
+        {
+          "id": "r7",
+          "status": "clear"
         }
       ],
       "shelters": [],
@@ -394,7 +430,10 @@
         "populationDensity": 60,
         "roadAccessibility": 20,
         "infrastructure": 10
-      }
+      },
+      "phase": "pre-attack",
+      "isAttack": false,
+      "blurb": "Baseline threat assessment established near Parliament House. Routes largely clear, shelters empty, situation under close watch."
     },
     {
       "label": "T+5",
@@ -435,6 +474,14 @@
         {
           "id": "r5",
           "status": "clear"
+        },
+        {
+          "id": "r6",
+          "status": "clear"
+        },
+        {
+          "id": "r7",
+          "status": "clear"
         }
       ],
       "shelters": [
@@ -445,11 +492,14 @@
       ],
       "roadCongestion": [],
       "causalFactors": {
-        "shelterDeficit": 36,
-        "populationDensity": 63,
-        "roadAccessibility": 70,
-        "infrastructure": 28
-      }
+        "shelterDeficit": 30,
+        "populationDensity": 62,
+        "roadAccessibility": 55,
+        "infrastructure": 25
+      },
+      "phase": "escalation",
+      "isAttack": false,
+      "blurb": "Early disruption spreads \u2014 Sansad Marg blocked, nearby routes congesting as crowds react to rising tension near Parliament."
     },
     {
       "label": "T+10",
@@ -494,6 +544,14 @@
         {
           "id": "r5",
           "status": "clear"
+        },
+        {
+          "id": "r6",
+          "status": "clear"
+        },
+        {
+          "id": "r7",
+          "status": "congested"
         }
       ],
       "shelters": [
@@ -508,11 +566,14 @@
       ],
       "roadCongestion": [],
       "causalFactors": {
-        "shelterDeficit": 68,
-        "populationDensity": 65,
-        "roadAccessibility": 90,
-        "infrastructure": 52
-      }
+        "shelterDeficit": 55,
+        "populationDensity": 64,
+        "roadAccessibility": 75,
+        "infrastructure": 45
+      },
+      "phase": "peak-disruption",
+      "isAttack": false,
+      "blurb": "Disruption peaks ahead of the attack \u2014 multiple routes blocked or congested, shelters filling fast as evacuation urgency builds."
     },
     {
       "label": "T+15",
@@ -540,18 +601,26 @@
         },
         {
           "id": "r2",
-          "status": "congested"
+          "status": "blocked"
         },
         {
           "id": "r3",
-          "status": "congested"
+          "status": "blocked"
         },
         {
           "id": "r4",
-          "status": "clear"
+          "status": "congested"
         },
         {
           "id": "r5",
+          "status": "congested"
+        },
+        {
+          "id": "r6",
+          "status": "clear"
+        },
+        {
+          "id": "r7",
           "status": "clear"
         }
       ],
@@ -571,11 +640,14 @@
       ],
       "roadCongestion": [],
       "causalFactors": {
-        "shelterDeficit": 82,
-        "populationDensity": 62,
-        "roadAccessibility": 55,
-        "infrastructure": 71
-      }
+        "shelterDeficit": 85,
+        "populationDensity": 68,
+        "roadAccessibility": 92,
+        "infrastructure": 78
+      },
+      "phase": "attack",
+      "isAttack": true,
+      "blurb": "Attack strikes near Parliament House. Surrounding roads blocked, shelters overwhelmed; the Pragati Maidan corridor remains the viable evacuation route."
     },
     {
       "label": "T+30",
@@ -607,11 +679,11 @@
         },
         {
           "id": "r2",
-          "status": "clear"
+          "status": "blocked"
         },
         {
           "id": "r3",
-          "status": "clear"
+          "status": "congested"
         },
         {
           "id": "r4",
@@ -619,6 +691,14 @@
         },
         {
           "id": "r5",
+          "status": "clear"
+        },
+        {
+          "id": "r6",
+          "status": "clear"
+        },
+        {
+          "id": "r7",
           "status": "clear"
         }
       ],
@@ -638,11 +718,14 @@
       ],
       "roadCongestion": [],
       "causalFactors": {
-        "shelterDeficit": 88,
-        "populationDensity": 58,
-        "roadAccessibility": 15,
-        "infrastructure": 84
-      }
+        "shelterDeficit": 78,
+        "populationDensity": 60,
+        "roadAccessibility": 40,
+        "infrastructure": 82
+      },
+      "phase": "response-recovery",
+      "isAttack": false,
+      "blurb": "Response stabilizes \u2014 several routes reopen and shelter load eases, though infrastructure damage remains the lasting concern."
     }
   ],
   "causalFactors": {

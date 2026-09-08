@@ -93,38 +93,138 @@ function CausalFactors({ factors }) {
   );
 }
 
-function RoadsList({ roads }) {
-  if (!roads || roads.length === 0) return null;
+/** Compact roads/shelters chip lists are no longer rendered inline by
+ * default on every activation/briefing turn (per explicit follow-up:
+ * that repetition was the whole complaint) — they're only shown via
+ * `RoadsQueryTurn`/`SheltersQueryTurn` below, reached through the
+ * quick-action buttons or a typed query.
+ */
+
+/** The "why this area is at risk" narrative — a real sentence or two
+ * that names the dominant causal factor(s) and ties them to the
+ * scenario's attack timing/phase, replacing the old static caption that
+ * sat above the bars unchanged every keyframe. Rendered right below the
+ * bars (per explicit follow-up: evac time / overload / risk zones /
+ * shelters, THEN this, every single time). */
+function WhyAtRiskNarrative({ text }) {
+  if (!text) return null;
   return (
-    <div className="mt-4 animate-[fadeIn_0.35s_ease-out_forwards]">
-      <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Roads nearby</p>
-      <ul className="mt-2 space-y-1">
-        {roads.map((road) => (
-          <li key={road.id} className="flex items-center justify-between text-xs">
-            <span className="text-slate-300">{road.label}</span>
-            <span className={`uppercase tracking-[0.14em] ${ROAD_STATUS_CLASS[road.status] || 'text-ink-dim'}`}>
-              {road.status}
-            </span>
-          </li>
-        ))}
-      </ul>
+    <p className="mt-2 text-xs leading-relaxed text-ink-dim animate-[fadeIn_0.35s_ease-out_forwards]">{text}</p>
+  );
+}
+
+const ROAD_FILTERS = [
+  { key: 'all', label: 'All' },
+  { key: 'blocked', label: 'Blocked' },
+  { key: 'congested', label: 'Congested' },
+  { key: 'clear', label: 'Open' },
+];
+
+/** Quick-action buttons offered at the end of every activation/briefing
+ * turn (Task 2 follow-up): "Roads nearby" and "Shelters in range" —
+ * distinct color from the "Next" advancement button so they read as a
+ * different KIND of action (query, not advance) rather than competing
+ * with it. Also reachable by typing the equivalent list command
+ * (parseContentQueryIntent in timelineIntent.js). */
+function QuickActionButtons({ onQueryRoads, onQueryShelters }) {
+  if (!onQueryRoads && !onQueryShelters) return null;
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-2">
+      {onQueryRoads && (
+        <button
+          type="button"
+          onClick={() => onQueryRoads('all')}
+          className="inline-flex items-center gap-2 border border-cyan-400/40 bg-cyan-400/10 px-3 py-1.5 text-[11px] uppercase tracking-[0.2em] text-cyan-300 transition hover:bg-cyan-400/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
+        >
+          Roads nearby
+        </button>
+      )}
+      {onQueryShelters && (
+        <button
+          type="button"
+          onClick={onQueryShelters}
+          className="inline-flex items-center gap-2 border border-violet-400/40 bg-violet-400/10 px-3 py-1.5 text-[11px] uppercase tracking-[0.2em] text-violet-300 transition hover:bg-violet-400/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
+        >
+          Shelters in range
+        </button>
+      )}
     </div>
   );
 }
 
-function SheltersList({ shelters }) {
-  if (!shelters || shelters.length === 0) return null;
+/** Full, filterable roads roster — rendered for the 'roads-query' turn
+ * kind (Roads nearby button / typed "list all blocked roads" etc). Shows
+ * EVERY tracked road (not just problem ones), plus its own filter
+ * sub-buttons so a person can immediately narrow to just blocked /
+ * congested / open without retyping. */
+function RoadsQueryTurn({ content, onReveal, onQueryRoads }) {
+  const [headlineDone, setHeadlineDone] = useState(false);
   return (
-    <div className="mt-4 animate-[fadeIn_0.35s_ease-out_forwards]">
-      <p className="text-[10px] uppercase tracking-[0.28em] text-ink-dim">Shelters in range</p>
-      <ul className="mt-2 space-y-1">
-        {shelters.map((shelter) => (
-          <li key={shelter.id} className="flex items-center justify-between text-xs">
-            <span className="text-slate-300">{shelter.name}</span>
-            <span className="font-mono text-ink-dim">{shelter.distanceKm.toFixed(2)} km</span>
-          </li>
-        ))}
-      </ul>
+    <div className="border-b border-hairline pb-4">
+      <TypewriterHeadline text={content.headline} onReveal={onReveal} onDone={() => setHeadlineDone(true)} />
+      {headlineDone && (
+        <ul className="mt-3 space-y-1 animate-[fadeIn_0.35s_ease-out_forwards]">
+          {content.roads.map((road) => (
+            <li key={road.id} className="flex items-center justify-between gap-3 text-xs">
+              <span className="text-slate-300">
+                {road.label}
+                {road.shelterName && (
+                  <span className="block text-[10px] text-ink-faint">→ {road.shelterName} ({road.shelterDistanceKm} km)</span>
+                )}
+              </span>
+              <span className={`shrink-0 uppercase tracking-[0.14em] ${ROAD_STATUS_CLASS[road.status] || 'text-accent'}`}>
+                {road.status}
+              </span>
+            </li>
+          ))}
+          {content.roads.length === 0 && <li className="text-xs text-ink-faint">None at this checkpoint.</li>}
+        </ul>
+      )}
+      {headlineDone && onQueryRoads && (
+        <div className="mt-3 flex flex-wrap gap-2 animate-[fadeIn_0.35s_ease-out_forwards]">
+          {ROAD_FILTERS.filter((f) => f.key !== content.filter).map((f) => (
+            <button
+              key={f.key}
+              type="button"
+              onClick={() => onQueryRoads(f.key)}
+              className="inline-flex items-center gap-1 border border-cyan-400/30 bg-cyan-400/5 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-cyan-300/90 transition hover:bg-cyan-400/15 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Full shelters roster with structural rating + feasibility notes —
+ * rendered for the 'shelters-query' turn kind. */
+function SheltersQueryTurn({ content, onReveal }) {
+  const [headlineDone, setHeadlineDone] = useState(false);
+  return (
+    <div className="border-b border-hairline pb-4">
+      <TypewriterHeadline text={content.headline} onReveal={onReveal} onDone={() => setHeadlineDone(true)} />
+      {headlineDone && (
+        <ul className="mt-3 space-y-3 animate-[fadeIn_0.35s_ease-out_forwards]">
+          {content.shelters.map((shelter) => (
+            <li key={shelter.id} className="text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-200">{shelter.name}</span>
+                <span className="font-mono text-ink-dim">{shelter.distanceKm.toFixed(2)} km</span>
+              </div>
+              {shelter.metadata?.structuralRating && (
+                <p className="mt-0.5 text-[10px] uppercase tracking-[0.16em] text-ink-faint">
+                  Structural rating: {shelter.metadata.structuralRating}
+                </p>
+              )}
+              {shelter.metadata?.feasibilityNote && (
+                <p className="mt-1 text-[11px] leading-relaxed text-ink-dim">{shelter.metadata.feasibilityNote}</p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -222,7 +322,7 @@ function NextStepButton({ nextLabel, onAdvance }) {
 /** Full analyst-response turn — headline types out first, then stats,
  * roads, shelters, and causal factors each reveal in sequence
  * (Section 6) rather than appearing all at once. */
-function ActivationResponseTurn({ content, onReveal, nextLabel, onAdvance }) {
+function ActivationResponseTurn({ content, onReveal, nextLabel, onAdvance, onQueryRoads, onQueryShelters }) {
   // 0 = headline typing, 1 = stats shown, 2 = +roads, 3 = +shelters,
   // 4 = +causal factors (fully revealed).
   const [phase, setPhase] = useState(0);
@@ -245,9 +345,9 @@ function ActivationResponseTurn({ content, onReveal, nextLabel, onAdvance }) {
     <div className="border-b border-hairline pb-4">
       <TypewriterHeadline text={content.headline} onReveal={onReveal} onDone={() => setHeadlineDone(true)} />
       {phase >= 1 && <StatBlock stats={content.stats} />}
-      {phase >= 2 && <RoadsList roads={content.roads} />}
-      {phase >= 3 && <SheltersList shelters={content.shelters} />}
+      {phase >= 1 && <WhyAtRiskNarrative text={content.whyAtRisk} />}
       {phase >= 4 && <CausalFactors factors={content.causalFactors} />}
+      {phase >= 4 && <QuickActionButtons onQueryRoads={onQueryRoads} onQueryShelters={onQueryShelters} />}
       {phase >= 4 && <NextStepButton nextLabel={nextLabel} onAdvance={onAdvance} />}
     </div>
   );
@@ -259,7 +359,7 @@ function ActivationResponseTurn({ content, onReveal, nextLabel, onAdvance }) {
  * computed delta sentence, not a "the system is thinking" moment).
  * Stats/roads/shelters/causal-factors still reveal in the same staggered
  * phases so briefings still visibly "build" rather than dumping at once. */
-function TimelineBriefingTurn({ content, onReveal, nextLabel, onAdvance, isFinal }) {
+function TimelineBriefingTurn({ content, onReveal, nextLabel, onAdvance, isFinal, onQueryRoads, onQueryShelters }) {
   // 1 = stats shown, 2 = +roads, 3 = +shelters, 4 = +causal factors.
   const [phase, setPhase] = useState(0);
 
@@ -276,9 +376,9 @@ function TimelineBriefingTurn({ content, onReveal, nextLabel, onAdvance, isFinal
     <div className="border-b border-hairline pb-4">
       <p className="text-sm leading-relaxed text-ink">{content.headline}</p>
       {phase >= 1 && <StatBlock stats={content.stats} />}
-      {phase >= 2 && <RoadsList roads={content.roads} />}
-      {phase >= 3 && <SheltersList shelters={content.shelters} />}
+      {phase >= 1 && <WhyAtRiskNarrative text={content.whyAtRisk} />}
       {phase >= 4 && <CausalFactors factors={content.causalFactors} />}
+      {phase >= 4 && <QuickActionButtons onQueryRoads={onQueryRoads} onQueryShelters={onQueryShelters} />}
       {phase >= 4 && isFinal && (
         <p className="mt-4 text-[11px] uppercase tracking-[0.22em] text-ink-dim">
           Scenario timeline complete.
@@ -298,14 +398,15 @@ function ClarifyFallbackTurn() {
     <div className="border-b border-hairline pb-4">
       <p className="text-sm leading-relaxed text-ink-dim">
         I didn&apos;t quite catch that. Try describing a scenario (e.g. &ldquo;hostile attack in Central
-        Delhi&rdquo;), or say &ldquo;next&rdquo; / name a checkpoint (e.g. &ldquo;T+15&rdquo;) to advance an
-        active timeline.
+        Delhi&rdquo;), say &ldquo;next&rdquo; / name a checkpoint (e.g. &ldquo;T+15&rdquo;) to advance an active
+        timeline, ask for roads/shelters (e.g. &ldquo;blocked roads&rdquo;, &ldquo;shelters in range&rdquo;), or
+        type &ldquo;cls&rdquo; to clear this chat.
       </p>
     </div>
   );
 }
 
-export function ChatMessage({ turn, onReveal, onAdvance }) {
+export function ChatMessage({ turn, onReveal, onAdvance, onQueryRoads, onQueryShelters }) {
   switch (turn.kind) {
     case 'user':
       return <UserTurn text={turn.text} />;
@@ -318,6 +419,8 @@ export function ChatMessage({ turn, onReveal, onAdvance }) {
           onReveal={onReveal}
           nextLabel={turn.nextLabel}
           onAdvance={turn.nextLabel ? onAdvance : undefined}
+          onQueryRoads={onQueryRoads}
+          onQueryShelters={onQueryShelters}
         />
       );
     case 'timeline-briefing':
@@ -328,8 +431,14 @@ export function ChatMessage({ turn, onReveal, onAdvance }) {
           nextLabel={turn.nextLabel}
           onAdvance={turn.nextLabel ? onAdvance : undefined}
           isFinal={turn.isFinal}
+          onQueryRoads={onQueryRoads}
+          onQueryShelters={onQueryShelters}
         />
       );
+    case 'roads-query':
+      return <RoadsQueryTurn content={turn.content} onReveal={onReveal} onQueryRoads={onQueryRoads} />;
+    case 'shelters-query':
+      return <SheltersQueryTurn content={turn.content} onReveal={onReveal} />;
     case 'clarify-fallback':
       return <ClarifyFallbackTurn />;
     // 'intervention-response' is stubbed/reserved for Task 3 (Section 7)

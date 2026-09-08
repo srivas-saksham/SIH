@@ -7,6 +7,27 @@ import { computeCausalFactors } from './causalFactors';
 // used only if a scenario's T+0 keyframe doesn't define impactPoint.
 const FALLBACK_IMPACT_POINT = { lat: 28.6134, lng: 77.2096 };
 
+// Explicit id -> real-world destination naming for the security-attack
+// scenario's 5 legacy roads (r1-r5, all originally anonymous stand-ins
+// clustered around the Parliament House/Central Vista impact point) plus
+// the 2 new roads (r6/r7) added specifically as the Pragati Maidan
+// evacuation corridor. Named directly rather than via nearest-landmark
+// guessing, per explicit follow-up feedback that "roads nearby" should
+// read as PRACTICAL routes to real places, not vague status chips.
+// Falls back to nearest-landmark labeling for any road id not in this
+// map (e.g. a future scenario's own r1..rN that hasn't been hand-named).
+const ROAD_DESTINATIONS = {
+  r1: 'Sansad Marg (Parliament House approach)',
+  r2: 'Rajpath / Kartavya Path (Parliament frontage)',
+  r3: 'Ashoka Road (Parliament perimeter)',
+  r4: 'Tilak Marg approach',
+  r5: 'Man Singh Road approach',
+  r6: 'Copernicus Marg — toward Pragati Maidan',
+  r7: 'Bhairon Marg — toward Pragati Maidan',
+};
+
+const ROAD_STATUS_ORDER = { blocked: 0, congested: 1, clear: 2 };
+
 function resolveImpactPoint(scenario) {
   const t0 = Array.isArray(scenario.timeline) ? scenario.timeline[0] : null;
   return t0?.impactPoint || FALLBACK_IMPACT_POINT;
@@ -22,6 +43,25 @@ function nearestLandmarks(impactPoint, count = 3) {
     .map((landmark) => ({ ...landmark, distanceKm: haversineDistanceKm(impactPoint, landmark) }))
     .sort((a, b) => a.distanceKm - b.distanceKm)
     .slice(0, count);
+}
+
+/** Nearest real metro-shelter to an arbitrary point — used to correlate
+ * a road with "which shelter does this actually lead toward", per
+ * explicit follow-up feedback that roads-nearby should be tied to
+ * shelter access, not just a status chip. */
+function nearestShelter(point) {
+  if (!point) return null;
+  return [...METRO_SHELTERS]
+    .map((shelter) => ({ ...shelter, distanceKm: haversineDistanceKm(point, shelter) }))
+    .sort((a, b) => a.distanceKm - b.distanceKm)[0];
+}
+
+function midpointOf(coords) {
+  if (!coords || coords.length === 0) return null;
+  return {
+    lat: coords.reduce((sum, c) => sum + c[0], 0) / coords.length,
+    lng: coords.reduce((sum, c) => sum + c[1], 0) / coords.length,
+  };
 }
 
 /**
@@ -101,39 +141,83 @@ export function buildStatBlock(scenario, mapState, interventionApplied) {
 }
 
 /**
- * Roads-nearby list. Reflects whichever roads are ACTUALLY blocked or
- * congested in this exact `mapState` — since each keyframe's merged
- * road list genuinely differs (different ids clear, different ids get
- * newly blocked), this list's contents change keyframe to keyframe
- * rather than repeating. `security-attack.json`'s baseline.roads entries
- * only carry an id + status + raw coordinates (no name field) —
- * MapLibreView's live-queried, named `roadCandidatesRef` data only
- * exists once the real map has mounted and queried actual OSM road
- * features, which isn't available at the moment this chat response is
- * composed. As a documented, honest simplification for this static chat
- * copy, each road is labeled by its status plus the nearest real
- * landmark to its midpoint (still real, sourced data — just not the live
- * OSM road name).
+ * Resolves a single road diff/state entry (from mapState.roads, which
+ * only ever carries {id, status, coords?}) into the practical,
+ * shelter-correlated shape the UI actually wants: a named destination,
+ * which real shelter it functionally leads toward, and how far that
+ * shelter is. `scenario.baseline.roads` is consulted for coords when the
+ * merged entry itself doesn't carry them (keyframes only diff `status`).
+ */
+function resolveRoadDetail(scenario, road) {
+  const baselineRoad = (scenario.baseline?.roads || []).find((r) => r.id === road.id);
+  const coords = road.coords || baselineRoad?.coords;
+  const mid = midpointOf(coords);
+  const shelter = mid ? nearestShelter(mid) : null;
+  const destination =
+    ROAD_DESTINATIONS[road.id] ||
+    (() => {
+      const nearest = mid ? nearestLandmarks(mid, 1)[0] : null;
+      return nearest ? `Route near ${nearest.name}` : `Route ${road.id}`;
+    })();
+
+  return {
+    id: road.id,
+    status: road.status,
+    label: destination,
+    shelterName: shelter?.name || null,
+    shelterDistanceKm: shelter ? Number(shelter.distanceKm.toFixed(2)) : null,
+  };
+}
+
+/**
+ * Roads-nearby list — now correlated with shelter access per explicit
+ * follow-up feedback ("the important roads are the roads TO the
+ * shelters"): each entry names its real destination corridor and the
+ * nearest real shelter it functionally serves, not just an anonymous
+ * status chip. Only returns blocked/congested roads (the "problem"
+ * list, used for the compact activation/briefing turn) — see
+ * `buildRoadsQueryContent` below for the full, filterable roster used by
+ * the dedicated "Roads nearby" button / typed list commands.
  */
 export function buildRoadsNearby(scenario, mapState) {
   const roads = mapState?.roads || [];
   return roads
     .filter((road) => road.status === 'blocked' || road.status === 'congested')
-    .map((road) => {
-      const coords = road.coords || [];
-      const mid = coords.length
-        ? {
-            lat: coords.reduce((sum, c) => sum + c[0], 0) / coords.length,
-            lng: coords.reduce((sum, c) => sum + c[1], 0) / coords.length,
-          }
-        : null;
-      const nearest = mid ? nearestLandmarks(mid, 1)[0] : null;
-      return {
-        id: road.id,
-        status: road.status,
-        label: nearest ? `Route near ${nearest.name}` : `Route ${road.id}`,
-      };
-    });
+    .sort((a, b) => ROAD_STATUS_ORDER[a.status] - ROAD_STATUS_ORDER[b.status])
+    .map((road) => resolveRoadDetail(scenario, road));
+}
+
+/**
+ * Full roads roster for the "Roads nearby" quick-action button and for
+ * typed queries like "list all blocked roads" / "which routes are open".
+ * Unlike `buildRoadsNearby` (compact, problem-only), this ALWAYS returns
+ * every tracked road for the current keyframe, optionally filtered by
+ * status, sorted worst-first so the most operationally relevant entries
+ * lead.
+ *
+ * @param {string} filter - 'all' | 'blocked' | 'congested' | 'clear'
+ */
+export function buildRoadsQueryContent(scenario, mapState, filter = 'all') {
+  const roads = mapState?.roads || [];
+  const filtered = filter === 'all' ? roads : roads.filter((r) => r.status === filter);
+  const details = filtered
+    .sort((a, b) => ROAD_STATUS_ORDER[a.status] - ROAD_STATUS_ORDER[b.status])
+    .map((road) => resolveRoadDetail(scenario, road));
+
+  const counts = {
+    blocked: roads.filter((r) => r.status === 'blocked').length,
+    congested: roads.filter((r) => r.status === 'congested').length,
+    clear: roads.filter((r) => r.status === 'clear').length,
+  };
+
+  const headline =
+    details.length === 0
+      ? `No ${filter === 'all' ? 'tracked roads' : `${filter} roads`} at this checkpoint.`
+      : `${details.length} of ${roads.length} tracked road${roads.length === 1 ? '' : 's'} ${
+          filter === 'all' ? 'currently tracked' : `currently ${filter}`
+        }. ${counts.blocked} blocked, ${counts.congested} congested, ${counts.clear} clear.`;
+
+  return { headline, roads: details, filter, counts };
 }
 
 /**
@@ -153,14 +237,85 @@ export function buildSheltersInRange(scenario, count = 5) {
 }
 
 /**
+ * Full shelters roster for the "Shelters in range" quick-action button /
+ * typed "list shelters" query — adds each shelter's structural rating
+ * and feasibility note (already authored in delhiMetroShelters.js) on
+ * top of the compact list's name+distance, since this is the "give me
+ * everything" view rather than the inline compact one.
+ */
+export function buildSheltersQueryContent(scenario) {
+  const shelters = buildSheltersInRange(scenario, METRO_SHELTERS.length);
+  const headline = `${shelters.length} tracked shelters within range, nearest first.`;
+  return { headline, shelters };
+}
+
+// ---------------------------------------------------------------------
+// "Why this area is at risk" — a real, varying narrative rather than a
+// static caption sitting above the bars. Explains which factor(s) are
+// currently dominant and ties them to the scenario's actual T+15 attack
+// moment (per explicit follow-up: the T+15 attack point was never
+// actually mentioned in the UI) so the phrase changes meaningfully
+// keyframe to keyframe instead of reading identically every time.
+// ---------------------------------------------------------------------
+
+const FACTOR_LABELS = {
+  shelterDeficit: 'shelter deficit',
+  populationDensity: 'population density pressure',
+  roadAccessibility: 'road inaccessibility',
+  infrastructure: 'infrastructure strain',
+};
+
+const PHASE_COPY = {
+  'pre-attack': 'before the attack window opens',
+  escalation: 'as the situation escalates ahead of the attack',
+  'peak-disruption': 'in the final approach to the attack window',
+  attack: 'at the moment of attack',
+  'response-recovery': 'in the response and recovery window following the attack',
+};
+
+/**
+ * @param {object} causalFactors - this keyframe's 4-factor object
+ * @param {string} keyframeLabel - e.g. "T+15"
+ * @param {string} phase - the keyframe's `phase` field from the scenario
+ *   JSON (e.g. 'attack', 'response-recovery'); undefined for scenarios
+ *   that haven't been hand-annotated with a phase yet.
+ * @param {boolean} isAttack - the keyframe's `isAttack` flag
+ */
+export function buildWhyAreaAtRisk(causalFactors, keyframeLabel, phase, isAttack) {
+  if (!causalFactors) return '';
+
+  const entries = Object.entries(causalFactors).sort((a, b) => b[1] - a[1]);
+  const [topKey, topValue] = entries[0];
+  const [secondKey, secondValue] = entries[1] || [];
+
+  const phaseClause = phase ? PHASE_COPY[phase] || null : null;
+  const timeClause = isAttack
+    ? `${keyframeLabel} marks the attack itself`
+    : phaseClause
+      ? `${keyframeLabel} sits ${phaseClause}`
+      : `at ${keyframeLabel}`;
+
+  const leadSentence = `${timeClause}, the dominant driver here is ${FACTOR_LABELS[topKey]} at ${topValue}%.`;
+
+  const secondSentence =
+    secondKey && secondValue >= 20
+      ? ` ${FACTOR_LABELS[secondKey][0].toUpperCase()}${FACTOR_LABELS[secondKey].slice(1)} is the next-largest contributor at ${secondValue}%.`
+      : '';
+
+  return `${leadSentence}${secondSentence}`;
+}
+
+/**
  * Full content bundle for the analyst-response chat turn (Section 6).
  * `causalFactors`, if not explicitly passed, is computed live from
  * `mapState` via `computeCausalFactors` rather than requiring a
- * pre-authored static object.
+ * pre-authored static object. `phase`/`isAttack` come straight off the
+ * matched T+0 keyframe when present.
  */
 export function buildAnalystContent(scenario, mapState, interventionApplied, causalFactors) {
   const impactPoint = resolveImpactPoint(scenario);
   const landmarks = nearestLandmarks(impactPoint, 3);
+  const t0 = Array.isArray(scenario.timeline) ? scenario.timeline[0] : null;
 
   const landmarkNames = landmarks.map((l) => l.name);
   const headline =
@@ -168,12 +323,15 @@ export function buildAnalystContent(scenario, mapState, interventionApplied, cau
       ? `Scenario active: ${scenario.name}. Impact centered near ${landmarkNames.join(', ')}.`
       : `Scenario active: ${scenario.name}.`;
 
+  const resolvedCausalFactors = causalFactors || computeCausalFactors(mapState);
+
   return {
     headline,
     stats: buildStatBlock(scenario, mapState, interventionApplied),
     roads: buildRoadsNearby(scenario, mapState),
     shelters: buildSheltersInRange(scenario),
-    causalFactors: causalFactors || computeCausalFactors(mapState),
+    causalFactors: resolvedCausalFactors,
+    whyAtRisk: buildWhyAreaAtRisk(resolvedCausalFactors, t0?.label || 'T+0', t0?.phase, Boolean(t0?.isAttack)),
   };
 }
 
@@ -185,7 +343,11 @@ export function buildAnalystContent(scenario, mapState, interventionApplied, cau
  * and assembles 2-4 short sentences describing what specifically changed
  * and what it means operationally. Every clause below is conditioned on
  * an actual computed difference; nothing here is copy-pasted boilerplate
- * that repeats verbatim across keyframes.
+ * that repeats verbatim across keyframes. Explicitly opens by naming the
+ * keyframe's own attack/phase status (per follow-up feedback that the
+ * T+15 attack moment was never actually surfaced anywhere), so the
+ * opening clause alone already differs keyframe to keyframe instead of
+ * always reading "T+N update: ...".
  *
  * @param {object} prevState - merged state at the previous keyframe
  * @param {object} nextState - merged state at the new keyframe
@@ -193,10 +355,27 @@ export function buildAnalystContent(scenario, mapState, interventionApplied, cau
  * @param {object} nextFactors - causal factors at the new keyframe
  * @param {string} keyframeLabel - e.g. "T+15"
  * @param {string} deltaText - the short describeDelta headline sentence
+ * @param {string} [phase] - this keyframe's `phase` field, if authored
+ * @param {boolean} [isAttack] - this keyframe's `isAttack` flag
  * @returns {string} a multi-sentence narrative paragraph
  */
-export function buildBriefingNarrative(prevState, nextState, prevFactors, nextFactors, keyframeLabel, deltaText) {
-  const sentences = [`${keyframeLabel} update: ${deltaText}`];
+export function buildBriefingNarrative(
+  prevState,
+  nextState,
+  prevFactors,
+  nextFactors,
+  keyframeLabel,
+  deltaText,
+  phase,
+  isAttack,
+) {
+  const openingClause = isAttack
+    ? `${keyframeLabel} — ATTACK WINDOW: `
+    : phase
+      ? `${keyframeLabel} (${PHASE_COPY[phase] ? PHASE_COPY[phase].replace(/^./, (c) => c.toUpperCase()) : phase}): `
+      : `${keyframeLabel} update: `;
+
+  const sentences = [`${openingClause}${deltaText}`];
 
   // Shelter occupancy trend — real numbers, not restated boilerplate.
   const prevLoad = aggregateShelterLoad(prevState?.shelters);
@@ -216,10 +395,16 @@ export function buildBriefingNarrative(prevState, nextState, prevFactors, nextFa
     }
   }
 
-  // Road accessibility trend — count clear vs blocked/congested.
+  // Road accessibility trend — count clear vs blocked/congested, AND
+  // call out the Pragati Maidan corridor by name when it's the thing
+  // keeping evacuation viable (the whole point of adding it).
   const nextRoads = nextState?.roads || [];
   const clearedCount = nextRoads.filter((r) => r.status === 'clear').length;
   const badCount = nextRoads.filter((r) => r.status === 'blocked' || r.status === 'congested').length;
+  const corridorOpen = nextRoads.some((r) => (r.id === 'r6' || r.id === 'r7') && r.status === 'clear');
+  const parliamentBlocked = nextRoads.some(
+    (r) => (r.id === 'r1' || r.id === 'r2' || r.id === 'r3') && r.status === 'blocked',
+  );
   if (nextRoads.length > 0) {
     if (clearedCount > 0 && badCount === 0) {
       sentences.push(`All ${clearedCount} tracked evacuation routes in this window are now clear.`);
@@ -229,17 +414,16 @@ export function buildBriefingNarrative(prevState, nextState, prevFactors, nextFa
       );
     }
   }
+  if (parliamentBlocked && corridorOpen) {
+    sentences.push(
+      'Parliament-adjacent routes are blocked; the Pragati Maidan corridor remains the viable evacuation path.',
+    );
+  }
 
   // Causal-factor movement — call out the single biggest mover so the
   // narrative connects to what the bars below are about to show.
   if (prevFactors && nextFactors) {
     const keys = ['shelterDeficit', 'populationDensity', 'roadAccessibility', 'infrastructure'];
-    const labels = {
-      shelterDeficit: 'shelter deficit',
-      populationDensity: 'population pressure',
-      roadAccessibility: 'road inaccessibility',
-      infrastructure: 'infrastructure strain',
-    };
     let biggestKey = null;
     let biggestChange = 0;
     keys.forEach((key) => {
@@ -252,7 +436,7 @@ export function buildBriefingNarrative(prevState, nextState, prevFactors, nextFa
     if (biggestKey && Math.abs(biggestChange) >= 3) {
       const direction = biggestChange > 0 ? 'risen' : 'fallen';
       sentences.push(
-        `${labels[biggestKey][0].toUpperCase()}${labels[biggestKey].slice(1)} has ${direction} ${Math.abs(biggestChange)} points to ${nextFactors[biggestKey]}%.`,
+        `${FACTOR_LABELS[biggestKey][0].toUpperCase()}${FACTOR_LABELS[biggestKey].slice(1)} has ${direction} ${Math.abs(biggestChange)} points to ${nextFactors[biggestKey]}%.`,
       );
     }
   }
@@ -267,6 +451,8 @@ export function buildBriefingNarrative(prevState, nextState, prevFactors, nextFa
  * `describeDelta` line — but the same stat/road/shelter builders are
  * reused rather than duplicated, per Task 2's must-deliver list, and
  * every number in them is recomputed live for THIS keyframe's mapState.
+ * Also carries a fresh `whyAtRisk` narrative per keyframe (never the
+ * static caption the bars used to sit under).
  *
  * @param {object} scenario
  * @param {object} prevState - merged state at the PREVIOUS keyframe
@@ -276,6 +462,8 @@ export function buildBriefingNarrative(prevState, nextState, prevFactors, nextFa
  * @param {object} causalFactors - this keyframe's causal factors
  * @param {string} deltaText - the short describeDelta sentence for this step
  * @param {string} keyframeLabel - e.g. "T+15", for the headline
+ * @param {string} [phase] - this keyframe's `phase` field, if authored
+ * @param {boolean} [isAttack] - this keyframe's `isAttack` flag
  */
 export function buildTimelineBriefingContent(
   scenario,
@@ -286,8 +474,19 @@ export function buildTimelineBriefingContent(
   causalFactors,
   deltaText,
   keyframeLabel,
+  phase,
+  isAttack,
 ) {
-  const headline = buildBriefingNarrative(prevState, mapState, prevCausalFactors, causalFactors, keyframeLabel, deltaText);
+  const headline = buildBriefingNarrative(
+    prevState,
+    mapState,
+    prevCausalFactors,
+    causalFactors,
+    keyframeLabel,
+    deltaText,
+    phase,
+    isAttack,
+  );
 
   return {
     headline,
@@ -295,6 +494,7 @@ export function buildTimelineBriefingContent(
     roads: buildRoadsNearby(scenario, mapState),
     shelters: buildSheltersInRange(scenario),
     causalFactors,
+    whyAtRisk: buildWhyAreaAtRisk(causalFactors, keyframeLabel, phase, isAttack),
   };
 }
 

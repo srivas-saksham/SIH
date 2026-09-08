@@ -18,7 +18,18 @@ import { ChatMessage } from './ChatMessage';
  * visible before AND after scenario activation; only the map viewport
  * (owned by CommandShell) switches between its idle/active look.
  */
-export function ChatPanel({ turns, inputValue, onInputChange, onSubmit, isThinking, placeholder, onAdvance, scrollNonce }) {
+export function ChatPanel({
+  turns,
+  inputValue,
+  onInputChange,
+  onSubmit,
+  isThinking,
+  placeholder,
+  onAdvance,
+  onQueryRoads,
+  onQueryShelters,
+  scrollNonce,
+}) {
   const historyRef = useRef(null);
 
   // Always snap to the newest content — including on every incremental
@@ -59,7 +70,14 @@ export function ChatPanel({ turns, inputValue, onInputChange, onSubmit, isThinki
           </div>
         )}
         {turns.map((turn) => (
-          <ChatMessage key={turn.id} turn={turn} onReveal={scrollToBottom} onAdvance={onAdvance} />
+          <ChatMessage
+            key={turn.id}
+            turn={turn}
+            onReveal={scrollToBottom}
+            onAdvance={onAdvance}
+            onQueryRoads={onQueryRoads}
+            onQueryShelters={onQueryShelters}
+          />
         ))}
       </div>
 

@@ -2,15 +2,21 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 import { describeDelta } from '../utils/describeKeyframeDelta';
 import { mergeKeyframesUpTo } from '../utils/mergeKeyframe';
 import { matchScenario, hasNoConfidentScenarioMatch } from '../utils/scenarioMatcher';
-import { buildAnalystContent, buildTimelineBriefingContent } from '../utils/buildAnalystContent';
+import {
+  buildAnalystContent,
+  buildTimelineBriefingContent,
+  buildRoadsQueryContent,
+  buildSheltersQueryContent,
+} from '../utils/buildAnalystContent';
 import { computeCausalFactors } from '../utils/causalFactors';
 import {
   buildProcessingLines,
   buildTimelineAdvanceLines,
   estimateProcessingDurationMs,
 } from '../utils/processingCascade';
-import { parseTimelineIntent } from '../utils/timelineIntent';
+import { parseTimelineIntent, parseContentQueryIntent, isClearChatCommand } from '../utils/timelineIntent';
 import { ChatPanel } from './ChatPanel';
+import { KeyframeBlurb } from './KeyframeBlurb';
 import { MapLibreView } from './MapLibreView';
 import { MapToolbar } from './MapToolbar';
 import { MapView } from './MapView';
@@ -204,6 +210,7 @@ export function CommandShell() {
         const deltaText = describeDelta(prevState, nextState);
         const prevCausalFactors = getCausalFactorsForIndex(activeScenario, prevIndex);
         const causalFactors = getCausalFactorsForIndex(activeScenario, clampedIndex);
+        const targetKeyframe = activeScenario.timeline[clampedIndex];
         const content = buildTimelineBriefingContent(
           activeScenario,
           prevState,
@@ -213,6 +220,8 @@ export function CommandShell() {
           causalFactors,
           deltaText,
           keyframeLabel,
+          targetKeyframe?.phase,
+          Boolean(targetKeyframe?.isAttack),
         );
 
         const isFinal = clampedIndex >= lastIndex;
@@ -229,6 +238,36 @@ export function CommandShell() {
     [activeScenario, currentKeyframeIndex, interventionApplied, isThinking, appendTurn],
   );
 
+  /**
+   * Follow-up must-deliver: "Roads nearby" / "Shelters in range" are now
+   * ALSO reachable as their own dedicated turns — via the quick-action
+   * buttons rendered on every activation/briefing turn, AND via typed
+   * commands ("list all blocked roads", "shelters in range") caught by
+   * parseContentQueryIntent below. Both paths land here. Unlike
+   * advanceTimeline, this never changes `currentKeyframeIndex` or replays
+   * a processing cascade — it's a lightweight "re-show me that block"
+   * request against whatever keyframe is already on screen, so it
+   * appends its turn immediately.
+   */
+  const handleQueryRoads = useCallback(
+    (filter = 'all') => {
+      if (!activeScenario) return;
+      const content = buildRoadsQueryContent(activeScenario, mergedMapState, filter);
+      appendTurn({ kind: 'roads-query', content });
+    },
+    [activeScenario, mergedMapState, appendTurn],
+  );
+
+  const handleQueryShelters = useCallback(() => {
+    if (!activeScenario) return;
+    // Typing/clicking a shelters query is a reasonable proxy for "I want
+    // to see them on the map too" — flips the MapToolbar toggle on
+    // rather than leaving the person to separately click it.
+    setSheltersVisible(true);
+    const content = buildSheltersQueryContent(activeScenario);
+    appendTurn({ kind: 'shelters-query', content });
+  }, [activeScenario, appendTurn]);
+
   // Intent dispatcher (Task 2's must-deliver list): runs BEFORE
   // matchScenario. Checks the typed text against the small fixed
   // timeline-advancement vocabulary first; only falls through to
@@ -241,6 +280,17 @@ export function CommandShell() {
 
     const query = inputValue.trim();
     if (!query) return;
+
+    // "cls" (Task 2 follow-up): clears the entire chat history outright.
+    // Checked before the user's own turn is echoed (echoing it first
+    // would just be wiped in the same tick anyway, since React batches
+    // both state updates into one render) and before every other
+    // intent — it's a meta-command, not scenario/timeline content.
+    if (isClearChatCommand(query)) {
+      setChatTurns([]);
+      setInputValue('');
+      return;
+    }
 
     appendTurn({ kind: 'user', text: query });
     setInputValue('');
@@ -256,6 +306,19 @@ export function CommandShell() {
         advanceTimeline('next');
       } else {
         advanceTimeline(timelineIntent.index);
+      }
+      return;
+    }
+
+    // Content-query intent ("list all blocked roads", "shelters in
+    // range") — checked right after timeline-advancement, still before
+    // matchScenario, and also only meaningful once a scenario is active.
+    const contentQueryIntent = parseContentQueryIntent(query);
+    if (contentQueryIntent && activeScenario) {
+      if (contentQueryIntent.type === 'roads') {
+        handleQueryRoads(contentQueryIntent.filter);
+      } else if (contentQueryIntent.type === 'shelters') {
+        handleQueryShelters();
       }
       return;
     }
@@ -348,6 +411,10 @@ export function CommandShell() {
                   sheltersVisible={sheltersVisible}
                 />
                 <MapToolbar sheltersVisible={sheltersVisible} onToggleShelters={setSheltersVisible} />
+                <KeyframeBlurb
+                  label={activeScenario.timeline?.[currentKeyframeIndex]?.label}
+                  text={activeScenario.timeline?.[currentKeyframeIndex]?.blurb}
+                />
               </>
             ) : (
               <MapView scenario={mapViewScenario} />
@@ -408,6 +475,8 @@ export function CommandShell() {
           onSubmit={handleChatSubmit}
           isThinking={isThinking}
           onAdvance={() => advanceTimeline('next')}
+          onQueryRoads={handleQueryRoads}
+          onQueryShelters={handleQueryShelters}
           scrollNonce={scrollNonce}
           placeholder={
             isActivated ? 'e.g. next, or describe a new scenario' : 'e.g. high-severity hostile attack in Central Delhi'
