@@ -22,6 +22,7 @@ import {
   parseInterventionIntent,
   isClearChatCommand,
 } from '../utils/timelineIntent';
+import { METRO_SHELTERS } from '../data/delhiMetroShelters';
 import { ChatPanel } from './ChatPanel';
 import { KeyframeBlurb } from './KeyframeBlurb';
 import { MapLibreView } from './MapLibreView';
@@ -128,6 +129,13 @@ export function CommandShell() {
   // Map toolbar: shelters default OFF.
   const [sheltersVisible, setSheltersVisible] = useState(false);
 
+  // Search-driven camera target for MapLibreView (shelters/roads chat
+  // queries). `nonce` is bumped on every submit so a repeat of the same
+  // query still re-triggers the flyTo.
+  const [flyToTarget, setFlyToTarget] = useState(null);
+  const flyToNonceRef = useRef(0);
+  const lastShelterIdRef = useRef(null);
+
   // Switching scenarios (via chat) must never carry a mid-timeline
   // position into the newly-activated scenario. Reset it during render
   // (React's documented "adjust state when a prop changes" pattern)
@@ -141,6 +149,7 @@ export function CommandShell() {
     setIsPlaying(false);
     setSheltersVisible(false);
     setInterventionApplied(false);
+    lastShelterIdRef.current = null;
   }
 
   const mergedMapState = useMemo(
@@ -276,6 +285,18 @@ export function CommandShell() {
       if (!activeScenario) return;
       const content = buildRoadsQueryContent(activeScenario, mergedMapState, filter);
       appendTurn({ kind: 'roads-query', content });
+      // Requirement: fly to a road matching the asked-for filter
+      // (blocked/congested/clear); 'all' just takes the first road.
+      const roads = mergedMapState?.roads;
+      const road = Array.isArray(roads)
+        ? (filter === 'all' ? roads[0] : roads.find((r) => r.status === filter)) || roads[0]
+        : null;
+      const coords = road?.coords;
+      if (coords && coords.length > 0) {
+        const [lat, lng] = coords[Math.floor(coords.length / 2)];
+        flyToNonceRef.current += 1;
+        setFlyToTarget({ lat, lng, zoom: 17, nonce: flyToNonceRef.current });
+      }
     },
     [activeScenario, mergedMapState, appendTurn],
   );
@@ -288,6 +309,22 @@ export function CommandShell() {
     setSheltersVisible(true);
     const content = buildSheltersQueryContent(activeScenario);
     appendTurn({ kind: 'shelters-query', content });
+    // Requirement: the very first shelters query always flies to Rajiv
+    // Chowk. Every query after that flies to a random OTHER shelter
+    // (never repeats the one currently shown).
+    let target;
+    if (!lastShelterIdRef.current) {
+      target = METRO_SHELTERS.find((s) => s.id === 'rajiv-chowk') || METRO_SHELTERS[0];
+    } else {
+      const others = METRO_SHELTERS.filter((s) => s.id !== lastShelterIdRef.current);
+      const pool = others.length > 0 ? others : METRO_SHELTERS;
+      target = pool[Math.floor(Math.random() * pool.length)];
+    }
+    if (target) {
+      lastShelterIdRef.current = target.id;
+      flyToNonceRef.current += 1;
+      setFlyToTarget({ lat: target.lat, lng: target.lng, zoom: 17, nonce: flyToNonceRef.current });
+    }
   }, [activeScenario, appendTurn]);
 
   /**
@@ -486,6 +523,7 @@ export function CommandShell() {
                   scenario={mapViewScenario}
                   timelineIndex={currentKeyframeIndex}
                   sheltersVisible={sheltersVisible}
+                  flyToTarget={flyToTarget}
                 />
                 <MapToolbar sheltersVisible={sheltersVisible} onToggleShelters={setSheltersVisible} />
                 <KeyframeBlurb

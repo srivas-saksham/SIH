@@ -561,19 +561,42 @@ function drawRoundedRectPath(ctx, x, y, width, height, r) {
  */
 function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, fillPercent, statusHex }) {
   const w = SHELTER_CARD_CSS_WIDTH;
-  const h = SHELTER_CARD_CSS_HEIGHT;
   const ratio = SHELTER_CARD_PIXEL_RATIO;
+  const padX = 10;
+  const tailH = 8;
+  const radius = 10;
+  const bottomPad = 10;
+
+  // --- measurement pass (font metrics only depend on the font string,
+  // not the canvas's pixel size, so this scratch context can safely
+  // decide the wrapped line counts before the real canvas is sized) ---
+  // Fix: the panel used to be a fixed 176px tall regardless of content,
+  // which clamped the feasibility note to 3 lines and left a large
+  // empty gap below short notes. Now the card's height is derived from
+  // its actual measured content, and the note is allowed to wrap up to
+  // 5 lines (still ellipsized past that) instead of 3.
+  const measureCtx = document.createElement('canvas').getContext('2d');
+  measureCtx.font = '700 12px system-ui, -apple-system, sans-serif';
+  const nameLines = wrapCanvasText(measureCtx, shelter.name, w - padX * 2, 2);
+  measureCtx.font = '400 9px system-ui, -apple-system, sans-serif';
+  const noteLines = wrapCanvasText(measureCtx, shelter.metadata.feasibilityNote, w - padX * 2, 5);
+
+  let y = 18;
+  y += nameLines.length * 14;
+  y += 2; // gap after name
+  y += 14; // badge + distance row
+  y += 5 + 13; // progress bar + gap
+  y += 13; // status line
+  const contentBottomY = y + noteLines.length * 11;
+  const panelH = contentBottomY + bottomPad;
+  const h = panelH + tailH;
+
   const canvas = document.createElement('canvas');
   canvas.width = w * ratio;
   canvas.height = h * ratio;
   const ctx = canvas.getContext('2d');
   ctx.scale(ratio, ratio);
   ctx.clearRect(0, 0, w, h);
-
-  const padX = 10;
-  const tailH = 8;
-  const panelH = h - tailH;
-  const radius = 10;
 
   // --- panel background (rounded rect) ---
   ctx.beginPath();
@@ -593,13 +616,12 @@ function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, f
   ctx.fillStyle = statusHex;
   ctx.fill();
 
-  let y = 18;
+  y = 18;
   ctx.textBaseline = 'alphabetic';
 
   // --- name ---
   ctx.font = '700 12px system-ui, -apple-system, sans-serif';
   ctx.fillStyle = '#e4e4e7';
-  const nameLines = wrapCanvasText(ctx, shelter.name, w - padX * 2, 2);
   nameLines.forEach((line) => {
     ctx.fillText(line, padX, y);
     y += 14;
@@ -647,10 +669,10 @@ function renderShelterCardCanvas(shelter, { occupancy, accessible, distanceKm, f
   ctx.fillText(statusLabel, padX, y);
   y += 13;
 
-  // --- feasibility note, clamped to 3 lines ---
+  // --- feasibility note, now wrapped to fit the card's own measured
+  // height instead of being clipped to a fixed 3 lines ---
   ctx.font = '400 9px system-ui, -apple-system, sans-serif';
   ctx.fillStyle = '#a1a1aa';
-  const noteLines = wrapCanvasText(ctx, shelter.metadata.feasibilityNote, w - padX * 2, 3);
   noteLines.forEach((line) => {
     ctx.fillText(line, padX, y);
     y += 11;
@@ -1031,7 +1053,7 @@ function queryBoxAround(point) {
   ];
 }
 
-export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false }) {
+export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false, flyToTarget = null }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const loadedRef = useRef(false);
@@ -2235,8 +2257,47 @@ export function MapLibreView({ scenario, timelineIndex, sheltersVisible = false 
     // the animation loop this effect kicks off via animateRiskZones).
     updateLandmarkLabels(scenario);
     updateRoadLabels();
+
+    // Requirement: camera spans out further on every keyframe advance,
+    // with an extra-extreme pull-back specifically at T+15 (index 3) so
+    // it covers much more area at that point in the timeline.
+    const map = mapRef.current;
+    if (map && typeof timelineIndex === 'number' && timelineIndex >= 0) {
+      const ZOOM_STEP_PER_KEYFRAME = 0.5;
+      const MIN_ZOOM = 12;
+      const EXTREME_ZOOM_KEYFRAME_INDEX = 4; // T+15
+      const EXTREME_ZOOM = 12.5;
+      const baseZoom = 16.5;
+      const steppedZoom = Math.max(MIN_ZOOM, baseZoom - timelineIndex * ZOOM_STEP_PER_KEYFRAME);
+      const nextZoom = timelineIndex >= EXTREME_ZOOM_KEYFRAME_INDEX
+        ? Math.min(steppedZoom, EXTREME_ZOOM)
+        : steppedZoom;
+      map.easeTo({ zoom: nextZoom, duration: 900 });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scenario, timelineIndex]);
+
+  // -------------------------------------------------------------------
+  // Requirement: search-driven camera moves. `flyToTarget` is set by
+  // CommandShell whenever a shelters/roads query is submitted via chat
+  // — { lat, lng, zoom, nonce }. `nonce` is bumped on every submit
+  // (even a repeat of the same query) so this effect re-fires and the
+  // camera flies again even to an identical target.
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    const map = mapRef.current;
+    if (!map || !flyToTarget) return;
+    map.flyTo({
+      center: [flyToTarget.lng, flyToTarget.lat],
+      zoom: flyToTarget.zoom ?? 16.5,
+      pitch: 60,
+      speed: 0.9,
+      curve: 1.4,
+      essential: true,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flyToTarget]);
 
   // -------------------------------------------------------------------
   // Scenario ACTIVATION — camera fly-in + building-candidate
