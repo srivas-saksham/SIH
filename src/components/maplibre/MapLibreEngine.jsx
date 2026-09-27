@@ -18,7 +18,7 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&ur
 import * as turf from '@turf/turf';
 import { RISK_HEX } from '../MapView';
 import {
-  STYLE_URL, TRANSITION_MS, RISK_RANK, IMPACT_ZONE_GROW_MS, ROUTE_ANIMATE_MS,
+  STYLE_URLS, TRANSITION_MS, RISK_RANK, IMPACT_ZONE_GROW_MS, ROUTE_ANIMATE_MS,
   BUILDING_RISK_HEX, BUILDING_DEFAULT_GRAY, ROADS_SOURCE_LAYER, ROAD_CONGESTION_HEX,
   SAFE_ZONE_HEX, SAFE_ZONE_FILL_HEIGHT, EXCLUSION_MARGIN_FACTOR,
   SHELTER_OCCUPANCY_LEVELS, SHELTER_INACCESSIBLE_HEX, SHELTER_STATUS_HEX,
@@ -71,6 +71,12 @@ export function MapLibreEngine({
   sheltersVisible = false,
   flyToTarget = null,
   capacityBoostPercent = null,
+  // Theme toggle (new) — 'dark' (default, matches the previous
+  // hardcoded-to-dark behavior exactly) or 'light'. Only read inside
+  // the map-init effect below to pick which STYLE_URLS entry to load;
+  // everything else about the engine (layers, risk colors, shelter
+  // cards, etc.) is theme-agnostic and untouched by this prop.
+  mapTheme = 'dark',
   // The active scene's config object (see sceneRegistry.js /
   // scenes/*.js) — everything below that used to be a hardcoded
   // module-level constant (LANDMARKS, LANDMARK_IDS, METRO_SHELTERS,
@@ -96,6 +102,13 @@ export function MapLibreEngine({
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const loadedRef = useRef(false);
+  // Theme toggle (new): holds { center, zoom, pitch, bearing } captured
+  // from the outgoing map right before it's torn down for a theme
+  // switch (see the mount effect's cleanup below), so the remounted map
+  // picks up the camera where the person left it instead of resetting
+  // to FALLBACK_CENTER. Stays null through the very first mount, so
+  // that initial load is unaffected.
+  const priorViewStateRef = useRef(null);
   // Mirrors the `sheltersVisible` prop into a ref so the one-time
   // map.on('load') callback (which closes over refs, not props — it
   // only ever runs once per map instance) can read whatever the LATEST
@@ -241,13 +254,40 @@ export function MapLibreEngine({
     const container = containerRef.current;
     if (!container) return undefined;
 
+    // Theme toggle (new): mapTheme is now a dependency of this effect
+    // (see the dep array at the bottom), so flipping it tears down and
+    // rebuilds the whole map — the only reliable way to swap
+    // STYLE_URLS entries here. A plain map.setStyle() was considered
+    // and rejected: setStyle() discards every source/layer/image that
+    // isn't part of the new style, and this component's map.on('load')
+    // handler below builds a large amount of custom map state (the
+    // promoteId'd buildings source, shelter-card/label-pill/
+    // capacity-badge canvases registered as images, risk feature-state,
+    // etc.) that only ever runs once per Map instance — none of it is
+    // set up to be torn down and reattached in place. Remounting gets
+    // that setup re-run for free through the exact same 'load' path a
+    // fresh page load takes, so the new theme starts fully correct
+    // instead of half-migrated.
+    //
+    // priorViewStateRef (set in this effect's cleanup, read here) lets
+    // the remount pick up the camera exactly where the person left it
+    // instead of snapping back to FALLBACK_CENTER/zoom 15/pitch 55 on
+    // every theme flip.
+    const priorView = priorViewStateRef.current;
+
+    // Satellite theme expansion: STYLE_URLS['satellite'] is a full
+    // MapLibre style OBJECT (raster source + layer), not a URL string,
+    // since there's no OpenFreeMap style for imagery — see the big
+    // comment above STYLE_URLS in mapEngineCore.js for why. MapLibre's
+    // `style` option accepts either shape natively (StyleSpecification
+    // | string), so this line needed no change to support it.
     const map = new maplibregl.Map({
       container,
-      style: STYLE_URL,
-      center: [FALLBACK_CENTER.lng, FALLBACK_CENTER.lat],
-      zoom: 15,
-      pitch: 55,
-      bearing: -15,
+      style: STYLE_URLS[mapTheme] || STYLE_URLS.dark,
+      center: priorView ? priorView.center : [FALLBACK_CENTER.lng, FALLBACK_CENTER.lat],
+      zoom: priorView ? priorView.zoom : 15,
+      pitch: priorView ? priorView.pitch : 55,
+      bearing: priorView ? priorView.bearing : -15,
       // Task 8e: MapLibre's own hard ceiling for pitch is 85° (it's
       // baked into the renderer, not a config choice — the library
       // simply won't go higher than this regardless of setMaxPitch()).
@@ -1276,6 +1316,19 @@ export function MapLibreEngine({
       window.removeEventListener('pointermove', onCustomDragPointerMove);
       window.removeEventListener('pointerup', onCustomDragPointerUp);
       container.removeEventListener('contextmenu', onContainerContextMenu);
+      // Theme toggle (new): snapshot the camera right before teardown
+      // so a remount triggered by mapTheme changing (see this effect's
+      // dep array below) restores it instead of resetting to
+      // FALLBACK_CENTER. Guarded by loadedRef since the camera getters
+      // are meaningless before the style has actually loaded once.
+      priorViewStateRef.current = loadedRef.current
+        ? {
+          center: map.getCenter(),
+          zoom: map.getZoom(),
+          pitch: map.getPitch(),
+          bearing: map.getBearing(),
+        }
+        : priorViewStateRef.current;
       // Shelter cards are now real map content (a GeoJSON source +
       // symbol layer + registered images) — unlike the old
       // maplibregl.Marker version, map.remove() below tears all of that
@@ -1285,12 +1338,15 @@ export function MapLibreEngine({
       mapRef.current = null;
       loadedRef.current = false;
     };
-    // Intentionally empty deps — this effect runs exactly once for
-    // mount/unmount. `scenario` is read via the ref-guarded functions
-    // below on every prop change instead (see the two effects further
-    // down), so map init itself never needs to re-run.
+    // Theme toggle (new): mapTheme was added as a real dependency on
+    // purpose — see the comment at the top of this effect for why a
+    // full remount (rather than setStyle()) is the correct way to
+    // handle a theme change here. `scenario` is still intentionally
+    // excluded; it continues to be read via the ref-guarded functions
+    // in the effects further down on every prop change, so map init
+    // doesn't re-run for that.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [mapTheme]);
 
   // -------------------------------------------------------------------
   // Resize the map whenever its container's actual size changes (right

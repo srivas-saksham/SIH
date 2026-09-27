@@ -144,6 +144,15 @@ export function CommandShell() {
 
   // Map toolbar: shelters default OFF.
   const [sheltersVisible, setSheltersVisible] = useState(false);
+  // Map toolbar: theme defaults to 'dark' — matches the previously
+  // hardcoded-to-dark behavior exactly; 'light' is the only other
+  // value MapToolbar's theme button cycles to. Unlike sheltersVisible,
+  // this is intentionally NOT reset on scenario switch below — the
+  // person's chosen map theme is a display preference, not
+  // scenario-scoped state, so it should persist across activating a
+  // different scenario the same way it persists across scrubbing the
+  // timeline.
+  const [mapTheme, setMapTheme] = useState('dark');
 
   // Search-driven camera target for MapLibreView (shelters/roads chat
   // queries). `nonce` is bumped on every submit so a repeat of the same
@@ -657,8 +666,14 @@ export function CommandShell() {
                   sheltersVisible={sheltersVisible}
                   flyToTarget={flyToTarget}
                   capacityBoostPercent={capacityBoostPercent}
+                  mapTheme={mapTheme}
                 />
-                <MapToolbar sheltersVisible={sheltersVisible} onToggleShelters={setSheltersVisible} />
+                <MapToolbar
+                  sheltersVisible={sheltersVisible}
+                  onToggleShelters={setSheltersVisible}
+                  mapTheme={mapTheme}
+                  onToggleMapTheme={setMapTheme}
+                />
                 {/*
                   Task 3: a separate keyframe, reachable ONLY via the
                   what-if chat command — not part of the T+N timeline

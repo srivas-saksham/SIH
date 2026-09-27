@@ -32,7 +32,82 @@ import { RISK_HEX } from '../MapView';
 // openmaptiles/dark-matter-gl-style — free, no key, same zero-config
 // setup as bright. Confirmed live at this exact URL (it's listed on
 // OpenFreeMap's own Quick Start guide alongside bright/liberty/positron).
-const STYLE_URL = 'https://tiles.openfreemap.org/styles/dark';
+//
+// Theme cycle (expanded from the original dark/light toggle — see
+// THEME_IDS/THEME_LABELS below). Verified directly against
+// openfreemap.org/quick_start (Sep 2026): OpenFreeMap's own default
+// style set is Positron, Bright, Liberty, Dark, Fiord, 3D — vector
+// styles only, no satellite imagery of any kind. So:
+//   - 'dark'  -> OpenFreeMap's dark style (unchanged from before).
+//   - 'light' -> switched from Positron to OpenFreeMap's LIBERTY style.
+//     Positron is deliberately near-monochrome/grayscale by design
+//     (openfreemap-styles' own README: "Positron, as a special clean
+//     looking style, has POIs removed..."), which read as "plain
+//     white" — not what was asked for. Liberty (a fork of OSM
+//     Bright/osm-liberty, actively maintained per that same README)
+//     renders real color: blue water, green parks/vegetation, tinted
+//     land use — the colored/terrain-ish look requested — while still
+//     being one of OpenFreeMap's own zero-config, no-key default
+//     styles, so it's exactly as reliable as dark was.
+//   - 'satellite' -> NOT an OpenFreeMap style (they don't have one).
+//     This is a real raster imagery source instead: Esri's public
+//     World Imagery tile service, served from
+//     server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/
+//     MapServer — the standard free/no-API-key satellite basemap used
+//     across many independent MapLibre projects (Esri's own docs,
+//     mapatlas.xyz, gpx.studio's "Liberty Satellite" style, etc.).
+//     Because this isn't a style URL MapLibre can just load like the
+//     vector ones, it's built as an inline style object below
+//     (SATELLITE_STYLE) with its own raster source + layer, applied
+//     the same way as any other style URL/object. Esri doesn't
+//     publish a rate-limit/SLA guarantee for this specific free
+//     endpoint (per Esri's own community forum), so it's included as
+//     a genuinely free but not contractually-guaranteed option — the
+//     same caveat that would apply to any no-key third-party tile
+//     service.
+// STYLE_URLS keys by the same theme id MapToolbar's cycle/dropdown
+// use, so MapLibreEngine can just index into this with whatever theme
+// prop it's handed. STYLE_URL is kept as an alias to STYLE_URLS.dark
+// so nothing that imported the old single constant needs to change.
+const SATELLITE_ATTRIBUTION = 'Imagery © Esri, Maxar, Earthstar Geographics, and the GIS community';
+const SATELLITE_STYLE = {
+  version: 8,
+  sources: {
+    'esri-world-imagery': {
+      type: 'raster',
+      tiles: [
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      ],
+      tileSize: 256,
+      maxzoom: 19,
+      attribution: SATELLITE_ATTRIBUTION,
+    },
+  },
+  layers: [
+    {
+      id: 'esri-world-imagery',
+      type: 'raster',
+      source: 'esri-world-imagery',
+    },
+  ],
+};
+
+const STYLE_URLS = {
+  dark: 'https://tiles.openfreemap.org/styles/dark',
+  light: 'https://tiles.openfreemap.org/styles/liberty',
+  satellite: SATELLITE_STYLE,
+};
+const STYLE_URL = STYLE_URLS.dark;
+
+// Theme cycle order + display labels, single source of truth for both
+// MapToolbar's cycle-on-click behavior and its dropdown list — so
+// adding/reordering a theme only ever needs to change this one place.
+const THEME_IDS = ['dark', 'light', 'satellite'];
+const THEME_LABELS = {
+  dark: 'Dark',
+  light: 'Light',
+  satellite: 'Satellite',
+};
 
 // Mirrors MapView's TRANSITION_MS convention (Task 5) so landmark risk
 // color changes crossfade at the same speed as every other risk-driven
@@ -1129,7 +1204,7 @@ function deriveLandmarkRisk(baseline, landmarkIds) {
 
 export {
   // constants
-  STYLE_URL, TRANSITION_MS, RISK_RANK, IMPACT_ZONE_GROW_MS, ROUTE_ANIMATE_MS,
+  STYLE_URL, STYLE_URLS, THEME_IDS, THEME_LABELS, TRANSITION_MS, RISK_RANK, IMPACT_ZONE_GROW_MS, ROUTE_ANIMATE_MS,
   BUILDING_RISK_HEX, BUILDING_DEFAULT_GRAY, ROADS_SOURCE_LAYER, ROAD_CONGESTION_HEX,
   SAFE_ZONE_HEX, SAFE_ZONE_FILL_HEIGHT, EXCLUSION_MARGIN_FACTOR,
   SHELTER_OCCUPANCY_LEVELS, SHELTER_INACCESSIBLE_HEX, SHELTER_STATUS_HEX,
