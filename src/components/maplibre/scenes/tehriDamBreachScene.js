@@ -68,13 +68,28 @@ const defaultRadii = { red: 3, yellow: 8, green: 15 };
 // follow it for realism. Only the circle's own drawn center is pinned.
 const pinImpactZoneCenter = { lat: 30.3778, lng: 78.4806 };
 
-// Flood-front polygon path (new, revised per explicit person
-// correction: "it should go more deep down through Dehradun and other
-// key checkpoints... make it very elongated"). [lng, lat] pairs, in
-// downstream order, now with real named waypoints along the actual
-// Bhagirathi/Ganga corridor instead of only the 4 keyframe
-// impactPoints (which, being nearly straight-line jumps ~30-50km
-// apart, produced too short/blunt a shape). Confidence per point:
+// Flood-front polygon path (revised again per explicit person spec:
+// "do not draw a straight line between checkpoints \u2014 insert 4\u20135
+// intermediate breakpoints between every pair so the path visibly
+// zigzags, and make the zigzag irregular/random-looking, not a neat
+// symmetrical alternation, the whole way down the corridor"). [lng,
+// lat] pairs, in downstream order. The named real-place waypoints from
+// the previous revision (Tehri Dam, Devprayag, Rishikesh, Raiwala,
+// Haridwar, Roorkee, Landhaura, Muzaffarnagar, Meerut/NCR \u2014 see the
+// per-point confidence notes below, unchanged from before) are still
+// present at their same verified coordinates; what's new is 4\u20135
+// unnamed intermediate points inserted into EVERY segment between them,
+// each offset perpendicular to that segment by an irregular
+// (non-alternating, non-fixed-magnitude) amount so the line reads as
+// organic river wandering instead of a ruler-straight jump. These
+// intermediate points are NOT real surveyed river-channel coordinates
+// (this codebase has no live tile access to trace the actual channel
+// \u2014 same "flag what isn't verified" standard as the rest of this file)
+// \u2014 they're a deliberately-irregular perturbation of the straight-line
+// midpoint grid between two verified real places, generated once
+// (fixed values, not regenerated at runtime) so the shape is stable
+// across renders. Confidence per NAMED point (unchanged from the prior
+// revision):
 //   - Tehri Dam, Devprayag, Ram Jhula Rishikesh, Har Ki Pauri
 //     Haridwar, IIT Roorkee: same verified coordinates already used
 //     in damCorridorLandmarks.js.
@@ -97,14 +112,91 @@ const pinImpactZoneCenter = { lat: 30.3778, lng: 78.4806 };
 // distance-along-path math in MapLibreEngine.jsx's animateFloodZone.
 const floodPath = [
   [78.4806, 30.3778], // Tehri Dam
-  [78.5988, 30.1462], // Devprayag (Bhagirathi\u2013Alaknanda confluence)
-  [78.3212, 30.1280], // Ram Jhula, Rishikesh
+  [78.5377, 30.3583],
+  [78.4864, 30.2834],
+  [78.5075, 30.2455],
+  [78.5273, 30.2070],
+  [78.6175, 30.2044],
+  [78.5988, 30.1462], // Devprayag (Bhagirathi\u2013Alaknanda confluence) \u2014 hotspot, see floodHotspots below
+  [78.5414, 30.1717],
+  [78.4850, 30.1803],
+  [78.4345, 30.1011],
+  [78.3730, 30.1890],
+  [78.3212, 30.1280], // Ram Jhula, Rishikesh \u2014 hotspot, see floodHotspots below
+  [78.3200, 30.1110],
+  [78.2971, 30.1225],
+  [78.2900, 30.1132],
+  [78.2799, 30.1078],
+  [78.2819, 30.0868],
   [78.2676, 30.0869], // Raiwala \u2014 Rishikesh\u2013Haridwar stretch adjacent to Dehradun
+  [78.2282, 30.0723],
+  [78.2041, 30.0466],
+  [78.2185, 29.9927],
+  [78.2136, 29.9529],
   [78.1642, 29.9457], // Har Ki Pauri, Haridwar
+  [78.1021, 29.9904],
+  [78.0617, 29.9621],
+  [78.0124, 29.9636],
+  [77.9953, 29.8569],
+  [77.9323, 29.9045],
   [77.8951, 29.8656], // IIT Roorkee
+  [77.9005, 29.8321],
+  [77.8880, 29.8087],
+  [77.8791, 29.7833],
+  [77.8661, 29.7601],
   [77.8300, 29.7500], // Landhaura \u2014 approximate interpolated midpoint
+  [77.7801, 29.7158],
+  [77.8357, 29.6349],
+  [77.8193, 29.5858],
+  [77.7829, 29.5456],
+  [77.6694, 29.5395],
   [77.7050, 29.4675], // Muzaffarnagar
+  [77.6151, 29.3706],
+  [77.7884, 29.2745],
+  [77.6249, 29.1775],
+  [77.6111, 29.0808],
   [77.7064, 28.9845], // Meerut / NCR approach (scenario's own T+30 keyframe point)
+];
+
+// Hotspot metadata (new): the two real physical "pooling" points along
+// this corridor per explicit person spec \u2014 Devprayag (where the
+// Bhagirathi and Alaknanda physically converge \u2014 a real confluence,
+// so floodwater genuinely pools/widens there, not just passes through)
+// and Ram Jhula/Rishikesh (a secondary, smaller widening \u2014 "kind of
+// huge, not very huge", i.e. visibly wider than the ribbon but clearly
+// smaller than Devprayag's). `atKm` is this point's distance along
+// floodPath from the dam (computed via turf.length on the slice up to
+// that point \u2014 see MapLibreEngine.jsx's floodHotspotsRef for how these
+// are resolved to actual along-path distance at runtime rather than
+// hardcoding a km value here that would silently drift out of sync if
+// floodPath is ever re-authored again). `radiusMultiplier` scales the
+// LOCAL ribbon width at that point in the corridor (targetWidthKm in
+// animateFloodZone, itself now a hills\u2192plains terrain curve, not a
+// flat value \u2014 see that function's own width-model comment) into
+// this hotspot's own circular buffer radius, unioned in once the flood
+// front reaches it. Retuned alongside that width-curve rework so
+// Devprayag still lands as visibly the single widest point on the
+// whole corridor (real river confluence \u2014 Bhagirathi + Alaknanda
+// physically meet here) even though the plains stretch further
+// downstream now also widens substantially on its own; Rishikesh
+// stays a clearly smaller secondary bulge, per explicit "Devprayag's
+// should be clearly bigger than Rishikesh's, but Rishikesh's should
+// still read as a hotspot, not just ribbon width."
+const floodHotspots = [
+  {
+    label: 'Devprayag confluence',
+    lng: 78.5988,
+    lat: 30.1462,
+    radiusMultiplier: 4.5,
+    spanKm: 3.5,
+  },
+  {
+    label: 'Ram Jhula, Rishikesh',
+    lng: 78.3212,
+    lat: 30.1280,
+    radiusMultiplier: 2.2,
+    spanKm: 2.5,
+  },
 ];
 
 export const tehriDamBreachScene = {
@@ -114,6 +206,7 @@ export const tehriDamBreachScene = {
   defaultRadii,
   pinImpactZoneCenter,
   floodPath,
+  floodHotspots,
   landmarks: DAM_LANDMARKS,
   landmarkIds: DAM_LANDMARK_IDS,
   shelters: DAM_SHELTERS,

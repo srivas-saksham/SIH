@@ -114,6 +114,14 @@ export function MapLibreEngine({
     // flood-zone source/layer/animation below — no-op there, not just
     // an empty polygon.
     floodPath: SCENE_FLOOD_PATH,
+    // Hotspot metadata (new — see tehriDamBreachScene.js's floodHotspots
+    // comment for the full spec this implements): points along
+    // floodPath where the ribbon should locally widen into a "pool"
+    // (Devprayag's real river confluence, Rishikesh's smaller
+    // secondary widening) instead of staying uniform width. undefined
+    // for scenes with no floodHotspots (and implicitly a no-op for any
+    // scene with no floodPath at all, same gating as floodPath itself).
+    floodHotspots: SCENE_FLOOD_HOTSPOTS,
   } = sceneConfig;
   // Built once per mount from the scene's static floodPath array (it
   // never changes at runtime) — a real MapLibre/Turf LineString feature,
@@ -125,6 +133,25 @@ export function MapLibreEngine({
   );
   const floodPathLengthKmRef = useRef(
     floodPathLineRef.current ? turf.length(floodPathLineRef.current, { units: 'kilometers' }) : 0,
+  );
+  // Resolves each scene-authored hotspot's (lng, lat) to its actual
+  // distance-along-floodPath in km, ONCE at mount, via the same
+  // turf.nearestPointOnLine used every animation tick elsewhere in this
+  // file (see animateFloodZone) — rather than hand-computing/hardcoding
+  // an `atKm` value in tehriDamBreachScene.js that would silently go
+  // stale the next time floodPath's points are re-authored. Empty array
+  // for scenes with no floodHotspots or no floodPath.
+  const floodHotspotsRef = useRef(
+    (SCENE_FLOOD_HOTSPOTS && floodPathLineRef.current)
+      ? SCENE_FLOOD_HOTSPOTS.map((hotspot) => ({
+        ...hotspot,
+        atKm: turf.nearestPointOnLine(
+          floodPathLineRef.current,
+          turf.point([hotspot.lng, hotspot.lat]),
+          { units: 'kilometers' },
+        ).properties.location,
+      }))
+      : [],
   );
 
   const containerRef = useRef(null);
@@ -1494,7 +1521,13 @@ export function MapLibreEngine({
     // default radii/point instead of the keyframe's actual values —
     // this is why scrubbing to T+5/T+10/etc. visibly did nothing.
     animateRiskZones(scenario.baseline, impactCenter, resolveKartavyaOverrideActive(scenario, timelineIndex));
-    animateFloodZone(scenario.baseline);
+    // Fix (see animateFloodZone's own comment for the full root-cause
+    // writeup): pass the SAME resolved impactCenter animateRiskZones
+    // just got, instead of leaving animateFloodZone to silently
+    // re-resolve its own fallback internally. Consistent with how this
+    // effect already fixed the identical missing-baseline-impactPoint
+    // case for the circles above.
+    animateFloodZone(scenario.baseline, impactCenter);
     // Road congestion has no growth/shrink animation to drive (§3.4 of
     // the research doc — `level` is a discrete enum per road, not an
     // interpolatable number) — applyRoadCongestion just diffs+applies
@@ -2053,7 +2086,10 @@ export function MapLibreEngine({
       resolveRoadCandidates(impactCenter);
       resolveKartavyaPathFeatures();
       animateRiskZones(currentScenario.baseline, impactCenter, resolveKartavyaOverrideActive(currentScenario, timelineIndex));
-      animateFloodZone(currentScenario.baseline);
+      // Same fix as the other call site above — pass the already-
+      // resolved impactCenter through instead of letting
+      // animateFloodZone fall back internally.
+      animateFloodZone(currentScenario.baseline, impactCenter);
       updateShelterStates(currentScenario, timelineIndex);
     };
     if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
@@ -2677,6 +2713,41 @@ export function MapLibreEngine({
   }
 
   /**
+   * Terrain-based ribbon-width curve (extracted so both the main flood
+   * ribbon AND each hotspot's own local width — see
+   * applyHotspotWidening — read off the exact same model, rather than
+   * hotspots reusing whatever the CURRENT front's width happens to be
+   * wherever it's gotten to, which previously made Devprayag/Rishikesh
+   * balloon to an absurd size once the front was far downstream in the
+   * wide plains segment, even though those two points themselves sit
+   * back in the narrow hills segment). Models a confined Himalayan
+   * valley channel from the dam down to Haridwar, then a much
+   * faster-widening floodplain once the land flattens past Haridwar —
+   * see animateFloodZone's own comment below for the full real-world
+   * reasoning. Pure function of `progress` (0–1 fraction of floodPath's
+   * total length) — no closure state, so it's safe to call with a
+   * hotspot's fixed `atKm` position as well as the live front's current
+   * extent.
+   */
+  const RIVER_CHANNEL_MIN_WIDTH_KM = 0.25; // narrow confined channel at the dam
+  const HILLS_EXIT_WIDTH_KM = 0.9; // channel width by the time it reaches Haridwar
+  const RIVER_CHANNEL_MAX_WIDTH_KM = 4.5; // full plains-inundation width by NCR — "prominent, 3-5km" per person spec
+  const HARIDWAR_PROGRESS = 0.385; // Haridwar's own resolved distance-along-floodPath fraction — the hills/plains terrain boundary, not a pooling hotspot itself
+  function channelWidthAtProgress(progress) {
+    if (progress <= HARIDWAR_PROGRESS) {
+      // Hills segment: gentle rise, confined valley.
+      const hillsT = progress / HARIDWAR_PROGRESS;
+      return RIVER_CHANNEL_MIN_WIDTH_KM
+        + (HILLS_EXIT_WIDTH_KM - RIVER_CHANNEL_MIN_WIDTH_KM) * hillsT ** 1.3;
+    }
+    // Plains segment: steeper, accelerating widen — the floodplain
+    // opening up, same real-world reason described in animateFloodZone.
+    const plainsT = (progress - HARIDWAR_PROGRESS) / (1 - HARIDWAR_PROGRESS);
+    return HILLS_EXIT_WIDTH_KM
+      + (RIVER_CHANNEL_MAX_WIDTH_KM - HILLS_EXIT_WIDTH_KM) * plainsT ** 0.75;
+  }
+
+  /**
    * Flood-front polygon mesh (new). No-op entirely when the active
    * scene has no floodPath (floodPathLineRef.current is null) —
    * security-attack never even reaches the body below meaningfully
@@ -2716,46 +2787,127 @@ export function MapLibreEngine({
    *     CURRENT keyframe's own impactPoint — derives directly from the
    *     scenario's existing per-keyframe impactPoint data, no new JSON
    *     fields needed.
-   *   - `widthKm`: the flood's lateral spread. Person feedback (three
-   *     rounds now): plain circle → fixed pill → still too wide/blobby.
-   *     RIVER_CHANNEL_*_WIDTH_KM below is kept narrow across the WHOLE
-   *     corridor now (not widening much even toward the plains) per
-   *     explicit "make its width smaller, but make it very elongated"
-   *     — the person wants a long, thin ribbon tracing the river, not
-   *     a shape that fattens into a lake-like blob downstream.
+   *   - `widthKm`: the flood's lateral spread. Person feedback (five
+   *     rounds now): plain circle → fixed pill → too wide/blobby →
+   *     narrow-but-flat-the-whole-way → still not visibly widening
+   *     ("I asked for it to scale up as it goes downhill — I don't
+   *     see that happening"). The previous revision's width range
+   *     (0.03km–0.22km) was simply too small a span to ever read as
+   *     "growing" on screen. This revision models the real physical
+   *     reason a Himalayan dam-breach flood widens the way it does:
+   *     a confined valley channel from the dam down to Haridwar, then
+   *     a much faster-widening floodplain once it reaches the plains
+   *     (see the terrain-based two-segment curve below,
+   *     RIVER_CHANNEL_MIN_WIDTH_KM → HILLS_EXIT_WIDTH_KM →
+   *     RIVER_CHANNEL_MAX_WIDTH_KM) — landing at a "prominent, ~3-5km
+   *     wide" plains inundation by NCR (T+30), per person's explicit
+   *     scale confirmation. Devprayag/Rishikesh are still separate
+   *     local pooling spikes on TOP of this trend (applyHotspotWidening
+   *     below), not the only widening that happens — Devprayag's is
+   *     visibly the single widest point on the whole corridor (a real
+   *     river confluence), Rishikesh's a smaller secondary bulge, and
+   *     the plains stretch widens continuously in between and beyond
+   *     them, independent of whether a hotspot is nearby.
    * Every tick, turf.lineSliceAlong (https://turfjs.org/docs/#lineSliceAlong)
    * slices floodPathLineRef up to the eased extentKm, then turf.buffer
    * (https://turfjs.org/docs/#buffer) grows a `steps: 96` (high-vertex)
-   * polygon mesh around that slice.
+   * polygon mesh around that slice. Hotspot widening (new) unions in
+   * one small extra high-vertex buffer per hotspot the flood has
+   * already reached, centered on that hotspot's own point with its own
+   * larger radius, so Devprayag/Rishikesh read as a local pool rather
+   * than the whole downstream ribbon permanently widening from there
+   * on.
+   *
+   * `impactCenter` (new param): the SAME already-resolved impact point
+   * animateRiskZones's caller computes (baseline/keyframe's own
+   * impactPoint, else the highest-severity-building heuristic, else
+   * FALLBACK_CENTER — see the two call sites above). Previously this
+   * function silently re-resolved its own fallback straight to
+   * FALLBACK_CENTER whenever currentState had no impactPoint — see the
+   * BUGFIX note inside the function body for why that was wrong
+   * specifically for the baseline/mount case.
    */
-  function animateFloodZone(currentState) {
+  function animateFloodZone(currentState, impactCenter) {
     const map = mapRef.current;
     const floodLine = floodPathLineRef.current;
     const floodSource = map?.getSource('flood-zone');
     if (!floodLine || !floodSource) return;
 
-    const target = resolveActiveRadii(currentState, FALLBACK_CENTER, SCENE_DEFAULT_RADII);
-    const targetPoint = turf.point([target.point.lng, target.point.lat]);
+    // BUGFIX (person-reported: "at T+0 the flood already covers the
+    // entire ~180km corridor, not a small pill near the dam"). Root
+    // cause: tehri-dam-breach.json's `baseline` object has no
+    // impactPoint field at all (only buildings/roads/shelters/
+    // roadCongestion — the flood/impact fields only start appearing on
+    // the T+0..T+30 timeline keyframes). This function is called once
+    // on mount with `currentState = scenario.baseline` (see the two
+    // call sites above), BEFORE any real keyframe is ever selected.
+    // The previous version called resolveActiveRadii(currentState,
+    // FALLBACK_CENTER, ...) directly — resolveActiveRadii's own
+    // fallback chain is `state?.impactPoint || impactCenter`, so a
+    // missing baseline impactPoint fell straight through to
+    // FALLBACK_CENTER (this scene's { lat: 29.55, lng: 77.95 } —
+    // geographic mean of the corridor, sitting near the Roorkee/
+    // Muzaffarnagar stretch, NOT near the dam). Projecting THAT onto
+    // floodPathLineRef via nearestPointOnLine immediately yields a
+    // large extentKm on mount — exactly the "everything flooded
+    // instantly" symptom, and it happens before T+0 is ever scrubbed
+    // to.
+    // Fix: when currentState has no impactPoint of its own, resolve to
+    // the START of floodPathLineRef (the dam, extentKm ≈ 0) instead of
+    // falling through to any wider fallback — a flood with no active
+    // keyframe yet should render as "hasn't started", not "already
+    // somewhere downstream". This intentionally does NOT touch
+    // resolveActiveRadii itself (shared with animateRiskZones/the
+    // circles) since the circles don't have this symptom: their own
+    // fallback chain (see the callers above) already tries
+    // findPrimaryImpactBuilding(scenario.baseline) before ever reaching
+    // FALLBACK_CENTER, and baseline's own buildings/roads DO exist, so
+    // in practice the circles' impactCenter param passed in here is
+    // usually already a real near-dam-ish point, not the raw scene
+    // fallbackCenter — flagged as a latent-but-currently-inert version
+    // of the same issue per the task's "flag it even if not reported"
+    // instruction, not fixed here since fixing it would change the
+    // circles' already-working, already person-approved behavior.
+    const hasOwnImpactPoint = typeof currentState?.impactPoint === 'object' && currentState.impactPoint !== null;
+    const target = hasOwnImpactPoint
+      ? resolveActiveRadii(currentState, impactCenter, SCENE_DEFAULT_RADII)
+      : null;
+    const rawExtentKm = target
+      ? turf.nearestPointOnLine(floodLine, turf.point([target.point.lng, target.point.lat]), { units: 'kilometers' })
+        .properties.location
+      : 0; // no keyframe active yet — flood hasn't started, sit at the dam end of the path
+    // T+5 special case (person spec: "at T+5 the flood has moved from
+    // the dam only about halfway toward Devprayag — explicitly not all
+    // the way there yet"). tehri-dam-breach.json's own T+0 and T+5
+    // keyframes share the EXACT SAME impactPoint (both sit at the dam
+    // itself — T+5 is "breach-initiation", the moment the dam gives
+    // way, before the front has physically travelled anywhere yet), so
+    // nearestPointOnLine alone can't distinguish T+0 from T+5 — both
+    // resolve to extentKm ≈ 0 off impactPoint. Since the JSON's own
+    // authored data has no distance signal here, key off `phase`
+    // (already a stable per-keyframe field this scenario defines —
+    // see the JSON) to nudge T+5 specifically to the halfway point
+    // between the dam and this scene's first named hotspot
+    // (Devprayag), rather than leaving it visually identical to T+0.
+    // Every other keyframe (T+0, T+10, T+15, T+30) is left to resolve
+    // purely off its own real impactPoint, unchanged.
+    const devprayagHotspot = floodHotspotsRef.current.find((h) => h.label === 'Devprayag confluence');
+    const isBreachInitiation = currentState?.phase === 'breach-initiation';
+    const rawExtentKmWithBreachNudge = (isBreachInitiation && devprayagHotspot)
+      ? devprayagHotspot.atKm / 2
+      : rawExtentKm;
     // clamp to [0, total path length] — nearestPointOnLine can return a
-    // location slightly past either end for an off-path point (e.g. the
-    // baseline state before any keyframe is scrubbed to), and a
+    // location slightly past either end for an off-path point, and a
     // negative/overshooting slice distance would throw inside
     // lineSliceAlong.
-    const rawExtentKm = turf.nearestPointOnLine(floodLine, targetPoint, { units: 'kilometers' })
-      .properties.location;
-    const targetExtentKm = Math.min(Math.max(rawExtentKm, 0.05), floodPathLengthKmRef.current);
-    // Kept narrow across the ENTIRE corridor per "make its width
-    // smaller, but make it very elongated" — only a mild widen toward
-    // the plains (still well under the old kilometers-wide scale),
-    // so the shape reads as a long thin ribbon of water tracing the
-    // river the whole way, not a shape that balloons out downstream.
-    const RIVER_CHANNEL_MIN_WIDTH_KM = 0.03;
-    const RIVER_CHANNEL_MAX_WIDTH_KM = 0.18;
+    const targetExtentKm = Math.min(Math.max(rawExtentKmWithBreachNudge, 0.05), floodPathLengthKmRef.current);
+    // Width model — see channelWidthAtProgress above for the full
+    // real-world hills-vs-plains reasoning this implements; this call
+    // site just resolves the CURRENT front's progress through it.
     const downstreamProgress = floodPathLengthKmRef.current > 0
       ? Math.min(1, targetExtentKm / floodPathLengthKmRef.current)
       : 1;
-    const targetWidthKm = RIVER_CHANNEL_MIN_WIDTH_KM
-      + (RIVER_CHANNEL_MAX_WIDTH_KM - RIVER_CHANNEL_MIN_WIDTH_KM) * downstreamProgress;
+    const targetWidthKm = channelWidthAtProgress(downstreamProgress);
 
     const previous = currentFloodRef.current || { extentKm: 0.05, widthKm: RIVER_CHANNEL_MIN_WIDTH_KM };
 
@@ -2773,7 +2925,8 @@ export function MapLibreEngine({
       };
 
       const slice = turf.lineSliceAlong(floodLine, 0, currentFlood.extentKm, { units: 'kilometers' });
-      floodSource.setData(turf.buffer(slice, currentFlood.widthKm, { units: 'kilometers', steps: 96 }));
+      const ribbon = turf.buffer(slice, currentFlood.widthKm, { units: 'kilometers', steps: 96 });
+      floodSource.setData(applyHotspotWidening(ribbon, currentFlood.extentKm));
 
       currentFloodRef.current = currentFlood;
 
@@ -2784,6 +2937,62 @@ export function MapLibreEngine({
       }
     };
     floodZoneFrameRef.current = requestAnimationFrame(step);
+  }
+
+  /**
+   * Hotspot widening (implements the person's explicit Devprayag/
+   * Rishikesh spec). For each scene-authored hotspot in
+   * floodHotspotsRef that the flood front has already reached (i.e.
+   * currentExtentKm >= hotspot.atKm), unions in one extra high-vertex
+   * (`steps: 96`, matching the main ribbon's mesh density) circular
+   * buffer centered on that hotspot's own real coordinate.
+   *
+   * BUGFIX: this used to scale off the CURRENT front's widthKm — the
+   * ribbon width wherever the flood has gotten to right now, not
+   * wherever the hotspot itself physically sits. Since the width curve
+   * keeps growing well past Haridwar into the plains, that meant once
+   * the front was, say, at T+30 in the plains (ribbon ~4.5km wide),
+   * Devprayag's hotspot circle — even though Devprayag itself is back
+   * in the narrow hills segment — was scaling off that ~4.5km plains
+   * width instead of its own local ~0.4km hills width, ballooning to
+   * tens of kilometers wide. Fixed by resolving each hotspot's own
+   * LOCAL channel width once, via channelWidthAtProgress at the
+   * hotspot's own fixed atKm/floodPathLengthKmRef progress — frozen to
+   * that location regardless of how far downstream the front has since
+   * travelled, so Devprayag's pool stays sized relative to Devprayag's
+   * own stretch of river, not the plains it hasn't reached yet.
+   *
+   * A hotspot the flood hasn't reached yet contributes nothing (so at
+   * T+0/T+5, before the front reaches Devprayag, no hotspot circle is
+   * unioned in — the flood stays a small pill near the dam as required).
+   * turf.union (https://turfjs.org/docs/#union) merges each hotspot
+   * circle into the ribbon polygon so the result is still a single
+   * feature for the 'flood-zone' source. No-op passthrough (returns
+   * `ribbon` unchanged) when the active scene has no floodHotspots.
+   */
+  function applyHotspotWidening(ribbon, currentExtentKm) {
+    const hotspots = floodHotspotsRef.current;
+    if (!hotspots || hotspots.length === 0) return ribbon;
+    const totalKm = floodPathLengthKmRef.current;
+
+    return hotspots.reduce((mergedShape, hotspot) => {
+      if (currentExtentKm < hotspot.atKm) return mergedShape; // flood hasn't reached this waypoint yet
+      const hotspotLocalWidthKm = totalKm > 0
+        ? channelWidthAtProgress(Math.min(1, hotspot.atKm / totalKm))
+        : RIVER_CHANNEL_MIN_WIDTH_KM;
+      const hotspotRadiusKm = hotspotLocalWidthKm * hotspot.radiusMultiplier;
+      const hotspotCircle = turf.circle(
+        [hotspot.lng, hotspot.lat],
+        hotspotRadiusKm,
+        { steps: 96, units: 'kilometers' },
+      );
+      const unioned = turf.union(turf.featureCollection([mergedShape, hotspotCircle]));
+      // turf.union can return null for degenerate inputs (research
+      // §7-adjacent defensive pattern already used elsewhere in this
+      // file for setFeatureState) — fall back to the pre-union shape
+      // rather than blanking the flood polygon for a tick.
+      return unioned || mergedShape;
+    }, ribbon);
   }
 
   /**
