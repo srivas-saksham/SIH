@@ -11,5 +11,6 @@ export const scenarioPresets = [
   { name: 'Hostile Attack', scenarioId: 'security-attack', severity: 'red', signal: 'Central Delhi threat' },
   { name: 'Earthquake', scenarioId: 'earthquake', severity: 'orange', signal: 'Structural collapse risk' },
   { name: 'Flood', scenarioId: 'flood', severity: 'yellow', signal: 'Yamuna overflow' },
+  { name: 'Dam Breach', scenarioId: 'tehri-dam-breach', severity: 'red', signal: 'Tehri Dam failure \u2192 NCR' },
   { name: 'Reset / Baseline', scenarioId: 'generic-fallback', severity: 'green', signal: 'Nominal conditions' },
 ];

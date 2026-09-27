@@ -30,6 +30,7 @@ import { METRO_SHELTERS } from '../data/delhiMetroShelters';
 import { ChatPanel } from './ChatPanel';
 import { KeyframeBlurb } from './KeyframeBlurb';
 import { MapLibreView } from './MapLibreView';
+import { MAPLIBRE_SCENE_IDS } from './maplibre/sceneRegistry';
 import { MapToolbar } from './MapToolbar';
 import { MapView } from './MapView';
 import { TimelineScrubber } from './TimelineScrubber';
@@ -637,14 +638,18 @@ export function CommandShell() {
               <div className="absolute inset-0 flex items-center justify-center">
                 <p className="text-2xl uppercase tracking-[0.5em] text-ink-dim/70">Foreseen</p>
               </div>
-            ) : activeScenario.id === 'security-attack' ? (
+            ) : MAPLIBRE_SCENE_IDS.includes(activeScenario.id) ? (
               <>
                 {/*
-                  TEMPORARY BRIDGE: MapLibreView (real 3D MapLibre GL JS
-                  map) is wired up for the security-attack scenario ONLY.
+                  MapLibreView (real 3D MapLibre GL JS map) now renders
+                  for every scene registered in sceneRegistry.js — the
+                  original security-attack scenario, plus
+                  tehri-dam-breach — instead of security-attack only.
+                  See MapLibreView.jsx / MapLibreEngine.jsx /
+                  sceneRegistry.js for the modularization that made this
+                  a membership check instead of a single hardcoded id.
                   Every other scenario still renders through the legacy
-                  SVG MapView, untouched — unrelated to this task's chat
-                  redesign.
+                  SVG MapView, untouched.
                 */}
                 <MapLibreView
                   scenario={mapViewScenario}

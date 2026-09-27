@@ -1,12 +1,13 @@
 import securityAttack from '../scenarios/security-attack.json';
 import earthquake from '../scenarios/earthquake.json';
 import flood from '../scenarios/flood.json';
+import tehriDamBreach from '../scenarios/tehri-dam-breach.json';
 import genericFallback from '../scenarios/generic-fallback.json';
 
 // All loaded scenario datasets, in priority order. Order matters only as a
 // tiebreaker when two scenarios score equally — security scenarios are
 // checked first since they're the primary demo use case.
-export const scenarios = [securityAttack, earthquake, flood];
+export const scenarios = [securityAttack, earthquake, flood, tehriDamBreach];
 
 export const fallbackScenario = genericFallback;
 
