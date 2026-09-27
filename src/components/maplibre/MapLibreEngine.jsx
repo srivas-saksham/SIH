@@ -97,7 +97,35 @@ export function MapLibreEngine({
     corridorPattern: KARTAVYA_PATH_NAME_PATTERN,
     defaultRadii: SCENE_DEFAULT_RADII,
     blockedShelterLabel: SCENE_BLOCKED_SHELTER_LABEL,
+    // Fix (person-reported "impact circle drifts/disappears" bug on
+    // Tehri Dam): optional per-scene override that pins the rendered
+    // impact-zone circle's center to a fixed point instead of letting
+    // it follow each keyframe's own (possibly traveling) impactPoint.
+    // undefined for scenes that don't set it (e.g. security-attack,
+    // whose impactPoint is already fixed every keyframe, so this is a
+    // no-op there) \u2014 see the animateRiskZones override below and the
+    // big comment above this field in tehriDamBreachScene.js.
+    pinImpactZoneCenter: SCENE_PIN_IMPACT_ZONE_CENTER,
+    // Flood visualization (new): an ordered array of [lng, lat] pairs
+    // tracing the flood front's real path (Tehri Dam scene sets this
+    // to its dam → peak-surge-hills → surge-plains → ncr-approach
+    // keyframe chain; see tehriDamBreachScene.js). undefined for scenes
+    // that don't set it (security-attack), which fully disables the
+    // flood-zone source/layer/animation below — no-op there, not just
+    // an empty polygon.
+    floodPath: SCENE_FLOOD_PATH,
   } = sceneConfig;
+  // Built once per mount from the scene's static floodPath array (it
+  // never changes at runtime) — a real MapLibre/Turf LineString feature,
+  // per turf's documented `lineString` helper (https://turfjs.org/docs/#lineString).
+  // Kept null for scenes with no floodPath so every flood code path
+  // below can cheaply gate on a single truthy check.
+  const floodPathLineRef = useRef(
+    SCENE_FLOOD_PATH && SCENE_FLOOD_PATH.length >= 2 ? turf.lineString(SCENE_FLOOD_PATH) : null,
+  );
+  const floodPathLengthKmRef = useRef(
+    floodPathLineRef.current ? turf.length(floodPathLineRef.current, { units: 'kilometers' }) : 0,
+  );
 
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -208,6 +236,16 @@ export function MapLibreEngine({
   const buildingIdByDedupeKeyRef = useRef(new Map());
   const nextSyntheticIdRef = useRef(1);
   const riskZoneFrameRef = useRef(null);
+  // floodZoneFrameRef / currentFloodRef: same rAF-handle + resume-from-
+  // interrupted-tick pattern as riskZoneFrameRef/currentRadiiRef just
+  // below, but driving the flood-front polygon mesh (animateFloodZone)
+  // instead of the three concentric circles. A separate rAF handle
+  // (not reusing riskZoneFrameRef) because both animations run
+  // concurrently off the same keyframe change and must not cancel each
+  // other. null / unused entirely for scenes with no SCENE_FLOOD_PATH
+  // (e.g. security-attack).
+  const floodZoneFrameRef = useRef(null);
+  const currentFloodRef = useRef(null);
   // lastRadiiRef: the most recently fully-settled { point, red, yellow,
   // green } radii, used as the animation's start point so scrubbing the
   // timeline forward/backward always animates a smooth grow/shrink from
@@ -636,6 +674,70 @@ export function MapLibreEngine({
           paint: { 'line-color': RISK_HEX[band], 'line-width': 2, 'line-opacity': 0.6 },
         });
       });
+
+      // --- 2b. Flood-front polygon mesh (new) ---
+      // Person's explicit spec: "a polygon with high mesh data, like
+      // high vertices, and it would move like a flood while covering
+      // the area" — driven off the scenario's own T+ keyframes. A
+      // plain circle (like the impact-zone rings above) can't show a
+      // flood advancing down a river valley — it can only grow/shrink
+      // around one fixed point. So this uses Turf's officially
+      // documented buffer() + lineSliceAlong() helpers instead
+      // (https://turfjs.org/docs/#buffer, https://turfjs.org/docs/#lineSliceAlong):
+      // each animation tick, the portion of the scene's floodPath
+      // already "reached" (by along-path distance) is sliced out, then
+      // buffered outward by a growing width in kilometers with a high
+      // `steps` count — buffer's steps option controls how many
+      // vertices approximate each rounded join/cap, so a high value
+      // (96, vs. the impact-zone circles' 64) is exactly the "high
+      // mesh / high vertices" the person asked for, and — unlike a
+      // circle — the resulting polygon follows the river corridor's
+      // actual shape and visibly lengthens down-valley as T+ advances,
+      // not just widens in place. See animateFloodZone below for the
+      // per-tick animation loop that recomputes this every frame.
+      //
+      // Entirely gated on SCENE_FLOOD_PATH / floodPathLineRef.current:
+      // scenes that don't set floodPath (security-attack) get no
+      // source, no layer, and animateFloodZone becomes a no-op later —
+      // zero footprint on the existing hostile-attack scene.
+      if (floodPathLineRef.current) {
+        const initialSlice = turf.lineSliceAlong(floodPathLineRef.current, 0, 0.05, { units: 'kilometers' });
+        map.addSource('flood-zone', {
+          type: 'geojson',
+          data: turf.buffer(initialSlice, 0.05, { units: 'kilometers', steps: 96 }),
+        });
+        map.addLayer({
+          id: 'flood-zone-fill',
+          source: 'flood-zone',
+          type: 'fill-extrusion',
+          paint: {
+            // Muddy river-flood blue, distinct from the red/yellow/
+            // green risk-band hexes so the two overlays read as
+            // different phenomena (flood water vs. building risk)
+            // even where they visually overlap.
+            'fill-extrusion-color': '#2f6fa8',
+            // Raised above the impact-zone rings' tallest extrusion
+            // (red = 18) on purpose — these are all fill-extrusion
+            // (real 3D volumes, not flat 2D fills), so layer-add ORDER
+            // alone doesn't decide what's visually on top at this
+            // scene's ~55° camera pitch; a shorter extrusion sitting
+            // inside/under a taller one gets occluded by its walls and
+            // roof regardless of which was added to the map later. 22
+            // (taller than 18) is what actually makes the flood polygon
+            // read as sitting above the impact rings, per person report
+            // that it was invisible underneath them.
+            'fill-extrusion-height': 22,
+            'fill-extrusion-base': 0,
+            'fill-extrusion-opacity': 0.5,
+          },
+        });
+        map.addLayer({
+          id: 'flood-zone-outline',
+          source: 'flood-zone',
+          type: 'line',
+          paint: { 'line-color': '#8fd0ff', 'line-width': 1.5, 'line-opacity': 0.7 },
+        });
+      }
 
       // --- 2a. Shelter / metro-station safe zones (Task 9, overhauled) ---
       // Each shelter now draws a real (non-circular) polygon via
@@ -1392,6 +1494,7 @@ export function MapLibreEngine({
     // default radii/point instead of the keyframe's actual values —
     // this is why scrubbing to T+5/T+10/etc. visibly did nothing.
     animateRiskZones(scenario.baseline, impactCenter, resolveKartavyaOverrideActive(scenario, timelineIndex));
+    animateFloodZone(scenario.baseline);
     // Road congestion has no growth/shrink animation to drive (§3.4 of
     // the research doc — `level` is a discrete enum per road, not an
     // interpolatable number) — applyRoadCongestion just diffs+applies
@@ -1950,6 +2053,7 @@ export function MapLibreEngine({
       resolveRoadCandidates(impactCenter);
       resolveKartavyaPathFeatures();
       animateRiskZones(currentScenario.baseline, impactCenter, resolveKartavyaOverrideActive(currentScenario, timelineIndex));
+      animateFloodZone(currentScenario.baseline);
       updateShelterStates(currentScenario, timelineIndex);
     };
     if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
@@ -2494,6 +2598,16 @@ export function MapLibreEngine({
     if (!greenSource || !yellowSource || !redSource) return;
 
     const target = resolveActiveRadii(currentState, impactCenter, SCENE_DEFAULT_RADII);
+    // Fix (person-reported): pin the CIRCLE's rendered center only,
+    // when the active scene opts in (Tehri Dam does; security-attack
+    // doesn't and is unaffected). impactCenter itself \u2014 and everything
+    // else fed by it (camera flyTo, building/road risk candidates) \u2014
+    // is intentionally left untouched, so those still correctly follow
+    // the real traveling flood front. See tehriDamBreachScene.js's
+    // pinImpactZoneCenter comment for the full root-cause writeup.
+    if (SCENE_PIN_IMPACT_ZONE_CENTER) {
+      target.point = SCENE_PIN_IMPACT_ZONE_CENTER;
+    }
     // BUGFIX: lastRadiiRef was only ever WRITTEN when a grow animation
     // fully settled (t>=1, ~IMPACT_ZONE_GROW_MS later — see the `else`
     // branch of `step` below). Auto-play advances keyframes every
@@ -2560,6 +2674,116 @@ export function MapLibreEngine({
       }
     };
     riskZoneFrameRef.current = requestAnimationFrame(step);
+  }
+
+  /**
+   * Flood-front polygon mesh (new). No-op entirely when the active
+   * scene has no floodPath (floodPathLineRef.current is null) —
+   * security-attack never even reaches the body below meaningfully
+   * since 'flood-zone' was never added as a source for it.
+   *
+   * REVISED per explicit person correction: an earlier version of this
+   * function queried the map's own loaded vector tiles for real
+   * OSM river/canal geometry (MapLibre's queryRenderedFeatures against
+   * OpenMapTiles' 'waterway' source-layer — real, documented "river
+   * recognition", not invented). That approach was correct in
+   * principle but unreliable in practice for a scene this large:
+   * queryRenderedFeatures only ever returns features from tiles
+   * ALREADY loaded in the current viewport, and this scene's camera
+   * doesn't necessarily pan across all ~180km of corridor within a
+   * single keyframe — so at T+30 it was still only finding river tiles
+   * near wherever the camera happened to be (often still near the dam),
+   * which visually looked like "the whole dam being highlighted"
+   * instead of the flood having travelled downstream, exactly as
+   * reported. Reverted to the deterministic approach: floodPathLineRef
+   * (built from tehriDamBreachScene.js's floodPath, now a much finer,
+   * real-place polyline — Tehri → Devprayag → Rishikesh → Raiwara/
+   * Dehradun-adjacent → Haridwar → Roorkee → Landhaura → Muzaffarnagar
+   * → Meerut, see that file's own per-point confidence comments) is
+   * buffered directly. This guarantees the polygon always reaches the
+   * scenario's full authored length by T+30, and — being hand-authored
+   * with real waypoints along the actual valley — still visibly
+   * follows the river corridor rather than being a straight jump.
+   *
+   * Same elapsed-time rAF + ease-out + resume-from-interrupted-tick
+   * shape as animateRiskZones above (see that function's BUGFIX
+   * comment for why resuming from the last-RENDERED value, not just
+   * the last-SETTLED one, matters during auto-play). Two things are
+   * eased —
+   *   - `extentKm`: how far down floodPathLineRef the flood front has
+   *     reached, via Turf's nearestPointOnLine
+   *     (https://turfjs.org/docs/#nearestPointOnLine) against the
+   *     CURRENT keyframe's own impactPoint — derives directly from the
+   *     scenario's existing per-keyframe impactPoint data, no new JSON
+   *     fields needed.
+   *   - `widthKm`: the flood's lateral spread. Person feedback (three
+   *     rounds now): plain circle → fixed pill → still too wide/blobby.
+   *     RIVER_CHANNEL_*_WIDTH_KM below is kept narrow across the WHOLE
+   *     corridor now (not widening much even toward the plains) per
+   *     explicit "make its width smaller, but make it very elongated"
+   *     — the person wants a long, thin ribbon tracing the river, not
+   *     a shape that fattens into a lake-like blob downstream.
+   * Every tick, turf.lineSliceAlong (https://turfjs.org/docs/#lineSliceAlong)
+   * slices floodPathLineRef up to the eased extentKm, then turf.buffer
+   * (https://turfjs.org/docs/#buffer) grows a `steps: 96` (high-vertex)
+   * polygon mesh around that slice.
+   */
+  function animateFloodZone(currentState) {
+    const map = mapRef.current;
+    const floodLine = floodPathLineRef.current;
+    const floodSource = map?.getSource('flood-zone');
+    if (!floodLine || !floodSource) return;
+
+    const target = resolveActiveRadii(currentState, FALLBACK_CENTER, SCENE_DEFAULT_RADII);
+    const targetPoint = turf.point([target.point.lng, target.point.lat]);
+    // clamp to [0, total path length] — nearestPointOnLine can return a
+    // location slightly past either end for an off-path point (e.g. the
+    // baseline state before any keyframe is scrubbed to), and a
+    // negative/overshooting slice distance would throw inside
+    // lineSliceAlong.
+    const rawExtentKm = turf.nearestPointOnLine(floodLine, targetPoint, { units: 'kilometers' })
+      .properties.location;
+    const targetExtentKm = Math.min(Math.max(rawExtentKm, 0.05), floodPathLengthKmRef.current);
+    // Kept narrow across the ENTIRE corridor per "make its width
+    // smaller, but make it very elongated" — only a mild widen toward
+    // the plains (still well under the old kilometers-wide scale),
+    // so the shape reads as a long thin ribbon of water tracing the
+    // river the whole way, not a shape that balloons out downstream.
+    const RIVER_CHANNEL_MIN_WIDTH_KM = 0.03;
+    const RIVER_CHANNEL_MAX_WIDTH_KM = 0.18;
+    const downstreamProgress = floodPathLengthKmRef.current > 0
+      ? Math.min(1, targetExtentKm / floodPathLengthKmRef.current)
+      : 1;
+    const targetWidthKm = RIVER_CHANNEL_MIN_WIDTH_KM
+      + (RIVER_CHANNEL_MAX_WIDTH_KM - RIVER_CHANNEL_MIN_WIDTH_KM) * downstreamProgress;
+
+    const previous = currentFloodRef.current || { extentKm: 0.05, widthKm: RIVER_CHANNEL_MIN_WIDTH_KM };
+
+    if (floodZoneFrameRef.current) cancelAnimationFrame(floodZoneFrameRef.current);
+
+    const start = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - start) / IMPACT_ZONE_GROW_MS);
+      const eased = 1 - (1 - t) ** 2;
+      const lerp = (a, b) => a + (b - a) * eased;
+
+      const currentFlood = {
+        extentKm: Math.max(0.05, lerp(previous.extentKm, targetExtentKm)),
+        widthKm: Math.max(RIVER_CHANNEL_MIN_WIDTH_KM, lerp(previous.widthKm, targetWidthKm)),
+      };
+
+      const slice = turf.lineSliceAlong(floodLine, 0, currentFlood.extentKm, { units: 'kilometers' });
+      floodSource.setData(turf.buffer(slice, currentFlood.widthKm, { units: 'kilometers', steps: 96 }));
+
+      currentFloodRef.current = currentFlood;
+
+      if (t < 1) {
+        floodZoneFrameRef.current = requestAnimationFrame(step);
+      } else {
+        floodZoneFrameRef.current = null;
+      }
+    };
+    floodZoneFrameRef.current = requestAnimationFrame(step);
   }
 
   /**
