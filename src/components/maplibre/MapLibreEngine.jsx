@@ -107,6 +107,9 @@ export function MapLibreEngine({
     fallbackCenter: FALLBACK_CENTER,
     corridorPattern: KARTAVYA_PATH_NAME_PATTERN,
     defaultRadii: SCENE_DEFAULT_RADII,
+    // Optional (Tehri only): landmarks within this many km of a shelter get
+    // their pill hung below that shelter's card. undefined = feature off.
+    landmarkShelterClusterKm: SCENE_LANDMARK_SHELTER_CLUSTER_KM,
     blockedShelterLabel: SCENE_BLOCKED_SHELTER_LABEL,
     // Fix (person-reported "impact circle drifts/disappears" bug on
     // Tehri Dam): optional per-scene override that pins the rendered
@@ -1031,7 +1034,7 @@ export function MapLibreEngine({
         // Landmarks near a shelter are re-anchored below that shelter's
         // card (see computeLandmarkLabelPlacement) so the pill never
         // covers the card; flyLng/flyLat keep the click target true.
-        const landmarkPlacement = computeLandmarkLabelPlacement(LANDMARKS, METRO_SHELTERS);
+        const landmarkPlacement = computeLandmarkLabelPlacement(LANDMARKS, METRO_SHELTERS, SCENE_LANDMARK_SHELTER_CLUSTER_KM);
         map.addSource('landmark-labels', {
           type: 'geojson',
           data: {

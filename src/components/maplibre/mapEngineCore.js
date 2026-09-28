@@ -465,21 +465,24 @@ const LABEL_PILL_ICON_OFFSET = [0, -2];
 // Landmarks farther than the cluster radius are untouched. Clicking a
 // moved pill still flies to the landmark's TRUE location.
 // ---------------------------------------------------------------------
-const LANDMARK_SHELTER_CLUSTER_KM = 0.7;
+// Per-scene: the radius now comes from the scene config field
+// `landmarkShelterClusterKm` (Tehri = 0.7; Central Delhi leaves it unset
+// so its landmark labels stay exactly at their true positions).
+const LANDMARK_SHELTER_CLUSTER_KM = 0.7; // default for scenes that opt in without a value
 const LANDMARK_STACK_GAP_PX = 10;
 const LANDMARK_MAX_STACK_SLOTS = 6;
 
 /** landmarkId -> { lng, lat, slot } (slot 0 = untouched, 1.. = stacked below a shelter). */
-function computeLandmarkLabelPlacement(landmarks, shelters) {
+function computeLandmarkLabelPlacement(landmarks, shelters, clusterKm = 0) {
   const out = {};
   const perShelter = {};
   landmarks.forEach((lm) => {
     out[lm.id] = { lng: lm.lng, lat: lm.lat, slot: 0 };
-    if (!(LANDMARK_SHELTER_CLUSTER_KM > 0)) return;
+    if (!(clusterKm > 0)) return;
     let best = null;
     shelters.forEach((sh) => {
       const d = turf.distance([lm.lng, lm.lat], [sh.lng, sh.lat], { units: 'kilometers' });
-      if (d <= LANDMARK_SHELTER_CLUSTER_KM && (!best || d < best.d)) best = { d, sh };
+      if (d <= clusterKm && (!best || d < best.d)) best = { d, sh };
     });
     if (best) (perShelter[best.sh.id] = perShelter[best.sh.id] || { sh: best.sh, list: [] }).list.push({ lm, d: best.d });
   });
@@ -958,6 +961,28 @@ function roadLabelImageId(dedupeKey) {
 function upsertShelterCardImage(map, imageId, canvas) {
   const imageData = canvasToImageData(canvas);
   if (map.hasImage(imageId)) {
+    // Adaptive-width labels: the real text is usually a different
+    // width than the placeholder image first registered. updateImage
+    // only works for same-size images (a size change can throw or be
+    // silently ignored, leaving the label stuck on its placeholder —
+    // e.g. 0.00 km from impact + default teal accent), so a resized
+    // image is removed and re-added instead.
+    try {
+      const existing = map.getImage(imageId);
+      if (existing && existing.data
+          && (existing.data.width !== imageData.width || existing.data.height !== imageData.height)) {
+        map.removeImage(imageId);
+        map.addImage(imageId, imageData, { pixelRatio: SHELTER_CARD_PIXEL_RATIO });
+        return;
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`resize re-add failed for ${imageId}, trying updateImage`, err);
+    }
+    if (!map.hasImage(imageId)) {
+      map.addImage(imageId, imageData, { pixelRatio: SHELTER_CARD_PIXEL_RATIO });
+      return;
+    }
     try {
       map.updateImage(imageId, imageData);
       return;

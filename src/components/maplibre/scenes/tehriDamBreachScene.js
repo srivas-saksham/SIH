@@ -342,6 +342,9 @@ export const tehriDamBreachScene = {
   // first "Shelters in range" query flies to. AIIMS Rishikesh is the
   // corridor's first shelter downstream of the dam.
   firstFocusShelterId: 'aiims-rishikesh',
+  // Landmark pills within this radius of a shelter hang below its card
+  // (mapEngineCore LANDMARK_* block). Not set on Central Delhi.
+  landmarkShelterClusterKm: 0.7,
 };
 
 export default tehriDamBreachScene;
