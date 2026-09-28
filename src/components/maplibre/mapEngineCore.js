@@ -430,7 +430,8 @@ function renderCapacityBadgeCanvas(percent) {
 // a live distance-from-impact — so the canvas render function below is
 // a stripped-down sibling of renderShelterCardCanvas, not a reuse of it.
 // ---------------------------------------------------------------------
-const LABEL_PILL_CSS_WIDTH = 168;
+const LABEL_PILL_CSS_WIDTH = 168; // MAX width; the pill now shrinks to fit its text
+const LABEL_PILL_MIN_CSS_WIDTH = 96; // MIN width for very short names
 const LABEL_PILL_CSS_HEIGHT = 40;
 const LABEL_PILL_PIXEL_RATIO = 3;
 
@@ -447,6 +448,63 @@ const LABEL_PILL_ICON_SIZE_EXPR = [
 ];
 const LABEL_PILL_ICON_OFFSET = [0, -2];
 
+// ---------------------------------------------------------------------
+// Landmark pill vs. shelter card de-overlap. A landmark label (e.g.
+// "IIT Roorkee") that sits within LANDMARK_SHELTER_CLUSTER_KM of a
+// shelter used to be drawn right on top of that shelter's floating
+// card ("IIT Roorkee Main Campus"). Such a landmark's pill is now
+// anchored at the SHELTER's point and hung BELOW it (the card floats
+// above the point), with LANDMARK_STACK_GAP_PX of air; several
+// landmarks near one shelter stack downward, nearest first. Pure
+// screen-space stacking, so it holds at every zoom.
+//   LANDMARK_SHELTER_CLUSTER_KM  how close a landmark must be to a
+//                                shelter to be moved. HIGHER = more
+//                                landmarks moved; 0 = feature off.
+//   LANDMARK_STACK_GAP_PX        gap between the shelter point / between
+//                                stacked pills (px at icon-size 1).
+// Landmarks farther than the cluster radius are untouched. Clicking a
+// moved pill still flies to the landmark's TRUE location.
+// ---------------------------------------------------------------------
+const LANDMARK_SHELTER_CLUSTER_KM = 0.7;
+const LANDMARK_STACK_GAP_PX = 10;
+const LANDMARK_MAX_STACK_SLOTS = 6;
+
+/** landmarkId -> { lng, lat, slot } (slot 0 = untouched, 1.. = stacked below a shelter). */
+function computeLandmarkLabelPlacement(landmarks, shelters) {
+  const out = {};
+  const perShelter = {};
+  landmarks.forEach((lm) => {
+    out[lm.id] = { lng: lm.lng, lat: lm.lat, slot: 0 };
+    if (!(LANDMARK_SHELTER_CLUSTER_KM > 0)) return;
+    let best = null;
+    shelters.forEach((sh) => {
+      const d = turf.distance([lm.lng, lm.lat], [sh.lng, sh.lat], { units: 'kilometers' });
+      if (d <= LANDMARK_SHELTER_CLUSTER_KM && (!best || d < best.d)) best = { d, sh };
+    });
+    if (best) (perShelter[best.sh.id] = perShelter[best.sh.id] || { sh: best.sh, list: [] }).list.push({ lm, d: best.d });
+  });
+  Object.values(perShelter).forEach(({ sh, list }) => {
+    list.sort((a, b) => a.d - b.d).forEach((item, i) => {
+      out[item.lm.id] = { lng: sh.lng, lat: sh.lat, slot: Math.min(i + 1, LANDMARK_MAX_STACK_SLOTS) };
+    });
+  });
+  return out;
+}
+
+/** Data-driven icon-offset keyed on the feature's integer `slot` property. */
+function landmarkIconOffsetExpr() {
+  const step = LABEL_PILL_CSS_HEIGHT + LANDMARK_STACK_GAP_PX;
+  const expr = ['match', ['get', 'slot']];
+  for (let n = 1; n <= LANDMARK_MAX_STACK_SLOTS; n += 1) {
+    // Positive y = down. Anchor is 'bottom', so the bottom edge sits
+    // n x (pill height + gap) below the point => the pill's top edge
+    // is one gap below it (slot 1), stacking downward for slot 2+.
+    expr.push(n, ['literal', [0, n * step]]);
+  }
+  expr.push(['literal', LABEL_PILL_ICON_OFFSET]);
+  return expr;
+}
+
 /**
  * Draws one landmark or road label pill: a compact rounded-rect tag
  * with a small colored status dot, the place/road name (single line,
@@ -458,9 +516,21 @@ const LABEL_PILL_ICON_OFFSET = [0, -2];
  * way the shelter card has.
  */
 function renderLabelPillCanvas(name, distanceKm, accentHex) {
-  const w = LABEL_PILL_CSS_WIDTH;
   const h = LABEL_PILL_CSS_HEIGHT;
   const ratio = LABEL_PILL_PIXEL_RATIO;
+  // Adaptive width: measure both text lines on a scratch context, then
+  // size the pill to the widest one (+ dot column and right padding),
+  // clamped to MIN..MAX. Height is unchanged.
+  const distText = `${distanceKm.toFixed(2)} km from impact`;
+  const scratch = document.createElement('canvas').getContext('2d');
+  scratch.font = '700 11px system-ui, -apple-system, sans-serif';
+  const nameW = scratch.measureText(name).width;
+  scratch.font = '400 9px system-ui, -apple-system, sans-serif';
+  const distW = scratch.measureText(distText).width;
+  const w = Math.ceil(Math.min(
+    LABEL_PILL_CSS_WIDTH,
+    Math.max(LABEL_PILL_MIN_CSS_WIDTH, 16 + 12 + Math.max(nameW, distW) + 12),
+  ));
   const canvas = document.createElement('canvas');
   canvas.width = w * ratio;
   canvas.height = h * ratio;
@@ -496,7 +566,7 @@ function renderLabelPillCanvas(name, distanceKm, accentHex) {
 
   ctx.font = '400 9px system-ui, -apple-system, sans-serif';
   ctx.fillStyle = '#a1a1aa';
-  ctx.fillText(`${distanceKm.toFixed(2)} km from impact`, textX, h / 2 + 11);
+  ctx.fillText(distText, textX, h / 2 + 11);
 
   return canvas;
 }
@@ -1231,6 +1301,7 @@ export {
   CAPACITY_BADGE_ICON_OFFSET, CAPACITY_BADGE_HEX,
   LABEL_PILL_CSS_WIDTH, LABEL_PILL_CSS_HEIGHT, LABEL_PILL_PIXEL_RATIO,
   LABEL_PILL_ICON_SIZE_EXPR, LABEL_PILL_ICON_OFFSET,
+  computeLandmarkLabelPlacement, landmarkIconOffsetExpr,
   DRIVABLE_CLASSES, ROADS_ACTIVATION_LABEL,
   BUILDINGS_SOURCE_ID, EXPLODED_BUILDINGS_SOURCE_ID, FEATURE_QUERY_RADIUS_PX,
   // canvas render helpers

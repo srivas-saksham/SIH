@@ -28,6 +28,7 @@ import {
   CAPACITY_BADGE_ICON_OFFSET, CAPACITY_BADGE_HEX,
   LABEL_PILL_CSS_WIDTH, LABEL_PILL_CSS_HEIGHT, LABEL_PILL_PIXEL_RATIO,
   LABEL_PILL_ICON_SIZE_EXPR, LABEL_PILL_ICON_OFFSET,
+  computeLandmarkLabelPlacement, landmarkIconOffsetExpr,
   DRIVABLE_CLASSES, ROADS_ACTIVATION_LABEL,
   BUILDINGS_SOURCE_ID, EXPLODED_BUILDINGS_SOURCE_ID, FEATURE_QUERY_RADIUS_PX,
   renderCapacityBadgeCanvas, renderLabelPillCanvas, wrapCanvasText, drawRoundedRectPath,
@@ -44,6 +45,7 @@ import {
   PILLAR_CIRCLE_STEPS, pillarHeightM, pillarRadiusM, labelGapM, heightToScreenPx,
   labelIconSizeAtZoom, resolveAllPlacements, frontVisibility, computePillarStates,
   pillarLabelImageId, pillarLabelLine2, renderPillarLabelCanvas,
+  pillarHeightZoomExpr, pillarHeightRefM, ZOOM_COMPENSATION,
 } from './populationPillars';
 
 /**
@@ -1026,15 +1028,25 @@ export function MapLibreEngine({
           upsertShelterCardImage(map, landmarkLabelImageId(landmark.id), placeholderCanvas);
         });
 
+        // Landmarks near a shelter are re-anchored below that shelter's
+        // card (see computeLandmarkLabelPlacement) so the pill never
+        // covers the card; flyLng/flyLat keep the click target true.
+        const landmarkPlacement = computeLandmarkLabelPlacement(LANDMARKS, METRO_SHELTERS);
         map.addSource('landmark-labels', {
           type: 'geojson',
           data: {
             type: 'FeatureCollection',
-            features: LANDMARKS.map((landmark) => ({
-              type: 'Feature',
-              geometry: { type: 'Point', coordinates: [landmark.lng, landmark.lat] },
-              properties: { landmarkId: landmark.id, icon: landmarkLabelImageId(landmark.id) },
-            })),
+            features: LANDMARKS.map((landmark) => {
+              const pl = landmarkPlacement[landmark.id];
+              return {
+                type: 'Feature',
+                geometry: { type: 'Point', coordinates: [pl.lng, pl.lat] },
+                properties: {
+                  landmarkId: landmark.id, icon: landmarkLabelImageId(landmark.id), slot: pl.slot,
+                  flyLng: landmark.lng, flyLat: landmark.lat,
+                },
+              };
+            }),
           },
         });
 
@@ -1048,7 +1060,7 @@ export function MapLibreEngine({
             'icon-allow-overlap': true,
             'icon-ignore-placement': true,
             'icon-size': LABEL_PILL_ICON_SIZE_EXPR,
-            'icon-offset': LABEL_PILL_ICON_OFFSET,
+            'icon-offset': landmarkIconOffsetExpr(),
             'icon-pitch-alignment': 'viewport',
             'icon-rotation-alignment': 'viewport',
           },
@@ -1148,7 +1160,9 @@ export function MapLibreEngine({
         });
         map.on('click', layerId, (e) => {
           const feature = e.features && e.features[0];
-          const coords = feature?.geometry?.type === 'Point' ? feature.geometry.coordinates : null;
+          let coords = feature?.geometry?.type === 'Point' ? feature.geometry.coordinates : null;
+          // Re-anchored landmark pills fly to the landmark's true spot.
+          if (feature?.properties?.flyLng != null) coords = [feature.properties.flyLng, feature.properties.flyLat];
           if (!coords) return;
           map.flyTo({
             center: [coords[0], coords[1]],
@@ -3427,7 +3441,12 @@ export function MapLibreEngine({
     // crossfades between keyframes; the `band` feature property is the
     // fallback if feature-state hasn't been set yet. Bands use the
     // existing RISK_HEX palette, not a new one.
-    map.addLayer({
+    // Height: primarily a zoom expression evaluated by the GPU every
+    // frame (heightRefM x 2^(REFERENCE_ZOOM - zoom)) so bars keep a fixed
+    // on-screen height even between geometry rebuilds; the zoom-
+    // compensated `heightM` property (rebuilt on every zoom event) is the
+    // fallback if the style validator rejects the expression.
+    const pillarExtrusionLayer = (heightExpr) => ({
       id: 'population-pillars-extrusion',
       source: 'population-pillars',
       type: 'fill-extrusion',
@@ -3440,12 +3459,24 @@ export function MapLibreEngine({
           RISK_HEX.green,
         ],
         'fill-extrusion-color-transition': { duration: TRANSITION_MS * 1.5, delay: 0 },
-        'fill-extrusion-height': ['get', 'heightM'],
+        'fill-extrusion-height': heightExpr,
         'fill-extrusion-base': 0,
         'fill-extrusion-opacity': 0.9,
         'fill-extrusion-vertical-gradient': true,
       },
     });
+    try {
+      // Fixed real-world size (default): plain metre height, like the
+      // shelter polygons. The GPU zoom expression is only for the
+      // optional constant-screen-size mode.
+      map.addLayer(pillarExtrusionLayer(ZOOM_COMPENSATION ? pillarHeightZoomExpr() : ['get', 'heightM']));
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('Pillar zoom-height expression rejected, using per-rebuild heightM:', err);
+    }
+    if (!map.getLayer('population-pillars-extrusion')) {
+      map.addLayer(pillarExtrusionLayer(['get', 'heightM']));
+    }
 
     // Labels: one registered image + one symbol layer per pillar,
     // anchored bottom-centre at the pillar's ground centre and lifted to
@@ -3530,12 +3561,18 @@ export function MapLibreEngine({
     });
 
     // Geometry depends on zoom (metre sizes are zoom-compensated), so
-    // rebuild it — throttled: only when zoom moved >= ZOOM_REBUILD_STEP
-    // since the last rebuild, plus once on moveend. Never every frame.
-    map.on('zoom', () => {
-      const last = pillarLastZoomRef.current;
-      if (last == null || Math.abs(map.getZoom() - last) >= ZOOM_REBUILD_STEP) safePaintPillars();
-    });
+    // rebuild it on every zoom event (ZOOM_REBUILD_STEP = 0) to keep the
+    // pillar radius/label lift a fixed on-screen size while zooming, plus
+    // once on moveend/zoomend. 12 small circles; MapLibre coalesces
+    // overlapping setData calls.
+    // Fixed-size mode needs none of this: geometry never depends on zoom.
+    if (ZOOM_COMPENSATION) {
+      map.on('zoom', () => {
+        const last = pillarLastZoomRef.current;
+        if (last == null || Math.abs(map.getZoom() - last) >= ZOOM_REBUILD_STEP) safePaintPillars();
+      });
+      map.on('zoomend', safePaintPillars);
+    }
     map.on('moveend', () => {
       const last = pillarLastZoomRef.current;
       if (last == null || Math.abs(map.getZoom() - last) > 0.01 || LABEL_LIFT_MODE === 'screen-offset') safePaintPillars();
@@ -3604,7 +3641,7 @@ export function MapLibreEngine({
       pillarFeatures.push({
         type: 'Feature',
         id: index + 1,
-        properties: { pid: st.id, heightM, band: st.band },
+        properties: { pid: st.id, heightM, heightRefM: pillarHeightRefM(effective), band: st.band },
         geometry: { type: 'Polygon', coordinates: circleFeatureCoords(pl.lng, pl.lat, radiusM) },
       });
       if (st.cutOff) {

@@ -45,8 +45,12 @@ import {
 //                           radius (spec: 2–3×).
 //   LABEL_GAP_M_AT_REF      air gap between pillar top and label.
 //   HEIGHT_ANIM_MS          height/lerp duration on keyframe change.
-//   ZOOM_REBUILD_STEP       geometry only rebuilt when zoom moved this
-//                           much (or on moveend) — never per frame.
+//   ZOOM_REBUILD_STEP       geometry is rebuilt when zoom moved at least
+//                           this much since the last rebuild. 0 (now) =
+//                           on EVERY zoom event, so pillar radius stays
+//                           a fixed on-screen size while zooming (the
+//                           old 0.25 let pillars visibly shrink/grow
+//                           between rebuilds). Cheap: 12 small circles.
 //   FRONT_LEAD_KM/RAMP_KM   a pillar starts growing when the flood
 //                           front is LEAD km short of it and is full
 //                           size RAMP km later (front = the flood
@@ -63,6 +67,12 @@ import {
 //                           instead. Flip to it if the label looks
 //                           glued to the base in a live browser.
 // =====================================================================
+// ZOOM_COMPENSATION = false (default): pillars are FIXED real-world
+// geometry, exactly like the cyan shelter polygons — radius and height
+// are true metres, pinned to their spot on the ground, so they grow
+// when you zoom in and shrink when you zoom out WITH the map.
+// true = the old constant-on-screen-size behaviour.
+export const ZOOM_COMPENSATION = false;
 export const REFERENCE_ZOOM = 9;
 export const HEIGHT_PER_PERSON = 0.3;
 export const HEIGHT_MODE = 'linear';
@@ -72,12 +82,46 @@ export const PILLAR_RADIUS_M_AT_REF = 1200;
 export const FOOTPRINT_RADIUS_FACTOR = 2.5;
 export const LABEL_GAP_M_AT_REF = 800;
 export const HEIGHT_ANIM_MS = 900;
-export const ZOOM_REBUILD_STEP = 0.25;
+export const ZOOM_REBUILD_STEP = 0;
 export const FRONT_LEAD_KM = 3;
 export const FRONT_RAMP_KM = 3;
 export const BOOST_TRAPPED_RELIEF = 0.5;
 export const LABEL_LIFT_MODE = 'elevated';
 export const PILLAR_CIRCLE_STEPS = 32;
+
+// De-clutter placement. Pillars used to sit INSIDE the flood ribbon
+// (its half-width reaches 4.5 km on the plains, pillars were only
+// 0.4-2.4 km off the river line), so bars, footprints and labels piled
+// on top of the flood polygon. Each pillar is now pushed clear of the
+// ribbon's edge:
+//   offset = ribbon half-width at that point (PILLAR_EDGE_MODEL below)
+//          + pillar radius + PILLAR_EDGE_MARGIN_KM
+//          + data offsetKm x PILLAR_JITTER_SCALE   (keeps the scatter)
+// then multiplied by PILLAR_OFFSET_SCALE.
+//   PILLAR_OFFSET_SCALE   overall push, 1 = just clear of the ribbon.
+//                         HIGHER = further from the river; 0 = disable
+//                         the new logic (old placement, data offsetKm).
+//   PILLAR_EDGE_MARGIN_KM extra gap between ribbon edge and pillar edge.
+//   PILLAR_JITTER_SCALE   how much the per-pillar data offsetKm varies
+//                         the distance (0 = perfectly even spacing).
+// NOTE the old "every pillar within ~3 km of the river" rule is
+// deliberately relaxed (pillars now sit ~1.5-8 km out, wider on the
+// plains where the flood is wider).
+export const PILLAR_OFFSET_SCALE = 1;
+export const PILLAR_EDGE_MARGIN_KM = 1.0;
+export const PILLAR_JITTER_SCALE = 0.8;
+// Mirror of MapLibreEngine's channelWidthAtProgress (flood half-width
+// by along-path fraction). Kept in sync by hand — if the ribbon widths
+// change there, change them here.
+const PILLAR_EDGE_MODEL = { minKm: 0.25, hillsExitKm: 0.9, maxKm: 4.5, haridwarProgress: 0.493 };
+function floodHalfWidthKm(progress) {
+  const m = PILLAR_EDGE_MODEL;
+  if (progress <= m.haridwarProgress) {
+    return m.minKm + (m.hillsExitKm - m.minKm) * (progress / m.haridwarProgress) ** 1.3;
+  }
+  const t = (progress - m.haridwarProgress) / (1 - m.haridwarProgress);
+  return m.hillsExitKm + (m.maxKm - m.hillsExitKm) * t ** 0.75;
+}
 
 // Entrapment Severity Index weights (sum = 100) and band cut-offs.
 // Illustrative model: trapped share of the exposed population (40),
@@ -97,7 +141,37 @@ export function metersPerPixel(zoom, latDeg) {
 
 /** Height/radius multiplier that keeps on-screen size ~constant. */
 export function zoomScale(zoom, latDeg) {
+  if (!ZOOM_COMPENSATION) return 1;
   return metersPerPixel(zoom, latDeg) / metersPerPixel(REFERENCE_ZOOM, latDeg);
+}
+
+/**
+ * GPU-side height expression: bar height = heightRefM (metres at
+ * REFERENCE_ZOOM) x 2^(REFERENCE_ZOOM - zoom), evaluated by MapLibre on
+ * every rendered frame, so the bar keeps a fixed on-screen height even
+ * between geometry rebuilds. An exponential interpolation with base 0.5
+ * between two stops reproduces A*0.5^(z-z0) exactly. (latitude cancels
+ * out of zoomScale, so no per-pillar term is needed.) Unverified in a
+ * live browser — the engine falls back to the plain 'heightM' property
+ * if the style validator rejects this expression.
+ */
+export const PILLAR_HEIGHT_ZOOM_STOPS = [0, 24];
+export function pillarHeightZoomExpr() {
+  const [z0, z1] = PILLAR_HEIGHT_ZOOM_STOPS;
+  return [
+    'interpolate', ['exponential', 0.5], ['zoom'],
+    z0, ['*', ['get', 'heightRefM'], 2 ** (REFERENCE_ZOOM - z0)],
+    z1, ['*', ['get', 'heightRefM'], 2 ** (REFERENCE_ZOOM - z1)],
+  ];
+}
+
+/** Bar height in metres at REFERENCE_ZOOM (no zoom compensation). */
+export function pillarHeightRefM(trapped) {
+  if (!(trapped > 0)) return 0;
+  const base = HEIGHT_MODE === 'sqrt'
+    ? Math.sqrt(trapped * SQRT_REF_PEOPLE) * HEIGHT_PER_PERSON
+    : trapped * HEIGHT_PER_PERSON;
+  return Math.max(base, MIN_BAR_M_AT_REF * Math.min(1, trapped / 500));
 }
 
 /** Bar height in metres for `trapped` people at this zoom. */
@@ -167,7 +241,12 @@ export function resolvePillarPlacement(pillar, floodLine) {
   const b = turf.along(floodLine, Math.max(0, Math.min(atKm, totalKm - 0.6)) + 0.5, { units: 'kilometers' });
   const heading = turf.bearing(a, b);
   const p0 = turf.along(floodLine, atKm, { units: 'kilometers' });
-  const dest = turf.destination(p0, pillar.offsetKm, heading + 90 * pillar.side, { units: 'kilometers' });
+  // Push clear of the flood ribbon (see PILLAR_OFFSET_SCALE above).
+  const offsetKm = PILLAR_OFFSET_SCALE > 0
+    ? (floodHalfWidthKm(atKm / totalKm) + PILLAR_RADIUS_M_AT_REF / 1000
+        + PILLAR_EDGE_MARGIN_KM + pillar.offsetKm * PILLAR_JITTER_SCALE) * PILLAR_OFFSET_SCALE
+    : pillar.offsetKm;
+  const dest = turf.destination(p0, offsetKm, heading + 90 * pillar.side, { units: 'kilometers' });
   const [lng, lat] = dest.geometry.coordinates;
   const distToRiverKm = turf.pointToLineDistance(dest, floodLine, { units: 'kilometers' });
   return { lng, lat, atKm, distToRiverKm };
@@ -275,18 +354,35 @@ export function pillarLabelLine2(state) {
   return `${state.trapped.toLocaleString('en-US')} trapped \u00b7 ${state.pctTrapped}%${state.cutOff ? ' \u00b7 CUT OFF' : ''}`;
 }
 
-const LABEL_CSS_W = 208;
+// Label width now ADAPTS to the text (min..max below); height is fixed.
+const LABEL_CSS_W = 208; // MAX width — longer text is ellipsized
+const LABEL_CSS_MIN_W = 110; // MIN width for very short text
 const LABEL_CSS_H = 44;
 const LABEL_PIXEL_RATIO = 3;
+const LABEL_TEXT_X = 19;
+const LABEL_RIGHT_PAD = 10;
+const LABEL_NAME_FONT = '700 12px system-ui, -apple-system, sans-serif';
+const LABEL_LINE2_FONT = '600 10.5px system-ui, -apple-system, sans-serif';
 
 /**
  * Two-line label: severity accent bar + area name + "48,200 trapped ·
  * 62%" (+ " · CUT OFF"). Same visual language as renderLabelPillCanvas.
+ * Width = widest text line + padding, clamped to LABEL_CSS_MIN_W..
+ * LABEL_CSS_W, so short labels no longer sit in a mostly-empty box.
  */
 export function renderPillarLabelCanvas(name, line2, accentHex, cutOff) {
-  const w = LABEL_CSS_W;
-  const h = LABEL_CSS_H;
   const ratio = LABEL_PIXEL_RATIO;
+  const h = LABEL_CSS_H;
+  // Measure first (scratch context), then size the real canvas.
+  const scratch = document.createElement('canvas').getContext('2d');
+  scratch.font = LABEL_NAME_FONT;
+  const nameW = scratch.measureText(name).width;
+  scratch.font = LABEL_LINE2_FONT;
+  const line2W = scratch.measureText(line2).width;
+  const w = Math.ceil(Math.min(
+    LABEL_CSS_W,
+    Math.max(LABEL_CSS_MIN_W, LABEL_TEXT_X + Math.max(nameW, line2W) + LABEL_RIGHT_PAD),
+  ));
   const canvas = document.createElement('canvas');
   canvas.width = w * ratio;
   canvas.height = h * ratio;
@@ -308,15 +404,15 @@ export function renderPillarLabelCanvas(name, line2, accentHex, cutOff) {
   ctx.fillStyle = accentHex;
   ctx.fill();
 
-  const textX = 19;
-  const maxTextWidth = w - textX - 8;
+  const textX = LABEL_TEXT_X;
+  const maxTextWidth = w - textX - LABEL_RIGHT_PAD + 2;
   ctx.textBaseline = 'alphabetic';
-  ctx.font = '700 12px system-ui, -apple-system, sans-serif';
+  ctx.font = LABEL_NAME_FONT;
   ctx.fillStyle = '#e4e4e7';
   const [nameLine] = wrapCanvasText(ctx, name, maxTextWidth, 1);
   ctx.fillText(nameLine, textX, 19);
 
-  ctx.font = '600 10.5px system-ui, -apple-system, sans-serif';
+  ctx.font = LABEL_LINE2_FONT;
   ctx.fillStyle = cutOff ? '#fca5a5' : '#a1a1aa';
   const [line] = wrapCanvasText(ctx, line2, maxTextWidth, 1);
   ctx.fillText(line, textX, 34);
