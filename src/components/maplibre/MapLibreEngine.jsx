@@ -39,6 +39,12 @@ import {
   findPrimaryImpactBuilding, deriveLandmarkRisk, findTargetShelter,
   findLabelLayerId, queryBoxAround,
 } from './mapEngineCore';
+import {
+  HEIGHT_ANIM_MS, ZOOM_REBUILD_STEP, FOOTPRINT_RADIUS_FACTOR, LABEL_LIFT_MODE,
+  PILLAR_CIRCLE_STEPS, pillarHeightM, pillarRadiusM, labelGapM, heightToScreenPx,
+  labelIconSizeAtZoom, resolveAllPlacements, frontVisibility, computePillarStates,
+  pillarLabelImageId, pillarLabelLine2, renderPillarLabelCanvas,
+} from './populationPillars';
 
 /**
  * MapLibreEngine — the real 3D MapLibre GL JS map, shared across every
@@ -71,6 +77,9 @@ export function MapLibreEngine({
   sheltersVisible = false,
   flyToTarget = null,
   capacityBoostPercent = null,
+  // Population-pillar overlay toggle (Tehri only — MapToolbar's
+  // "Population" switch). Ignored by scenes with no populationPillars.
+  populationVisible = false,
   // Theme toggle (new) — 'dark' (default, matches the previous
   // hardcoded-to-dark behavior exactly) or 'light'. Only read inside
   // the map-init effect below to pick which STYLE_URLS entry to load;
@@ -127,6 +136,11 @@ export function MapLibreEngine({
     // scenes that don't set it, which keeps the original zoom-step
     // camera below completely unchanged.
     cameraKeyframes: SCENE_CAMERA_KEYFRAMES,
+    // Flood population-entrapment pillars (Tehri only — see
+    // data/floodPopulationPillars.js). undefined for scenes that don't
+    // set it, which makes every pillar code path below a strict no-op
+    // (no sources, layers, listeners or frames).
+    populationPillars: SCENE_POPULATION_PILLARS,
   } = sceneConfig;
   // Last timeline index the scene-specific camera already moved for, so
   // unrelated scenario-object changes don't yank the camera back.
@@ -300,6 +314,22 @@ export function MapLibreEngine({
   // candidates against wherever the impact point CURRENTLY is, instead
   // of only the point one specific activation started with.
   const currentImpactCenterRef = useRef(FALLBACK_CENTER);
+  // Population-pillar overlay state. All refs are tied to this map
+  // instance's lifetime (rebuilt on theme-toggle remount from scene
+  // config); nothing lives outside the component.
+  const populationVisibleRef = useRef(populationVisible);
+  populationVisibleRef.current = populationVisible;
+  const timelineIndexRef = useRef(timelineIndex);
+  timelineIndexRef.current = timelineIndex;
+  const pillarPlacementsRef = useRef(null); // { [id]: {lng, lat, atKm} }, set once at load
+  const pillarStatesRef = useRef([]); // computePillarStates() for the current keyframe
+  const pillarShownRef = useRef({}); // id -> animated (displayed) trapped count
+  const pillarFrameRef = useRef(null); // height-animation rAF
+  const pillarPulseFrameRef = useRef(null); // cut-off footprint pulse rAF
+  const pillarLastZoomRef = useRef(null); // zoom at the last geometry rebuild
+  const pillarLabelKeyRef = useRef({}); // id -> last rendered label text+colour key
+  const pillarFootprintCountRef = useRef(0);
+  const pillarHoverElRef = useRef(null);
   // (Shelter card images are now registered/updated purely off
   // map.hasImage as the source of truth — see upsertShelterCardImage's
   // doc comment for why a separately-tracked ref caused a real bug —
@@ -1064,6 +1094,23 @@ export function MapLibreEngine({
       }
 
       // ---------------------------------------------------------------
+      // Flood population-entrapment pillars (Tehri only). Own try/catch,
+      // like the shelter cards / labels above: a failure here is logged
+      // and swallowed and can never break the rest of the scene. The
+      // returned label-layer ids join CLICKABLE_LABEL_LAYERS below.
+      // Strict no-op when the scene has no populationPillars (Delhi).
+      // ---------------------------------------------------------------
+      let populationLabelLayerIds = [];
+      if (SCENE_POPULATION_PILLARS && floodPathLineRef.current) {
+        try {
+          populationLabelLayerIds = setupPopulationPillars(map);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error('Population-pillar setup failed — pillars will be missing, rest of the scene is unaffected:', err);
+        }
+      }
+
+      // ---------------------------------------------------------------
       // Clickable labels (person request): every on-map heading —
       // landmark/area pills (Ram Jhula, Har Ki Pauri, Connaught Place…),
       // shelter status cards + their capacity badges, and road pills —
@@ -1080,6 +1127,7 @@ export function MapLibreEngine({
         'shelter-cards-symbol',
         'landmark-labels-symbol',
         'road-labels-symbol',
+        ...populationLabelLayerIds,
       ];
       const LABEL_FOCUS_ZOOM = 17;
       CLICKABLE_LABEL_LAYERS.forEach((layerId) => {
@@ -1420,6 +1468,7 @@ export function MapLibreEngine({
 
       loadedRef.current = true;
       applyScenarioActivation(scenario);
+      updatePopulationPillars(timelineIndex);
       applyLandmarkRisk(scenario);
       applyRoadCongestion(scenario.baseline);
       updateShelterStates(scenario, timelineIndex);
@@ -1500,6 +1549,16 @@ export function MapLibreEngine({
     return () => {
       if (impactZoneFrameRef.current) cancelAnimationFrame(impactZoneFrameRef.current);
       if (routeFrameRef.current) cancelAnimationFrame(routeFrameRef.current);
+      if (pillarFrameRef.current) cancelAnimationFrame(pillarFrameRef.current);
+      if (pillarPulseFrameRef.current) cancelAnimationFrame(pillarPulseFrameRef.current);
+      pillarFrameRef.current = null;
+      pillarPulseFrameRef.current = null;
+      pillarPlacementsRef.current = null;
+      pillarLabelKeyRef.current = {};
+      pillarShownRef.current = {};
+      pillarLastZoomRef.current = null;
+      if (pillarHoverElRef.current) pillarHoverElRef.current.remove();
+      pillarHoverElRef.current = null;
       container.removeEventListener('pointerdown', onCustomDragPointerDown);
       window.removeEventListener('pointermove', onCustomDragPointerMove);
       window.removeEventListener('pointerup', onCustomDragPointerUp);
@@ -1592,6 +1651,13 @@ export function MapLibreEngine({
     // mergeKeyframe.js's field whitelist — this is what makes
     // animateFloodZone's T+5 nudge actually fire now.
     animateFloodZone(scenario.baseline, impactCenter, resolveActiveKeyframePhase(scenario, timelineIndex));
+    // Population pillars (Tehri only; no-op elsewhere): must run AFTER
+    // animateFloodZone so its rAF is already scheduled — the pillar loop
+    // keeps running while the flood ribbon grows and reads that
+    // ribbon's live extent as the flood front. Also re-runs on the
+    // shelter-capacity what-if (scenario object changes), which is how
+    // the boost reaches the trapped counts.
+    updatePopulationPillars(timelineIndex);
     // Road congestion has no growth/shrink animation to drive (§3.4 of
     // the research doc — `level` is a discrete enum per road, not an
     // interpolatable number) — applyRoadCongestion just diffs+applies
@@ -1710,6 +1776,17 @@ export function MapLibreEngine({
     applySheltersVisibility(sheltersVisible);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sheltersVisible]);
+
+  // -------------------------------------------------------------------
+  // Population toggle (MapToolbar) — pure visibility flip, its own
+  // effect so toggling never re-runs anything else. No-op for scenes
+  // without pillars.
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    applyPopulationVisibility(populationVisible);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [populationVisible]);
 
   // -------------------------------------------------------------------
   // Imperative helpers (closures over refs, called from the effects
@@ -3302,6 +3379,320 @@ export function MapLibreEngine({
       }
     };
     routeFrameRef.current = requestAnimationFrame(step);
+  }
+
+  // -------------------------------------------------------------------
+  // FLOOD POPULATION-ENTRAPMENT PILLARS (Tehri only).
+  // One GeoJSON source + one fill-extrusion layer for every cylinder
+  // (data-driven height, feature-state colour so it crossfades like the
+  // buildings do), a fill + dashed outline for the cut-off footprints,
+  // and one symbol layer PER pillar for the floating labels (per-pillar
+  // so the 'screen-offset' fallback can use a plain layout icon-offset).
+  // Nothing here is verified in a live browser — see populationPillars.js
+  // for the tuning block.
+  // -------------------------------------------------------------------
+  const PILLAR_LAYER_IDS = ['population-footprints-fill', 'population-footprints-outline', 'population-pillars-extrusion'];
+  const pillarLabelLayerId = (id) => `population-label-${id}`;
+
+  function circleFeatureCoords(lng, lat, radiusM) {
+    return turf.circle([lng, lat], radiusM / 1000, { steps: PILLAR_CIRCLE_STEPS, units: 'kilometers' }).geometry.coordinates;
+  }
+
+  function setupPopulationPillars(map) {
+    const pillars = SCENE_POPULATION_PILLARS;
+    pillarPlacementsRef.current = resolveAllPlacements(pillars, SCENE_FLOOD_PATH);
+    pillarShownRef.current = {};
+    pillarLabelKeyRef.current = {};
+    const empty = { type: 'FeatureCollection', features: [] };
+
+    map.addSource('population-footprints', { type: 'geojson', data: empty });
+    map.addSource('population-pillars', { type: 'geojson', data: empty });
+    map.addSource('population-pillar-labels', { type: 'geojson', data: empty });
+
+    // Cut-off footprint: flat translucent red disc + dashed outline.
+    map.addLayer({
+      id: 'population-footprints-fill',
+      source: 'population-footprints',
+      type: 'fill',
+      paint: { 'fill-color': '#ef4444', 'fill-opacity': 0.25 },
+    });
+    map.addLayer({
+      id: 'population-footprints-outline',
+      source: 'population-footprints',
+      type: 'line',
+      paint: { 'line-color': '#ef4444', 'line-width': 1.6, 'line-dasharray': [2, 2], 'line-opacity': 0.9 },
+    });
+    // Pillars. Colour comes from feature-state 'band' (set in
+    // updatePopulationPillars) so `fill-extrusion-color-transition`
+    // crossfades between keyframes; the `band` feature property is the
+    // fallback if feature-state hasn't been set yet. Bands use the
+    // existing RISK_HEX palette, not a new one.
+    map.addLayer({
+      id: 'population-pillars-extrusion',
+      source: 'population-pillars',
+      type: 'fill-extrusion',
+      paint: {
+        'fill-extrusion-color': [
+          'match', ['coalesce', ['feature-state', 'band'], ['get', 'band']],
+          'red', RISK_HEX.red,
+          'orange', RISK_HEX.orange,
+          'yellow', RISK_HEX.yellow,
+          RISK_HEX.green,
+        ],
+        'fill-extrusion-color-transition': { duration: TRANSITION_MS * 1.5, delay: 0 },
+        'fill-extrusion-height': ['get', 'heightM'],
+        'fill-extrusion-base': 0,
+        'fill-extrusion-opacity': 0.9,
+        'fill-extrusion-vertical-gradient': true,
+      },
+    });
+
+    // Labels: one registered image + one symbol layer per pillar,
+    // anchored bottom-centre at the pillar's ground centre and lifted to
+    // its top (see LABEL_LIFT_MODE in populationPillars.js).
+    const states0 = computePillarStates(pillars, 0, null);
+    const labelLayerIds = [];
+    states0.forEach((st) => {
+      upsertShelterCardImage(map, pillarLabelImageId(st.id), renderPillarLabelCanvas(st.name, '\u2014', st.hex, false));
+      const layerId = pillarLabelLayerId(st.id);
+      const layout = {
+        'icon-image': pillarLabelImageId(st.id),
+        'icon-anchor': 'bottom',
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+        'icon-size': LABEL_PILL_ICON_SIZE_EXPR,
+        'icon-offset': LABEL_PILL_ICON_OFFSET,
+        'icon-pitch-alignment': 'viewport',
+        'icon-rotation-alignment': 'viewport',
+      };
+      if (LABEL_LIFT_MODE === 'elevated') {
+        // Per-feature metres above ground (maplibre-gl >= 6.7 style spec).
+        layout['symbol-height-offset'] = ['get', 'labelH'];
+      }
+      map.addLayer({
+        id: layerId,
+        source: 'population-pillar-labels',
+        type: 'symbol',
+        filter: ['==', ['get', 'pid'], st.id],
+        layout,
+      });
+      labelLayerIds.push(layerId);
+    });
+
+    // Hover card (DOM overlay inside the map container).
+    const card = document.createElement('div');
+    card.style.cssText = 'position:absolute;z-index:6;display:none;pointer-events:none;min-width:200px;max-width:240px;'
+      + 'padding:8px 10px;border-radius:8px;border:1px solid #2a2a2e;background:rgba(10,10,11,0.94);color:#e4e4e7;'
+      + 'font:11px/1.45 system-ui,-apple-system,sans-serif;backdrop-filter:blur(4px);';
+    map.getContainer().appendChild(card);
+    pillarHoverElRef.current = card;
+
+    function showCard(e) {
+      const pid = e.features?.[0]?.properties?.pid;
+      const st = pillarStatesRef.current.find((x) => x.id === pid);
+      if (!st) return;
+      const shelter = METRO_SHELTERS.find((sh) => sh.id === st.nearestShelterId);
+      card.innerHTML = `<div style="font-weight:700;font-size:12px;margin-bottom:3px">${st.name}${st.cutOff ? ' <span style="color:#fca5a5">\u00b7 CUT OFF</span>' : ''}</div>`
+        + `<div><b>${st.trapped.toLocaleString('en-US')}</b> trapped of ${st.populationTotal.toLocaleString('en-US')} (${st.pctTrapped}%)</div>`
+        + `<div>ESI <b style="color:${st.hex}">${st.esi} \u00b7 ${st.band.toUpperCase()}</b></div>`
+        + `<div style="color:#a1a1aa">Flood depth ${st.depthM.toFixed(1)} m \u00b7 ETA ${st.arrivalMinutes} min</div>`
+        + `<div style="color:#a1a1aa">Rescue window ${st.rescueWindowMin} min \u00b7 vulnerable ${st.vulnerablePct}%</div>`
+        + `<div style="color:#a1a1aa">Nearest shelter: ${shelter ? shelter.name : st.nearestShelterId} (${st.nearestShelterKm} km)</div>`
+        + '<div style="color:#6b7280;font-size:9px;margin-top:3px">Illustrative demo figures</div>';
+      card.style.display = 'block';
+      const box = map.getContainer().getBoundingClientRect();
+      const w = card.offsetWidth;
+      const h = card.offsetHeight;
+      card.style.left = `${Math.max(4, Math.min(e.point.x + 14, box.width - w - 4))}px`;
+      card.style.top = `${Math.max(4, Math.min(e.point.y + 14, box.height - h - 4))}px`;
+    }
+    const hideCard = () => { card.style.display = 'none'; };
+
+    ['population-pillars-extrusion', ...labelLayerIds].forEach((layerId) => {
+      map.on('mousemove', layerId, showCard);
+      map.on('mouseleave', layerId, hideCard);
+    });
+    // Pillar body: pointer cursor + click-to-fly (label layers get theirs
+    // from CLICKABLE_LABEL_LAYERS).
+    map.on('mouseenter', 'population-pillars-extrusion', () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', 'population-pillars-extrusion', () => { map.getCanvas().style.cursor = ''; });
+    map.on('click', 'population-pillars-extrusion', (e) => {
+      const pl = pillarPlacementsRef.current?.[e.features?.[0]?.properties?.pid];
+      if (!pl) return;
+      map.flyTo({
+        center: [pl.lng, pl.lat],
+        zoom: Math.max(map.getZoom(), 13),
+        pitch: 58,
+        speed: 1.8,
+        curve: 1.2,
+        essential: true,
+      });
+    });
+
+    // Geometry depends on zoom (metre sizes are zoom-compensated), so
+    // rebuild it — throttled: only when zoom moved >= ZOOM_REBUILD_STEP
+    // since the last rebuild, plus once on moveend. Never every frame.
+    map.on('zoom', () => {
+      const last = pillarLastZoomRef.current;
+      if (last == null || Math.abs(map.getZoom() - last) >= ZOOM_REBUILD_STEP) safePaintPillars();
+    });
+    map.on('moveend', () => {
+      const last = pillarLastZoomRef.current;
+      if (last == null || Math.abs(map.getZoom() - last) > 0.01 || LABEL_LIFT_MODE === 'screen-offset') safePaintPillars();
+    });
+
+    // Gentle pulse on the cut-off footprints (~15 fps, one paint prop).
+    let lastPulse = 0;
+    const pulse = (now) => {
+      pillarPulseFrameRef.current = requestAnimationFrame(pulse);
+      if (now - lastPulse < 66) return;
+      lastPulse = now;
+      if (!populationVisibleRef.current || pillarFootprintCountRef.current === 0) return;
+      if (!map.getLayer('population-footprints-fill')) return;
+      map.setPaintProperty('population-footprints-fill', 'fill-opacity', 0.16 + 0.16 * (0.5 + 0.5 * Math.sin(now / 420)));
+    };
+    pillarPulseFrameRef.current = requestAnimationFrame(pulse);
+
+    applyPopulationVisibility(populationVisibleRef.current);
+    return labelLayerIds;
+  }
+
+  function safePaintPillars() {
+    try {
+      paintPillars();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('Population-pillar repaint failed:', err);
+    }
+  }
+
+  function applyPopulationVisibility(visible) {
+    const map = mapRef.current;
+    if (!map || !SCENE_POPULATION_PILLARS || !pillarPlacementsRef.current) return;
+    const value = visible ? 'visible' : 'none';
+    [...PILLAR_LAYER_IDS, ...SCENE_POPULATION_PILLARS.map((p) => pillarLabelLayerId(p.id))].forEach((layerId) => {
+      if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', value);
+    });
+    if (!visible && pillarHoverElRef.current) pillarHoverElRef.current.style.display = 'none';
+  }
+
+  /**
+   * Redraws pillar/footprint/label geometry from pillarStatesRef +
+   * pillarShownRef at the CURRENT zoom. Cheap (12 small circles); called
+   * per frame only during the ~900 ms height animation, otherwise on a
+   * throttled zoom change / moveend.
+   */
+  function paintPillars() {
+    const map = mapRef.current;
+    const placements = pillarPlacementsRef.current;
+    const pillarSource = map?.getSource('population-pillars');
+    if (!map || !placements || !pillarSource) return;
+    const zoom = map.getZoom();
+    const pitch = map.getPitch();
+    const extent = currentFloodRef.current?.extentKm ?? 0;
+    const pillarFeatures = [];
+    const footprintFeatures = [];
+    const labelFeatures = [];
+    pillarStatesRef.current.forEach((st, index) => {
+      const pl = placements[st.id];
+      // Flood-front gate: hidden until the ribbon's live front reaches
+      // the pillar; scrubbing back shrinks it as the front recedes.
+      const effective = (pillarShownRef.current[st.id] ?? 0) * frontVisibility(extent, pl.atKm);
+      if (effective < 1) return;
+      const heightM = pillarHeightM(effective, zoom, pl.lat);
+      const radiusM = pillarRadiusM(zoom, pl.lat);
+      pillarFeatures.push({
+        type: 'Feature',
+        id: index + 1,
+        properties: { pid: st.id, heightM, band: st.band },
+        geometry: { type: 'Polygon', coordinates: circleFeatureCoords(pl.lng, pl.lat, radiusM) },
+      });
+      if (st.cutOff) {
+        footprintFeatures.push({
+          type: 'Feature',
+          properties: { pid: st.id },
+          geometry: { type: 'Polygon', coordinates: circleFeatureCoords(pl.lng, pl.lat, radiusM * FOOTPRINT_RADIUS_FACTOR) },
+        });
+      }
+      const gapM = labelGapM(zoom, pl.lat);
+      labelFeatures.push({
+        type: 'Feature',
+        properties: { pid: st.id, labelH: heightM + gapM },
+        geometry: { type: 'Point', coordinates: [pl.lng, pl.lat] },
+      });
+      if (LABEL_LIFT_MODE === 'screen-offset') {
+        // Fallback: lift the icon by the bar's on-screen height (icon-
+        // offset is multiplied by icon-size, so divide it back out).
+        const liftPx = heightToScreenPx(heightM + gapM, zoom, pl.lat, pitch) + 2;
+        const layerId = pillarLabelLayerId(st.id);
+        if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'icon-offset', [0, -liftPx / labelIconSizeAtZoom(zoom)]);
+      }
+    });
+    pillarSource.setData({ type: 'FeatureCollection', features: pillarFeatures });
+    map.getSource('population-footprints')?.setData({ type: 'FeatureCollection', features: footprintFeatures });
+    map.getSource('population-pillar-labels')?.setData({ type: 'FeatureCollection', features: labelFeatures });
+    pillarFootprintCountRef.current = footprintFeatures.length;
+    pillarLastZoomRef.current = zoom;
+  }
+
+  /**
+   * Called on every keyframe/boost change (see the timeline effect):
+   * recomputes each pillar's state, updates colour (feature-state) and
+   * label text (only when it actually changed), then animates each
+   * pillar's height from its previous value (0 on first appearance) to
+   * the new one with ease-out. The loop also keeps running while the
+   * flood ribbon is still growing, because visibility follows the
+   * ribbon's live front.
+   */
+  function updatePopulationPillars(index) {
+    const map = mapRef.current;
+    if (!map || !SCENE_POPULATION_PILLARS || !pillarPlacementsRef.current) return;
+    // try/catch: this runs inside the shared timeline effect, so a bug
+    // here must never stop the roads/shelters/labels updates after it.
+    try {
+      const states = computePillarStates(SCENE_POPULATION_PILLARS, index, capacityBoostPercentRef.current);
+      pillarStatesRef.current = states;
+      states.forEach((st, i) => {
+        map.setFeatureState({ source: 'population-pillars', id: i + 1 }, { band: st.band });
+        if (st.trapped > 0) {
+          const line2 = pillarLabelLine2(st);
+          const key = `${line2}|${st.hex}|${st.cutOff}`;
+          if (pillarLabelKeyRef.current[st.id] !== key) {
+            pillarLabelKeyRef.current[st.id] = key;
+            upsertShelterCardImage(map, pillarLabelImageId(st.id), renderPillarLabelCanvas(st.name, line2, st.hex, st.cutOff));
+          }
+        }
+      });
+
+      if (pillarFrameRef.current) cancelAnimationFrame(pillarFrameRef.current);
+      const from = { ...pillarShownRef.current };
+      const start = performance.now();
+      const step = (now) => {
+        try {
+          const t = Math.min(1, (now - start) / HEIGHT_ANIM_MS);
+          const eased = 1 - (1 - t) ** 3;
+          states.forEach((st) => {
+            const a = from[st.id] ?? 0;
+            pillarShownRef.current[st.id] = a + (st.trapped - a) * eased;
+          });
+          paintPillars();
+          // Keep going while the flood front is still moving (bounded).
+          if (t < 1 || (floodZoneFrameRef.current && now - start < 4000)) {
+            pillarFrameRef.current = requestAnimationFrame(step);
+          } else {
+            pillarFrameRef.current = null;
+          }
+        } catch (err) {
+          pillarFrameRef.current = null;
+          // eslint-disable-next-line no-console
+          console.warn('Population-pillar animation frame failed — pillars may be stale:', err);
+        }
+      };
+      pillarFrameRef.current = requestAnimationFrame(step);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('Population-pillar update failed — pillars may be stale, rest of the scene unaffected:', err);
+    }
   }
 
   return <div ref={containerRef} className="h-full w-full" />;

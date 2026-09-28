@@ -11,6 +11,7 @@ import {
   DAM_SHELTERS,
   DAM_INACCESSIBLE_SHELTER_ID,
 } from '../../../data/damCorridorShelters';
+import { FLOOD_PILLARS } from '../../../data/floodPopulationPillars';
 
 // Roughly the geographic mean of the scenario's baseline buildings
 // (src/scenarios/tehri-dam-breach.json spans lat 28.70\u201330.38, lng
@@ -274,6 +275,9 @@ const floodHotspots = [
 //   rightKm     Shift the camera RIGHT on screen (+) or LEFT (-), in km.
 //   upKm        Shift the camera UP on screen (+) or DOWN (-), in km.
 //   pitch       Optional tilt 0-85 (0 = top-down). null = leave as is.
+//               T+5..T+30 are set to 55 (population pillars read
+//               clearly at this tilt). To revert to the old behaviour
+//               set those four entries back to `null`.
 //   bearing     Optional rotation in degrees. null = leave as is.
 //   durationMs  How long the glide takes (smaller = faster).
 //
@@ -284,13 +288,13 @@ const cameraKeyframes = [
   // T+0  — unchanged: tight on the dam.
   { zoom: 16.5, followFront: 0,   rightKm: 0,  upKm: 0, pitch: null, bearing: null, durationMs: 1600 },
   // T+5  — pull WAY back, nudge right so the whole flood circle fits.
-  { zoom: 10.9, followFront: 0,   rightKm: 2,  upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+  { zoom: 10.9, followFront: 0,   rightKm: 2,  upKm: 0, pitch: 55, bearing: null, durationMs: 1800 },
   // T+10 — even further out, slide toward the front (Devprayag \u2192 Rishikesh), still a bit right.
-  { zoom: 9.9,  followFront: 0.5, rightKm: 10, upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+  { zoom: 9.9,  followFront: 0.5, rightKm: 10, upKm: 0, pitch: 55, bearing: null, durationMs: 1800 },
   // T+15 — keeps pulling back so it never zooms IN after T+10 (front nears Haridwar).
-  { zoom: 8.7,  followFront: 0.5, rightKm: 0,  upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+  { zoom: 8.7,  followFront: 0.5, rightKm: 0,  upKm: 0, pitch: 55, bearing: null, durationMs: 1800 },
   // T+30 — widest shot, framing the whole dam \u2192 Meerut corridor.
-  { zoom: 8.2,  followFront: 0.5, rightKm: 0,  upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+  { zoom: 8.2,  followFront: 0.5, rightKm: 0,  upKm: 0, pitch: 55, bearing: null, durationMs: 1800 },
 ];
 
 export const tehriDamBreachScene = {
@@ -302,6 +306,10 @@ export const tehriDamBreachScene = {
   cameraKeyframes,
   floodPath,
   floodHotspots,
+  // Population-entrapment pillars (Task N+5) — Tehri only; the Delhi
+  // scene config deliberately has no such field. Tuning constants live
+  // in components/maplibre/populationPillars.js.
+  populationPillars: FLOOD_PILLARS,
   landmarks: DAM_LANDMARKS,
   landmarkIds: DAM_LANDMARK_IDS,
   shelters: DAM_SHELTERS,

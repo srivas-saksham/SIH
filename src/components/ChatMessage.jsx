@@ -254,6 +254,36 @@ function SheltersQueryTurn({ content, onReveal }) {
   );
 }
 
+/** Population-entrapment briefing — rendered for the 'population-query'
+ * turn kind (Tehri only): headline + the three worst hotspots. */
+function PopulationQueryTurn({ content, onReveal }) {
+  const [headlineDone, setHeadlineDone] = useState(false);
+  const bandText = {
+    red: 'text-risks-red', orange: 'text-risks-orange', yellow: 'text-risks-yellow', green: 'text-risks-green',
+  };
+  return (
+    <div className="border-b border-hairline pb-4">
+      <TypewriterHeadline text={content.headline} onReveal={onReveal} onDone={() => setHeadlineDone(true)} />
+      {headlineDone && content.hotspots.length > 0 && (
+        <ul className="mt-3 space-y-2.5 animate-[fadeIn_0.35s_ease-out_forwards]">
+          {content.hotspots.map((spot, i) => (
+            <li key={spot.id} className="text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-200">{i + 1}. {spot.name}</span>
+                <span className="font-mono text-ink-dim">{spot.trapped.toLocaleString('en-US')} {'\u00b7'} {spot.pctTrapped}%</span>
+              </div>
+              <p className="mt-0.5 text-[10px] uppercase tracking-[0.16em] text-ink-faint">
+                <span className={bandText[spot.band]}>ESI {spot.esi} {spot.band}</span>
+                {spot.cutOff ? ' \u00b7 cut off' : ''} {'\u00b7'} rescue window {spot.rescueWindowMin} min
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /** User's own typed/echoed chat turn. */
 function UserTurn({ text }) {
   return (
@@ -582,6 +612,8 @@ export function ChatMessage({ turn, onReveal, onAdvance, onQueryRoads, onQuerySh
       return <RoadsQueryTurn content={turn.content} onReveal={onReveal} onQueryRoads={onQueryRoads} />;
     case 'shelters-query':
       return <SheltersQueryTurn content={turn.content} onReveal={onReveal} />;
+    case 'population-query':
+      return <PopulationQueryTurn content={turn.content} onReveal={onReveal} />;
     case 'clarify-fallback':
       return <ClarifyFallbackTurn />;
     case 'intervention-response':

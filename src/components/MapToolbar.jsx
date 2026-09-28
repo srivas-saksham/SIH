@@ -89,6 +89,11 @@ const SHARED_PILL_CLASSES = 'pointer-events-auto relative flex items-center roun
 export function MapToolbar({
   sheltersVisible,
   onToggleShelters,
+  // Population-pillar toggle (Task N+5). Rendered ONLY when the active
+  // scene defines pillars (Tehri) — `onTogglePopulation` is undefined
+  // for every other scene, so the pill never appears there.
+  populationVisible = false,
+  onTogglePopulation,
   mapTheme = 'dark',
   onToggleMapTheme,
 }) {
@@ -143,6 +148,26 @@ export function MapToolbar({
         <span className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 translate-x-0 rounded-full bg-canvas transition-transform peer-checked:translate-x-5" />
         <span className="ml-2"> Shelters </span>
       </label>
+
+      {onTogglePopulation ? (
+        <label
+          className={`${SHARED_PILL_CLASSES} cursor-pointer pl-12 pr-3 ${
+            populationVisible
+              ? 'border-accent bg-accent/15 text-ink'
+              : 'border-hairline bg-canvas/85 text-ink-dim hover:border-ink-dim hover:bg-surface/85 hover:text-ink'
+          }`}
+        >
+          <input
+            type="checkbox"
+            checked={populationVisible}
+            onChange={(event) => onTogglePopulation(event.target.checked)}
+            className="peer sr-only"
+          />
+          <span className="absolute left-2 top-1/2 h-5 w-10 -translate-y-1/2 rounded-full bg-ink-dim transition-colors peer-checked:bg-accent" />
+          <span className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 translate-x-0 rounded-full bg-canvas transition-transform peer-checked:translate-x-5" />
+          <span className="ml-2"> Population </span>
+        </label>
+      ) : null}
 
       <div ref={menuRef} className={`${SHARED_PILL_CLASSES} gap-0 border-hairline bg-canvas/85 pl-3 pr-1 text-ink-dim`}>
         <button

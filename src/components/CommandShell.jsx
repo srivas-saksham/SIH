@@ -9,6 +9,7 @@ import {
   buildSheltersQueryContent,
   buildInterventionResponseContent,
   buildCapacityBoostResponseContent,
+  buildPopulationQueryContent,
 } from '../utils/buildAnalystContent';
 import { computeCausalFactors } from '../utils/causalFactors';
 import { applyShelterCapacityBoost } from '../utils/shelterCapacityBoost';
@@ -23,6 +24,7 @@ import {
   parseContentQueryIntent,
   parseInterventionIntent,
   parseCapacityBoostIntent,
+  parsePopulationIntent,
   isClearChatCommand,
   isResetSceneCommand,
 } from '../utils/timelineIntent';
@@ -33,6 +35,10 @@ import { KeyframeBlurb } from './KeyframeBlurb';
 import { MapLibreView } from './MapLibreView';
 import { MAPLIBRE_SCENE_IDS } from './maplibre/sceneRegistry';
 import { MapToolbar } from './MapToolbar';
+import { PopulationPanel } from './PopulationPanel';
+import {
+  computePillarStates, summarizeStates, totalsByKeyframe, resolveAllPlacements,
+} from './maplibre/populationPillars';
 import { MapView } from './MapView';
 import { TimelineScrubber } from './TimelineScrubber';
 import { TopNav } from './TopNav';
@@ -145,6 +151,12 @@ export function CommandShell() {
 
   // Map toolbar: shelters default OFF.
   const [sheltersVisible, setSheltersVisible] = useState(false);
+  // Map toolbar: flood population pillars default ON (Tehri only — the
+  // toggle, panel and chat command only exist for scenes whose config
+  // defines populationPillars; everywhere else this state is inert).
+  const [populationVisible, setPopulationVisible] = useState(true);
+  // Cycles the "population at risk" chat query through the worst hotspots.
+  const populationCycleRef = useRef(0);
   // Map toolbar: theme defaults to 'dark' — matches the previously
   // hardcoded-to-dark behavior exactly; 'light' is the only other
   // value MapToolbar's theme button cycles to. Unlike sheltersVisible,
@@ -174,6 +186,8 @@ export function CommandShell() {
     setCurrentKeyframeIndex(0);
     setIsPlaying(false);
     setSheltersVisible(false);
+    setPopulationVisible(true);
+    populationCycleRef.current = 0;
     setInterventionApplied(false);
     setCapacityBoostPercent(null);
     lastShelterIdRef.current = null;
@@ -229,6 +243,24 @@ export function CommandShell() {
   const currentCausalFactors = useMemo(
     () => (activeScenario ? getCausalFactorsForIndex(activeScenario, currentKeyframeIndex) : null),
     [activeScenario, currentKeyframeIndex],
+  );
+
+  // Population pillars (Tehri only): the scene's pillar list, and the
+  // per-keyframe summary the panel + chat command share with the map
+  // (same computePillarStates, so they always agree, incl. the
+  // shelter-capacity what-if via capacityBoostPercent).
+  const scenePillars = activeScenario ? getSceneConfig(activeScenario.id).populationPillars : undefined;
+  const populationStates = useMemo(
+    () => (scenePillars ? computePillarStates(scenePillars, currentKeyframeIndex, capacityBoostPercent) : null),
+    [scenePillars, currentKeyframeIndex, capacityBoostPercent],
+  );
+  const populationSummary = useMemo(
+    () => (populationStates ? summarizeStates(populationStates) : null),
+    [populationStates],
+  );
+  const populationSeries = useMemo(
+    () => (scenePillars ? totalsByKeyframe(scenePillars, capacityBoostPercent) : null),
+    [scenePillars, capacityBoostPercent],
   );
 
   const appendTurn = useCallback(
@@ -342,6 +374,29 @@ export function CommandShell() {
     },
     [activeScenario, mergedMapState, appendTurn],
   );
+
+  /**
+   * "Population at risk" / "who is trapped" (Task N+5, Tehri only):
+   * appends an analyst turn (headline + top hotspots), turns the
+   * pillars on, and flies to the worst hotspot; repeating the query
+   * cycles through the top hotspots.
+   */
+  const handlePopulationQuery = useCallback(() => {
+    if (!activeScenario || !scenePillars || !populationSummary) return;
+    setPopulationVisible(true);
+    const label = activeScenario.timeline?.[currentKeyframeIndex]?.label || `T+${currentKeyframeIndex}`;
+    appendTurn({ kind: 'population-query', content: buildPopulationQueryContent(label, populationSummary) });
+    const top = populationSummary.worst.slice(0, 3);
+    if (top.length === 0) return;
+    const target = top[populationCycleRef.current % top.length];
+    populationCycleRef.current += 1;
+    const placements = resolveAllPlacements(scenePillars, getSceneConfig(activeScenario.id).floodPath);
+    const pl = placements[target.id];
+    if (pl) {
+      flyToNonceRef.current += 1;
+      setFlyToTarget({ lat: pl.lat, lng: pl.lng, zoom: 12.5, nonce: flyToNonceRef.current });
+    }
+  }, [activeScenario, scenePillars, populationSummary, currentKeyframeIndex, appendTurn]);
 
   const handleQueryShelters = useCallback(() => {
     if (!activeScenario) return;
@@ -518,6 +573,8 @@ export function CommandShell() {
       setInterventionApplied(false);
       setCapacityBoostPercent(null);
       setSheltersVisible(false);
+      setPopulationVisible(true);
+      populationCycleRef.current = 0;
       lastShelterIdRef.current = null;
       setChatTurns([{ id: nextTurnId(), kind: 'system-notice', text: 'Scene reset — back to T+0, intervention cleared, shelters off, attack still active.' }]);
       bumpScroll();
@@ -564,6 +621,15 @@ export function CommandShell() {
     const interventionIntent = parseInterventionIntent(query);
     if (interventionIntent && activeScenario) {
       handleApplyIntervention(interventionIntent.percent);
+      return;
+    }
+
+    // Population-entrapment intent (Task N+5) — only acted on when the
+    // active scene has pillars (Tehri); otherwise falls through to the
+    // existing flow exactly as before. Placed after the what-if /
+    // intervention intents so "increase shelter capacity …" still wins.
+    if (activeScenario && scenePillars && parsePopulationIntent(query)) {
+      handlePopulationQuery();
       return;
     }
 
@@ -673,14 +739,25 @@ export function CommandShell() {
                   sheltersVisible={sheltersVisible}
                   flyToTarget={flyToTarget}
                   capacityBoostPercent={capacityBoostPercent}
+                  populationVisible={populationVisible}
                   mapTheme={mapTheme}
                 />
                 <MapToolbar
                   sheltersVisible={sheltersVisible}
                   onToggleShelters={setSheltersVisible}
+                  populationVisible={populationVisible}
+                  onTogglePopulation={scenePillars ? setPopulationVisible : undefined}
                   mapTheme={mapTheme}
                   onToggleMapTheme={setMapTheme}
                 />
+                {scenePillars && populationVisible && populationSummary && populationSeries ? (
+                  <PopulationPanel
+                    summary={populationSummary}
+                    series={populationSeries}
+                    currentIndex={currentKeyframeIndex}
+                    labels={activeScenario.timeline.map((k) => k.label)}
+                  />
+                ) : null}
                 {/*
                   Task 3: a separate keyframe, reachable ONLY via the
                   what-if chat command — not part of the T+N timeline

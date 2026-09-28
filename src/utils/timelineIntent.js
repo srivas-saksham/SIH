@@ -120,6 +120,27 @@ export function parseContentQueryIntent(rawInput) {
 }
 
 /**
+ * Population-entrapment intent (Task N+5): "population at risk", "who is
+ * trapped", "trapped people", "show pillars", "cut off areas". Its own
+ * regex — the roads/shelters regexes above are deliberately untouched.
+ * CommandShell only acts on it when the active scene actually has
+ * population pillars (Tehri); everywhere else it falls through to the
+ * existing flow unchanged.
+ *
+ * @param {string} rawInput
+ * @returns {{type:'population'}|null}
+ */
+const POPULATION_WORDS =
+  /\b(population\s+(at\s+risk|trapped|entrapment|exposure)|who\s+(is|are|s)\s+(trapped|stuck|stranded)|(trapped|stuck|stranded)\s+(people|population|residents|civilians)|people\s+(trapped|stuck|stranded)|(show|display)\s+(the\s+)?(pillars?|population)|pillars?|cut\s*off\s+(areas?|zones?|towns?|villages?))\b/;
+
+export function parsePopulationIntent(rawInput) {
+  if (!rawInput) return null;
+  const normalized = normalize(rawInput);
+  if (!normalized) return null;
+  return POPULATION_WORDS.test(normalized) ? { type: 'population' } : null;
+}
+
+/**
  * Intervention-command intent (Task 3, Section 2 point 3 / Task 3 spec):
  * typing "increase shelter capacity by 20%", "apply intervention",
  * "deploy more shelters", "boost shelter capacity", etc. while a

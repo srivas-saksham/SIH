@@ -261,6 +261,33 @@ export function buildSheltersQueryContent(scenario) {
   return { headline, shelters };
 }
 
+/**
+ * Population-entrapment briefing (Task N+5) for the 'population-query'
+ * chat turn. Takes an already-computed summary (see summarizeStates in
+ * components/maplibre/populationPillars.js) so this stays a pure
+ * text-shaping function. All figures are illustrative demo numbers.
+ *
+ * @param {string} keyframeLabel e.g. "T+15"
+ * @param {{totalTrapped:number, cutOffCount:number, areaCount:number, worst:Array}} summary
+ */
+export function buildPopulationQueryContent(keyframeLabel, summary) {
+  const { totalTrapped, cutOffCount, areaCount, worst } = summary;
+  const headline = totalTrapped > 0
+    ? `${totalTrapped.toLocaleString('en-US')} people trapped across ${areaCount} flood-affected area${areaCount === 1 ? '' : 's'} at ${keyframeLabel}${cutOffCount > 0 ? `, ${cutOffCount} completely cut off` : ''}.`
+    : `No population entrapment yet at ${keyframeLabel} \u2014 the flood front has not reached any tracked area.`;
+  const hotspots = worst.slice(0, 3).map((s) => ({
+    id: s.id,
+    name: s.name,
+    trapped: s.trapped,
+    pctTrapped: s.pctTrapped,
+    esi: s.esi,
+    band: s.band,
+    cutOff: s.cutOff,
+    rescueWindowMin: s.rescueWindowMin,
+  }));
+  return { headline, hotspots };
+}
+
 // ---------------------------------------------------------------------
 // "Why this area is at risk" — a real, varying narrative rather than a
 // static caption sitting above the bars. Explains which factor(s) are
