@@ -134,7 +134,7 @@ export function MapToolbar({
       <label
         className={`${SHARED_PILL_CLASSES} cursor-pointer pl-12 pr-3 ${
           sheltersVisible
-            ? 'border-accent bg-accent/15 text-ink'
+            ? 'border-accent bg-canvas/85 text-ink'
             : 'border-hairline bg-canvas/85 text-ink-dim hover:border-ink-dim hover:bg-surface/85 hover:text-ink'
         }`}
       >
@@ -153,7 +153,7 @@ export function MapToolbar({
         <label
           className={`${SHARED_PILL_CLASSES} cursor-pointer pl-12 pr-3 ${
             populationVisible
-              ? 'border-accent bg-accent/15 text-ink'
+              ? 'border-accent bg-canvas/85 text-ink'
               : 'border-hairline bg-canvas/85 text-ink-dim hover:border-ink-dim hover:bg-surface/85 hover:text-ink'
           }`}
         >
