@@ -1526,8 +1526,13 @@ export function MapLibreEngine({
     // just got, instead of leaving animateFloodZone to silently
     // re-resolve its own fallback internally. Consistent with how this
     // effect already fixed the identical missing-baseline-impactPoint
-    // case for the circles above.
-    animateFloodZone(scenario.baseline, impactCenter);
+    // case for the circles above. Also pass the active keyframe's raw
+    // `phase` (resolveActiveKeyframePhase — see its own doc comment),
+    // resolved off `scenario`'s RAW timeline + `timelineIndex` rather
+    // than off `scenario.baseline`, which never carries `phase` through
+    // mergeKeyframe.js's field whitelist — this is what makes
+    // animateFloodZone's T+5 nudge actually fire now.
+    animateFloodZone(scenario.baseline, impactCenter, resolveActiveKeyframePhase(scenario, timelineIndex));
     // Road congestion has no growth/shrink animation to drive (§3.4 of
     // the research doc — `level` is a discrete enum per road, not an
     // interpolatable number) — applyRoadCongestion just diffs+applies
@@ -2088,8 +2093,15 @@ export function MapLibreEngine({
       animateRiskZones(currentScenario.baseline, impactCenter, resolveKartavyaOverrideActive(currentScenario, timelineIndex));
       // Same fix as the other call site above — pass the already-
       // resolved impactCenter through instead of letting
-      // animateFloodZone fall back internally.
-      animateFloodZone(currentScenario.baseline, impactCenter);
+      // animateFloodZone fall back internally, and pass the active
+      // keyframe's raw `phase` (resolveActiveKeyframePhase) off
+      // currentScenario's RAW timeline + timelineIndex so the T+5
+      // breach-initiation nudge actually fires here too (this is the
+      // mount/scenario-switch call site — timelineIndex is 0 here per
+      // CommandShell's currentKeyframeIndex default, so this resolves
+      // to T+0's 'seismic-event' phase on first mount, correctly not
+      // nudging).
+      animateFloodZone(currentScenario.baseline, impactCenter, resolveActiveKeyframePhase(currentScenario, timelineIndex));
       updateShelterStates(currentScenario, timelineIndex);
     };
     if (map.isSourceLoaded(BUILDINGS_SOURCE_ID)) {
@@ -2612,6 +2624,48 @@ export function MapLibreEngine({
   }
 
   /**
+   * Resolves the currently-active keyframe's own `phase` string
+   * straight off the RAW (un-merged) currentScenario.timeline array —
+   * NOT off a merged/cloned state object like scenario.baseline.
+   *
+   * BUGFIX (person-reported: "T+0 and T+5 look identical"). mergeKeyframe.js's
+   * mergeKeyframe() only ever copies a fixed whitelist of fields onto
+   * the object it returns — buildings/roads/shelters/roadCongestion/
+   * impactPoint/red|yellow|greenRadiusKm (see that file's own doc
+   * comment) — via an explicit `...baseState` spread followed by only
+   * those named fields. `phase` (along with `label`/`isBreach`/`blurb`)
+   * is never one of them, and scenario.baseline itself has no `phase`
+   * field to begin with (it only has buildings/roads/shelters/
+   * roadCongestion), so `...baseState` never carries one through
+   * either. That means `mergedState.phase` — e.g. the
+   * `scenario.baseline` / `currentScenario.baseline` object
+   * animateFloodZone is called with at both its call sites below — is
+   * ALWAYS undefined, for every keyframe, not just T+5. animateFloodZone
+   * used to read `currentState?.phase === 'breach-initiation'` directly
+   * off that merged object to nudge T+5 forward from the dam — since
+   * that read was always undefined, the nudge silently never fired, and
+   * T+5 rendered with the exact same extentKm as T+0 (both keyframes
+   * share the same dam impactPoint — see the JSON).
+   *
+   * Fix: resolve phase the same reliable way
+   * resolveKartavyaOverrideActive (immediately above) already resolves
+   * the Kartavya Path gate — by index into the RAW timeline array,
+   * which still has label/phase/isBreach/blurb intact, rather than by
+   * reading a field off the whitelisted-and-therefore-lossy merged
+   * state. Same defensive shape as that function too: defaults to null
+   * for anything ambiguous (missing/non-numeric index, absent or empty
+   * timeline, index out of range) rather than throwing or guessing —
+   * a keyframe whose phase can't be resolved just doesn't get the
+   * nudge, which is the safe failure direction here.
+   */
+  function resolveActiveKeyframePhase(currentScenario, index) {
+    if (typeof index !== 'number') return null;
+    const timeline = currentScenario?.timeline;
+    if (!Array.isArray(timeline) || index < 0 || index >= timeline.length) return null;
+    return timeline[index]?.phase ?? null;
+  }
+
+  /**
    * Drives BOTH the three concentric impact-zone circles AND the
    * per-building recoloring off a single requestAnimationFrame loop
    * keyed to elapsed wall-clock time (research §9 — "keyed to elapsed
@@ -2732,7 +2786,7 @@ export function MapLibreEngine({
   const RIVER_CHANNEL_MIN_WIDTH_KM = 0.25; // narrow confined channel at the dam
   const HILLS_EXIT_WIDTH_KM = 0.9; // channel width by the time it reaches Haridwar
   const RIVER_CHANNEL_MAX_WIDTH_KM = 4.5; // full plains-inundation width by NCR — "prominent, 3-5km" per person spec
-  const HARIDWAR_PROGRESS = 0.385; // Haridwar's own resolved distance-along-floodPath fraction — the hills/plains terrain boundary, not a pooling hotspot itself
+  const HARIDWAR_PROGRESS = 0.493; // Haridwar's own resolved distance-along-floodPath fraction — the hills/plains terrain boundary, not a pooling hotspot itself. UPDATED (was 0.385): tehriDamBreachScene.js's floodPath now routes Devprayag→Rishikesh through a Satpuli detour (person request — see that file's own "SATPULI DETOUR" comment), which lengthens the corridor from ≈209.7km to ≈254.8km and pushes Haridwar's own along-path fraction from ≈0.384 to ≈0.493. Left unlined-up, the width model would start treating the last stretch of the detour + Raiwala + part of the Haridwar approach as already "plains" even though it's still the confined hills segment, so this was recalculated alongside the path change.
   function channelWidthAtProgress(progress) {
     if (progress <= HARIDWAR_PROGRESS) {
       // Hills segment: gentle rise, confined valley.
@@ -2818,7 +2872,7 @@ export function MapLibreEngine({
    * than the whole downstream ribbon permanently widening from there
    * on.
    *
-   * `impactCenter` (new param): the SAME already-resolved impact point
+   * `impactCenter` (param): the SAME already-resolved impact point
    * animateRiskZones's caller computes (baseline/keyframe's own
    * impactPoint, else the highest-severity-building heuristic, else
    * FALLBACK_CENTER — see the two call sites above). Previously this
@@ -2826,8 +2880,15 @@ export function MapLibreEngine({
    * FALLBACK_CENTER whenever currentState had no impactPoint — see the
    * BUGFIX note inside the function body for why that was wrong
    * specifically for the baseline/mount case.
+   *
+   * `activeKeyframePhase` (new param): the active keyframe's raw
+   * `phase` string, resolved by the caller via
+   * resolveActiveKeyframePhase(scenario/currentScenario, timelineIndex)
+   * — see that function's own doc comment for why this can't be read
+   * off `currentState` (i.e. scenario.baseline) itself. Used below only
+   * for the T+5 "breach-initiation" nudge.
    */
-  function animateFloodZone(currentState, impactCenter) {
+  function animateFloodZone(currentState, impactCenter, activeKeyframePhase) {
     const map = mapRef.current;
     const floodLine = floodPathLineRef.current;
     const floodSource = map?.getSource('flood-zone');
@@ -2884,15 +2945,27 @@ export function MapLibreEngine({
     // way, before the front has physically travelled anywhere yet), so
     // nearestPointOnLine alone can't distinguish T+0 from T+5 — both
     // resolve to extentKm ≈ 0 off impactPoint. Since the JSON's own
-    // authored data has no distance signal here, key off `phase`
-    // (already a stable per-keyframe field this scenario defines —
-    // see the JSON) to nudge T+5 specifically to the halfway point
-    // between the dam and this scene's first named hotspot
-    // (Devprayag), rather than leaving it visually identical to T+0.
-    // Every other keyframe (T+0, T+10, T+15, T+30) is left to resolve
-    // purely off its own real impactPoint, unchanged.
+    // authored data has no distance signal here, key off `phase` to
+    // nudge T+5 specifically to the halfway point between the dam and
+    // this scene's first named hotspot (Devprayag), rather than leaving
+    // it visually identical to T+0. Every other keyframe (T+0, T+10,
+    // T+15, T+30) is left to resolve purely off its own real
+    // impactPoint, unchanged.
+    //
+    // BUGFIX: this used to read `currentState?.phase` directly — always
+    // undefined, since `currentState` here is `scenario.baseline` /
+    // `currentScenario.baseline`, a MERGED state object, and
+    // mergeKeyframe.js never copies `phase` onto a merged state (see
+    // resolveActiveKeyframePhase's doc comment above for the full
+    // root-cause writeup). That's exactly why T+5 was rendering
+    // identically to T+0 — this nudge was silently never firing. Fixed
+    // by taking the resolved phase in as its own param instead
+    // (`activeKeyframePhase`, resolved by the caller off the RAW
+    // timeline array via resolveActiveKeyframePhase), the same pattern
+    // resolveKartavyaOverrideActive already uses for the Kartavya Path
+    // gate.
     const devprayagHotspot = floodHotspotsRef.current.find((h) => h.label === 'Devprayag confluence');
-    const isBreachInitiation = currentState?.phase === 'breach-initiation';
+    const isBreachInitiation = activeKeyframePhase === 'breach-initiation';
     const rawExtentKmWithBreachNudge = (isBreachInitiation && devprayagHotspot)
       ? devprayagHotspot.atKm / 2
       : rawExtentKm;

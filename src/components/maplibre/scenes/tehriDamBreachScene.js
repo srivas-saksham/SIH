@@ -110,51 +110,111 @@ const pinImpactZoneCenter = { lat: 30.3778, lng: 78.4806 };
 // impact-zone circles' pinned center and for camera flyTo) are
 // UNCHANGED by this \u2014 this array only feeds the flood polygon's shape/
 // distance-along-path math in MapLibreEngine.jsx's animateFloodZone.
+//
+// ZIGZAG-START REVISION (person request: "change where the zigzag
+// starts"): every segment between two named anchors below now stays
+// EXACTLY on the straight line connecting them for the first ~40% of
+// that segment's length, and only starts perpendicular-wandering after
+// that point \u2014 ramped in gradually (0 at the 40% mark, full amplitude
+// by the segment's end) rather than switching on abruptly. Previously
+// the wander was present across a segment's entire length from the
+// anchor onward, so the flood front visibly started "wobbling" the
+// instant it left a named place; this reads as the front travelling
+// cleanly out of Tehri Dam/Devprayag/Rishikesh/etc. before the river's
+// own natural meander becomes visible, closer to how an actual channel
+// looks leaving a fixed point. Regenerated with the same 4\u20135
+// intermediate-breakpoints-per-segment count and the same low
+// amplitude as the prior "lower zigzag frequency" pass (~1km-scale max
+// perpendicular offset, not the original ~40%-of-segment-length
+// wander) \u2014 this revision only moves WHERE along each segment that
+// wander is allowed to begin, it does not re-widen it. Generated with
+// a small deterministic per-segment lerp+jitter helper (fixed seeds
+// per segment, not re-randomized on every load, so the shape stays
+// stable across renders \u2014 same reasoning as the previous revision's
+// own "generated once, not at runtime" note). Corridor total length
+// \u2248209.7km (previously \u2248213.7km) and Haridwar's own resolved
+// distance-along-path fraction is \u22480.384 (previously 0.385) \u2014 close
+// enough that MapLibreEngine.jsx's HARIDWAR_PROGRESS = 0.385
+// terrain-boundary constant still lines up correctly and did not need
+// updating alongside this.
+//
+// SATPULI DETOUR (person request: "from Devprayag the flood suddenly
+// moves surprisingly towards the west \u2014 I want it to move more down,
+// toward Satpuli, and land down [afterward]"). Devprayag\u2192Rishikesh
+// previously ran almost due west at a near-constant latitude
+// (30.1462\u2192{30.146\u2026 30.139\u2026 30.137\u2026 30.135}\u219230.1280 \u2014 barely a 2km
+// latitude drop over the whole ~27km segment), which read as an abrupt
+// west-only turn right after Devprayag with no southward travel at
+// all. That segment is now replaced with a deliberate south-then-west
+// bow through Satpuli (verified coordinates \u2014 see the inline comment
+// on that point above) before rejoining the corridor toward Rishikesh.
+// Flagged explicitly: Satpuli sits on the Nayar (East) river, a
+// tributary that joins the Ganges further downstream at Byasghat/
+// Vyasi \u2014 NOT on the Bhagirathi/Ganges mainstem the flood front is
+// actually following through Devprayag\u2192Rishikesh\u2192Haridwar. This
+// detour is therefore an intentional ARTISTIC reroute anchored on a
+// real, verified place per the person's explicit direction, not a
+// claim that the actual dam-breach floodwater would physically reach
+// Satpuli \u2014 same "flag what's schematic vs. verified" standard this
+// file already applies to Landhaura's approximate interpolated
+// midpoint. This is a large, deliberate 4-breakpoint detour (not the
+// small-amplitude organic wander used elsewhere in floodPath), so it's
+// left as clean hand-placed points rather than run through the
+// zigzag-wander treatment \u2014 easiest to hand-tune further from here.
+// This ~45km detour meaningfully lengthens the corridor (\u2248254.8km
+// total, up from \u2248209.7km) and pushes Haridwar's own resolved
+// distance-along-path fraction from \u22480.384 to \u22480.493 \u2014 UNLIKE the
+// zigzag-start revision above, this drift is too large to ignore, so
+// MapLibreEngine.jsx's HARIDWAR_PROGRESS constant has been updated
+// alongside this change (see that file's own comment at
+// HARIDWAR_PROGRESS for the matching note) to keep the hills/plains
+// width-curve boundary lined up with where Haridwar actually now sits
+// on the corridor.
 const floodPath = [
   [78.4806, 30.3778], // Tehri Dam
-  [78.5377, 30.3583],
-  [78.4864, 30.2834],
-  [78.5075, 30.2455],
-  [78.5273, 30.2070],
-  [78.6175, 30.2044],
+  [78.4903, 30.3392],
+  [78.4800, 30.3006],
+  [78.4899, 30.2621],
+  [78.5610, 30.2242],
+  [78.5778, 30.1841],
   [78.5988, 30.1462], // Devprayag (Bhagirathi\u2013Alaknanda confluence) \u2014 hotspot, see floodHotspots below
-  [78.5414, 30.1717],
-  [78.4850, 30.1803],
-  [78.4345, 30.1011],
-  [78.3730, 30.1890],
+  [78.6520, 30.1430], // begins the southward swing toward Satpuli \u2014 see note below
+  [78.6612, 30.1280], // Satpuli, Pauri Garhwal \u2014 verified: Wikipedia gives 29\u00b055\u203200\u2033N 78\u00b042\u203200\u2033E (29.91667, 78.70000); latlong.net/elevationmap.net agree closely (29.917/29.918, 78.710/78.711). Used 29.9170/78.7101.
+  [78.5212, 30.0780], // swings back northwest, "landing down" off the Satpuli detour
+  [78.4212, 30.1300], // rejoins the corridor approaching Rishikesh
   [78.3212, 30.1280], // Ram Jhula, Rishikesh \u2014 hotspot, see floodHotspots below
-  [78.3200, 30.1110],
-  [78.2971, 30.1225],
-  [78.2900, 30.1132],
-  [78.2799, 30.1078],
-  [78.2819, 30.0868],
+  [78.3123, 30.1212],
+  [78.3033, 30.1143],
+  [78.2944, 30.1074],
+  [78.2849, 30.1013],
+  [78.2778, 30.0920],
   [78.2676, 30.0869], // Raiwala \u2014 Rishikesh\u2013Haridwar stretch adjacent to Dehradun
-  [78.2282, 30.0723],
-  [78.2041, 30.0466],
-  [78.2185, 29.9927],
-  [78.2136, 29.9529],
+  [78.2469, 30.0587],
+  [78.2262, 30.0304],
+  [78.2055, 30.0022],
+  [78.1851, 29.9737],
   [78.1642, 29.9457], // Har Ki Pauri, Haridwar
-  [78.1021, 29.9904],
-  [78.0617, 29.9621],
-  [78.0124, 29.9636],
-  [77.9953, 29.8569],
-  [77.9323, 29.9045],
+  [78.1193, 29.9323],
+  [78.0745, 29.9190],
+  [78.0296, 29.9058],
+  [77.9850, 29.8915],
+  [77.9395, 29.8803],
   [77.8951, 29.8656], // IIT Roorkee
-  [77.9005, 29.8321],
-  [77.8880, 29.8087],
-  [77.8791, 29.7833],
-  [77.8661, 29.7601],
+  [77.8821, 29.8425],
+  [77.8691, 29.8194],
+  [77.8571, 29.7956],
+  [77.8404, 29.7746],
   [77.8300, 29.7500], // Landhaura \u2014 approximate interpolated midpoint
-  [77.7801, 29.7158],
-  [77.8357, 29.6349],
-  [77.8193, 29.5858],
-  [77.7829, 29.5456],
-  [77.6694, 29.5395],
+  [77.8092, 29.7029],
+  [77.7883, 29.6558],
+  [77.7672, 29.6089],
+  [77.7449, 29.5624],
+  [77.7278, 29.5137],
   [77.7050, 29.4675], // Muzaffarnagar
-  [77.6151, 29.3706],
-  [77.7884, 29.2745],
-  [77.6249, 29.1775],
-  [77.6111, 29.0808],
+  [77.7053, 29.3709],
+  [77.7056, 29.2743],
+  [77.7051, 29.1777],
+  [77.7065, 29.0811],
   [77.7064, 28.9845], // Meerut / NCR approach (scenario's own T+30 keyframe point)
 ];
 
