@@ -122,7 +122,16 @@ export function MapLibreEngine({
     // for scenes with no floodHotspots (and implicitly a no-op for any
     // scene with no floodPath at all, same gating as floodPath itself).
     floodHotspots: SCENE_FLOOD_HOTSPOTS,
+    // Optional per-keyframe camera choreography (Tehri only for now —
+    // see cameraKeyframes in tehriDamBreachScene.js). undefined for
+    // scenes that don't set it, which keeps the original zoom-step
+    // camera below completely unchanged.
+    cameraKeyframes: SCENE_CAMERA_KEYFRAMES,
   } = sceneConfig;
+  // Last timeline index the scene-specific camera already moved for, so
+  // unrelated scenario-object changes don't yank the camera back.
+  // Starts at 0: activation's own flyTo already handles T+0.
+  const lastCameraKeyframeRef = useRef(0);
   // Built once per mount from the scene's static floodPath array (it
   // never changes at runtime) — a real MapLibre/Turf LineString feature,
   // per turf's documented `lineString` helper (https://turfjs.org/docs/#lineString).
@@ -1054,6 +1063,56 @@ export function MapLibreEngine({
         console.error('Road-label setup failed — labels will be missing/stale, rest of the scene is unaffected:', err);
       }
 
+      // ---------------------------------------------------------------
+      // Clickable labels (person request): every on-map heading —
+      // landmark/area pills (Ram Jhula, Har Ki Pauri, Connaught Place…),
+      // shelter status cards + their capacity badges, and road pills —
+      // turns the cursor into a pointer on hover, and on click the camera
+      // flies fast to that label's own anchor coordinate. Purely additive:
+      // just listeners on the existing layers, so it works identically
+      // for every scene registered in sceneRegistry.js. Layers that
+      // failed to build (or are hidden, e.g. shelters toggled off) simply
+      // never match, so this is a no-op for them. map.remove() on
+      // unmount tears the listeners down with the map.
+      // ---------------------------------------------------------------
+      const CLICKABLE_LABEL_LAYERS = [
+        'shelter-capacity-badges-symbol',
+        'shelter-cards-symbol',
+        'landmark-labels-symbol',
+        'road-labels-symbol',
+      ];
+      const LABEL_FOCUS_ZOOM = 17;
+      CLICKABLE_LABEL_LAYERS.forEach((layerId) => {
+        // The cursor must be set on the map's own canvas: MapLibre's
+        // stylesheet gives its inner canvas container `cursor: grab`,
+        // which sits BELOW the outer container the custom-drag code
+        // styles, so styling the outer container never showed. An
+        // inline style on the canvas itself wins over that rule.
+        map.on('mouseenter', layerId, () => {
+          map.getCanvas().style.cursor = 'pointer';
+        });
+        map.on('mousemove', layerId, () => {
+          map.getCanvas().style.cursor = 'pointer';
+        });
+        map.on('mouseleave', layerId, () => {
+          // '' hands the cursor back to MapLibre's own default (grab).
+          map.getCanvas().style.cursor = '';
+        });
+        map.on('click', layerId, (e) => {
+          const feature = e.features && e.features[0];
+          const coords = feature?.geometry?.type === 'Point' ? feature.geometry.coordinates : null;
+          if (!coords) return;
+          map.flyTo({
+            center: [coords[0], coords[1]],
+            zoom: Math.max(map.getZoom(), LABEL_FOCUS_ZOOM),
+            pitch: 60,
+            speed: 1.8,
+            curve: 1.2,
+            essential: true,
+          });
+        });
+      });
+
       // Devtools confirmation hooks (safe zones aren't setFeatureState-
       // driven the way roads/buildings are, so there's less "state" to
       // dump via window.__debugRoads-style helpers). window.__debugMap
@@ -1560,7 +1619,31 @@ export function MapLibreEngine({
     // with an extra-extreme pull-back specifically at T+15 (index 3) so
     // it covers much more area at that point in the timeline.
     const map = mapRef.current;
-    if (map && typeof timelineIndex === 'number' && timelineIndex >= 0) {
+    if (map && SCENE_CAMERA_KEYFRAMES && typeof timelineIndex === 'number' && timelineIndex >= 0) {
+      // Scene-defined camera (Tehri): glide to this keyframe's zoom +
+      // position. Only when the keyframe index actually changed.
+      if (timelineIndex !== lastCameraKeyframeRef.current) {
+        lastCameraKeyframeRef.current = timelineIndex;
+        const cam = SCENE_CAMERA_KEYFRAMES[Math.min(timelineIndex, SCENE_CAMERA_KEYFRAMES.length - 1)];
+        const dam = SCENE_PIN_IMPACT_ZONE_CENTER || impactCenter;
+        const t = cam.followFront || 0;
+        const baseLat = dam.lat + (impactCenter.lat - dam.lat) * t;
+        const baseLng = dam.lng + (impactCenter.lng - dam.lng) * t;
+        // Screen-relative shift -> geographic shift, accounting for the
+        // map's current rotation so "right" is always screen-right.
+        const b = (map.getBearing() * Math.PI) / 180;
+        const right = cam.rightKm || 0;
+        const up = cam.upKm || 0;
+        const eastKm = right * Math.cos(b) + up * Math.sin(b);
+        const northKm = -right * Math.sin(b) + up * Math.cos(b);
+        const lat = baseLat + northKm / 111.32;
+        const lng = baseLng + eastKm / (111.32 * Math.cos((baseLat * Math.PI) / 180));
+        const opts = { center: [lng, lat], zoom: cam.zoom, duration: cam.durationMs ?? 1800, essential: true };
+        if (cam.pitch != null) opts.pitch = cam.pitch;
+        if (cam.bearing != null) opts.bearing = cam.bearing;
+        map.easeTo(opts);
+      }
+    } else if (map && typeof timelineIndex === 'number' && timelineIndex >= 0) {
       const ZOOM_STEP_PER_KEYFRAME = 0.5;
       const MIN_ZOOM = 12;
       const EXTREME_ZOOM_KEYFRAME_INDEX = 4; // T+15

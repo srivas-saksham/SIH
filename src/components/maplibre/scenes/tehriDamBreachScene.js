@@ -259,12 +259,47 @@ const floodHotspots = [
   },
 ];
 
+// =====================================================================
+// CAMERA KEYFRAMES — the ONE place to tune Tehri's timeline camera.
+// One entry per timeline keyframe, in order: index 0 = T+0, 1 = T+5,
+// 2 = T+10, 3 = T+15, 4 = T+30. Every time the timeline lands on a
+// keyframe, the camera glides to that entry's values.
+//
+//   zoom        HIGHER = closer, LOWER = further out.
+//               (16.5 ~ street level, 10 ~ ~60km wide, 8 ~ ~250km wide)
+//   followFront 0 = centre on the dam (fixed circle centre),
+//               1 = centre on the flood front's current position,
+//               0.5 = halfway between. Use it to slide the camera
+//               DOWNSTREAM along the river as the flood advances.
+//   rightKm     Shift the camera RIGHT on screen (+) or LEFT (-), in km.
+//   upKm        Shift the camera UP on screen (+) or DOWN (-), in km.
+//   pitch       Optional tilt 0-85 (0 = top-down). null = leave as is.
+//   bearing     Optional rotation in degrees. null = leave as is.
+//   durationMs  How long the glide takes (smaller = faster).
+//
+// rightKm/upKm are relative to the screen, so "right" stays right even
+// after you rotate the map.
+// =====================================================================
+const cameraKeyframes = [
+  // T+0  — unchanged: tight on the dam.
+  { zoom: 16.5, followFront: 0,   rightKm: 0,  upKm: 0, pitch: null, bearing: null, durationMs: 1600 },
+  // T+5  — pull WAY back, nudge right so the whole flood circle fits.
+  { zoom: 10.9, followFront: 0,   rightKm: 2,  upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+  // T+10 — even further out, slide toward the front (Devprayag \u2192 Rishikesh), still a bit right.
+  { zoom: 9.9,  followFront: 0.5, rightKm: 10, upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+  // T+15 — keeps pulling back so it never zooms IN after T+10 (front nears Haridwar).
+  { zoom: 8.7,  followFront: 0.5, rightKm: 0,  upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+  // T+30 — widest shot, framing the whole dam \u2192 Meerut corridor.
+  { zoom: 8.2,  followFront: 0.5, rightKm: 0,  upKm: 0, pitch: null, bearing: null, durationMs: 1800 },
+];
+
 export const tehriDamBreachScene = {
   id: 'tehri-dam-breach',
   label: 'Dam Breach \u2014 Tehri Dam Catastrophic Failure',
   fallbackCenter,
   defaultRadii,
   pinImpactZoneCenter,
+  cameraKeyframes,
   floodPath,
   floodHotspots,
   landmarks: DAM_LANDMARKS,
@@ -295,6 +330,10 @@ export const tehriDamBreachScene = {
   // for its own unrelated reason (its "attack" phase).
   forcedJamActivationLabel: 'T+15',
   blockedShelterLabel: '\u26d4 Blocked \u2014 Haridwar approach roads submerged',
+  // Same role as securityAttackScene's Rajiv Chowk: the shelter the
+  // first "Shelters in range" query flies to. AIIMS Rishikesh is the
+  // corridor's first shelter downstream of the dam.
+  firstFocusShelterId: 'aiims-rishikesh',
 };
 
 export default tehriDamBreachScene;

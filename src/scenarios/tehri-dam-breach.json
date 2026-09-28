@@ -179,9 +179,9 @@
     {
       "label": "T+30",
       "impactPoint": { "lat": 28.9845, "lng": 77.7064 },
-      "redRadiusKm": 5,
-      "yellowRadiusKm": 15,
-      "greenRadiusKm": 32,
+      "redRadiusKm": 9.6,
+      "yellowRadiusKm": 24,
+      "greenRadiusKm": 48,
       "buildings": [
         { "id": "b7", "riskLevel": "orange" },
         { "id": "b8", "riskLevel": "yellow" },

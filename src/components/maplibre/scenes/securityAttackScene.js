@@ -56,6 +56,10 @@ export const securityAttackScene = {
   // Unchanged from the original hardcoded string in
   // renderShelterCardCanvas.
   blockedShelterLabel: '\u26d4 Blocked \u2014 Kartavya Path jammed',
+  // The shelter the very first "Shelters in range" query flies to
+  // (every later query picks a random other one). Same Rajiv Chowk
+  // target CommandShell.jsx always hardcoded — now data, per scene.
+  firstFocusShelterId: 'rajiv-chowk',
 };
 
 export default securityAttackScene;

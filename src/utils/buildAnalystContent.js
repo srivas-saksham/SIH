@@ -1,5 +1,6 @@
 import { LANDMARKS } from '../data/delhiLandmarks';
 import { METRO_SHELTERS } from '../data/delhiMetroShelters';
+import { DAM_SHELTERS } from '../data/damCorridorShelters';
 import { haversineDistanceKm } from './geoDistance';
 import { computeCausalFactors } from './causalFactors';
 
@@ -45,13 +46,24 @@ function nearestLandmarks(impactPoint, count = 3) {
     .slice(0, count);
 }
 
+/**
+ * Which named shelter roster belongs to a scenario. Delhi's METRO_SHELTERS
+ * stays the default for every scenario (exactly the old behavior);
+ * tehri-dam-breach gets its own real Bhagirathi/Ganga corridor roster so
+ * "Shelters in range" lists (and the camera targets) shelters that
+ * actually exist in that scene instead of Central Delhi ones.
+ */
+export function resolveShelterRoster(scenario) {
+  return scenario?.id === 'tehri-dam-breach' ? DAM_SHELTERS : METRO_SHELTERS;
+}
+
 /** Nearest real metro-shelter to an arbitrary point — used to correlate
  * a road with "which shelter does this actually lead toward", per
  * explicit follow-up feedback that roads-nearby should be tied to
  * shelter access, not just a status chip. */
-function nearestShelter(point) {
+function nearestShelter(point, scenario) {
   if (!point) return null;
-  return [...METRO_SHELTERS]
+  return [...resolveShelterRoster(scenario)]
     .map((shelter) => ({ ...shelter, distanceKm: haversineDistanceKm(point, shelter) }))
     .sort((a, b) => a.distanceKm - b.distanceKm)[0];
 }
@@ -152,7 +164,7 @@ function resolveRoadDetail(scenario, road) {
   const baselineRoad = (scenario.baseline?.roads || []).find((r) => r.id === road.id);
   const coords = road.coords || baselineRoad?.coords;
   const mid = midpointOf(coords);
-  const shelter = mid ? nearestShelter(mid) : null;
+  const shelter = mid ? nearestShelter(mid, scenario) : null;
   const destination =
     ROAD_DESTINATIONS[road.id] ||
     (() => {
@@ -227,7 +239,7 @@ export function buildRoadsQueryContent(scenario, mapState, filter = 'all') {
  */
 export function buildSheltersInRange(scenario, count = 5) {
   const impactPoint = resolveImpactPoint(scenario);
-  return [...METRO_SHELTERS]
+  return [...resolveShelterRoster(scenario)]
     .map((shelter) => ({
       ...shelter,
       distanceKm: haversineDistanceKm(impactPoint, shelter),
@@ -244,7 +256,7 @@ export function buildSheltersInRange(scenario, count = 5) {
  * everything" view rather than the inline compact one.
  */
 export function buildSheltersQueryContent(scenario) {
-  const shelters = buildSheltersInRange(scenario, METRO_SHELTERS.length);
+  const shelters = buildSheltersInRange(scenario, resolveShelterRoster(scenario).length);
   const headline = `${shelters.length} tracked shelters within range, nearest first.`;
   return { headline, shelters };
 }
@@ -542,7 +554,7 @@ export function buildCapacityBoostResponseContent(scenario, boostedState, percen
   const impactPoint = resolveImpactPoint(scenario);
   const boostedShelters = boostedState?.shelters || [];
 
-  const shelterRoster = buildSheltersInRange(scenario, METRO_SHELTERS.length).map((namedShelter) => {
+  const shelterRoster = buildSheltersInRange(scenario, resolveShelterRoster(scenario).length).map((namedShelter) => {
     const nearestNumeric = [...boostedShelters]
       .map((s) => ({ ...s, pairDistanceKm: haversineDistanceKm(namedShelter, s) }))
       .sort((a, b) => a.pairDistanceKm - b.pairDistanceKm)[0];

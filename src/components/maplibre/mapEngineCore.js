@@ -303,9 +303,26 @@ const SHELTER_CARD_PIXEL_RATIO = 3;
 // zoom range (roughly 14–18 per the existing flyTo/maxPitch config),
 // not derived from any formula — same honesty standard as this file's
 // other "tuned to look right at this scene" constants.
+// =====================================================================
+// LABEL SIZE TUNING — edit these numbers to change label sizes.
+// (icon-size multiplies the label image: 1 = its natural size.)
+// Labels used to keep shrinking (down to 0.5 / 0.45) as you zoomed out,
+// so they were unreadable in wide shots. Now they hold a FIXED size at
+// and below LABEL_HOLD_ZOOM (the "limit" — zooming out further never
+// makes them smaller OR bigger), then grow again as you zoom in past
+// the close-up stops.
+//   LABEL_HOLD_ZOOM      zoom at/below which size stops changing
+//                        (higher = size stops shrinking sooner)
+//   SHELTER_CARD_FAR_SIZE  shelter card (+ capacity badge) size when far
+//   LABEL_PILL_FAR_SIZE    area / landmark / road label size when far
+// =====================================================================
+const LABEL_HOLD_ZOOM = 14;
+const SHELTER_CARD_FAR_SIZE = 0.8;
+const LABEL_PILL_FAR_SIZE = 0.8;
+
 const SHELTER_CARD_ICON_SIZE_EXPR = [
   'interpolate', ['linear'], ['zoom'],
-  14, 0.5,
+  LABEL_HOLD_ZOOM, SHELTER_CARD_FAR_SIZE,
   16.5, 1,
   18, 1.4,
 ];
@@ -424,9 +441,9 @@ const LABEL_PILL_PIXEL_RATIO = 3;
 // full shelter card is allowed to.
 const LABEL_PILL_ICON_SIZE_EXPR = [
   'interpolate', ['linear'], ['zoom'],
-  14, 0.45,
-  16.5, 0.85,
-  18, 1.1,
+  LABEL_HOLD_ZOOM, LABEL_PILL_FAR_SIZE,
+  16.5, 1.1,
+  18, 1.3,
 ];
 const LABEL_PILL_ICON_OFFSET = [0, -2];
 

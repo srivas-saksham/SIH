@@ -27,6 +27,7 @@ import {
   isResetSceneCommand,
 } from '../utils/timelineIntent';
 import { METRO_SHELTERS } from '../data/delhiMetroShelters';
+import { getSceneConfig } from './maplibre/sceneRegistry';
 import { ChatPanel } from './ChatPanel';
 import { KeyframeBlurb } from './KeyframeBlurb';
 import { MapLibreView } from './MapLibreView';
@@ -353,12 +354,18 @@ export function CommandShell() {
     // Requirement: the very first shelters query always flies to Rajiv
     // Chowk. Every query after that flies to a random OTHER shelter
     // (never repeats the one currently shown).
+    // Roster + first-focus shelter now come from the ACTIVE scene's
+    // config (Delhi -> METRO_SHELTERS/Rajiv Chowk, exactly as before;
+    // Tehri -> its own corridor shelters) instead of always Delhi.
+    const sceneConfig = getSceneConfig(activeScenario.id);
+    const roster = sceneConfig.shelters?.length ? sceneConfig.shelters : METRO_SHELTERS;
+    const firstId = sceneConfig.firstFocusShelterId || 'rajiv-chowk';
     let target;
     if (!lastShelterIdRef.current) {
-      target = METRO_SHELTERS.find((s) => s.id === 'rajiv-chowk') || METRO_SHELTERS[0];
+      target = roster.find((s) => s.id === firstId) || roster[0];
     } else {
-      const others = METRO_SHELTERS.filter((s) => s.id !== lastShelterIdRef.current);
-      const pool = others.length > 0 ? others : METRO_SHELTERS;
+      const others = roster.filter((s) => s.id !== lastShelterIdRef.current);
+      const pool = others.length > 0 ? others : roster;
       target = pool[Math.floor(Math.random() * pool.length)];
     }
     if (target) {
